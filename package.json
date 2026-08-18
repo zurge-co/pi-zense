@@ -1,0 +1,21 @@
+{
+  "name": "pi-zense",
+  "version": "0.1.0",
+  "description": "Spec-gated SDLC harness for pi — sub-agents, dual eval, budgeted autonomy — plus Thai-language terminal font & color setup.",
+  "keywords": ["pi-package", "pi", "sdlc", "harness", "agent", "thai", "theme"],
+  "license": "MIT",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/zurge-co/pi-zense.git"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "themes": ["./themes"]
+  }
+}

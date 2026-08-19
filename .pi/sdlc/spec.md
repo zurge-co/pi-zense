@@ -1,23 +1,29 @@
-# Spec v1: Show plan summary before approval prompt
+# Spec v1: Embed Thai font in pi-zense with auto-install
 approved: false
 
 ## Intent
-ตอนนี้ sdlc-harness ขอ approve spec โดยไม่สรุป plan ให้อ่านก่อน (confirm dialog มีแค่ title + intent 300 ตัวอักษรแรก ไม่มี scope/criteria/spec-debt) ผู้ใช้ต้องการเห็นสรุป plan แบบอ่านรู้เรื่องก่อนตัดสินใจ approve ทุกจุดที่ขอ approval
+ผู้ใช้ต้องการให้ pi-zense ติดตั้งฟอนต์ภาษาไทยให้อัตโนมัติ (ไม่ต้อง download/install เอง) โดย embed ไฟล์ฟอนต์ลงใน npm package แล้วคัดลอกเข้า OS user font dir ตอน session_start พร้อมเขียน config ให้ terminal ที่ตรวจจับได้แบบ opt-in — ข้อจำกัดที่ยอมรับ: terminal emulator เป็นเจ้าของ font rendering โปรแกรมใน terminal เปลี่ยนฟอนต์ให้ไม่ได้ จึงเหลือขั้นตอน restart terminal 1 ครั้งเท่านั้น
 
 ## Scope
-- extensions/sdlc-harness/index.ts
+- extensions/thai-terminal/
+- fonts/
+- package.json
+- README.md
 
 ## Constraints
-- ไม่เปลี่ยน tool/parameter schema ภายนอก (agent-facing API เดิม)
-- ยังคง gate เดิม: implementation ต้องรอ spec approved
-- sync ทั้ง repo copy และ ~/.pi/agent install copy
+- ฟอนต์ต้อง redistributable (SIL OFL) และต้องแนบ OFL.txt ไปด้วยตามเงื่อนไข license
+- ใช้เฉพาะน้ำหนักที่จำเป็น (Regular + Bold) เพื่อจำกัดขนาด tarball
+- การคัดลอกฟอนต์เข้า OS font dir เป็น no-admin (user-level dir เท่านั้น)
+- การแก้ config ของ user ต้องมีการยืนยันและ backup ไฟล์เดิมก่อน
+- ไม่แตะ Windows Terminal/iTerm2 แบบอัตโนมัติ — แสดง snippet ให้เหมือนเดิม
 
 ## Acceptance criteria
-- [ ] C1: หลัง sdlc_spec (action=set) เขียน spec แล้ว ต้องแสดงสรุป plan แบบอ่านได้ (title, intent, scope, constraints, criteria+check, specDebt) ก่อนขอ approve โดยตรงทันที *(check: grep หา specSummary + ctx.ui.confirm หลัง writeFileSync spec ใน index.ts)*
-- [ ] C2: /sdlc approve ต้องแสดง criteria list และ specDebt เต็ม ไม่ใช่แค่ intent slice *(check: grep หา call ctx.ui.confirm ที่ approve spec ใช้ specSummary)*
-- [ ] C3: tool_call gate dialog (block write เพราะ spec unapproved) ต้องมี compact plan summary (ชื่อ, จำนวน criteria, scope, debt) *(check: grep dialog message ใน tool_call handler)*
-- [ ] C4: spec.json/spec.md schema เดิมไม่เปลี่ยน, approve flow ยัง persist ถูกต้อง *(check: npx tsc parse ไฟล์ผ่าน (ไม่มี syntax error นอกเหนือ missing types เดิม))*
-- [ ] C5: แก้ทั้งสอง copy: repo (extensions/sdlc-harness/index.ts) และ install (~/.pi/agent/extensions/sdlc-harness/index.ts) ให้ logic เหมือนกัน *(check: diff ส่วน handler ทั้งสองไฟล์ตรงกัน)*
+- [ ] fonts-embedded: fonts/ มี IBM Plex Sans Thai Looped Regular+Bold (TTF) + OFL.txt *(check: ls fonts/*.ttf fonts/OFL.txt | wc -l  => 3)*
+- [ ] auto-install: session_start ตรวจว่าฟอนต์อยู่ใน OS user font dir หรือยัง ถ้ายังให้คัดลอกอัตโนมัติ (macOS ~/Library/Fonts, Linux ~/.local/share/fonts + fc-cache) และแจ้งเตือน *(check: grep -q 'Library/Fonts' extensions/thai-terminal/index.ts && grep -q 'local/share/fonts' extensions/thai-terminal/index.ts)*
+- [ ] config-writer: คำสั่ง /terminal-font ตรวจจับ terminal จาก env (TERM_PROGRAM, KITTY_WINDOW_ID, WT_SESSION ฯลฯ) และเสนอเขียน config อัตโนมัติสำหรับ ghostty/kitty/wezterm/alacritty/vscode พร้อมยืนยัน + backup *(check: grep -q 'TERM_PROGRAM' extensions/thai-terminal/index.ts && grep -q 'confirm' extensions/thai-terminal/index.ts)*
+- [ ] tarball: npm pack tarball มี fonts/ รวมอยู่และขนาดรวม < 2MB *(check: npm pack --dry-run 2>&1 | grep -q 'fonts/')*
+- [ ] docs: README ของ thai-terminal อธิบาย flow อัตโนมัติ + ข้อจำกัด (ต้อง restart terminal) *(check: path exists: extensions/thai-terminal/README.md (updated))*
 
 ## Spec debt (human-verified only)
-- ความยาว dialog ใน TUI เหมาะสมหรือไม่ (อ่านง่ายใน confirm box) — ตรวจด้วยมนุษย์ตอนใช้งานจริง
+- การ render จริง (สระ/วรรณยุกต์ซ้อนถูกต้อง, cell width) ตรวจใน CI ไม่ได้ — ต้อง manual review บน terminal จริงหลัง restart
+- Windows auto-install ไม่ได้ implement (user font install บน Windows ต้องผ่าน registry) — Windows users ยังต้อง double-click ไฟล์ .ttf เอง

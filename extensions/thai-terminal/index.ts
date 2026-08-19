@@ -6,15 +6,22 @@
  *
  *   1. Contributes the "thai-looped-night" color theme (.pi/themes/) and lets
  *      you activate it with /thai-theme.
- *   2. Bundles copy-paste font config snippets for common terminals
- *      (/terminal-font) targeting IBM Plex Sans Thai Looped — a font with full
- *      Thai script coverage, monospaced "Terminal" builds, and consistent
- *      space/indent widths — plus an HTML preview (/thai-preview).
+ *   2. Auto-installs the bundled IBM Plex Sans Thai Looped TTFs (SIL OFL 1.1,
+ *      see fonts/OFL.txt) into the OS user font directory on session start —
+ *      no admin, no manual download.
+ *   3. Writes the terminal emulator config for you (/terminal-font auto-setup
+ *      for ghostty/kitty/wezterm/alacritty/vscode, with confirm + backup), or
+ *      shows copy-paste snippets for iTerm2/Terminal.app/Windows Terminal —
+ *      plus an HTML preview (/thai-preview).
+ *
+ * Hard limitation: a program running *inside* a terminal cannot change the
+ * terminal's font. Auto-install + config write gets the user down to a single
+ * terminal restart — nothing less is possible.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { exec } from "node:child_process";
+import { exec, execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +37,136 @@ const THEME_NAME = "thai-looped-night";
 const FONT_FAMILY = "IBM Plex Sans Thai Looped";
 const FONT_DOWNLOAD = "https://github.com/IBM/plex/releases (v6.4.0+ > IBM-Plex-Sans-Thai-Looped.zip)";
 const FONT_FALLBACK = "Sarasa Term Nerd Font (brew install --cask font-sarasa-nerd หรือ font-sarasa-term-nerd)";
+
+// Bundled TTFs (SIL OFL 1.1 — redistribution permitted, OFL.txt ships alongside).
+const FONT_DIR = [
+	join(HERE, "..", "..", "fonts"),
+	join(process.env.HOME ?? "", ".pi", "agent", "fonts"),
+].find((d) => existsSync(join(d, "IBMPlexSansThaiLooped-Regular.ttf"))) ?? join(HERE, "..", "..", "fonts");
+const FONT_FILES = ["IBMPlexSansThaiLooped-Regular.ttf", "IBMPlexSansThaiLooped-Bold.ttf"];
+
+/** OS user font dir (no admin): macOS ~/Library/Fonts, Linux ~/.local/share/fonts. */
+function userFontDir(): string | null {
+	if (process.platform === "darwin") return join(process.env.HOME ?? "", "Library", "Fonts");
+	if (process.platform === "linux") return join(process.env.HOME ?? "", ".local", "share", "fonts");
+	return null; // Windows needs registry registration — fall back to manual install
+}
+
+function fontsInstalled(): boolean {
+	const dir = userFontDir();
+	return dir !== null && FONT_FILES.every((f) => existsSync(join(dir, f)));
+}
+
+/** Copy bundled TTFs into the OS user font dir. Returns null on success, error string otherwise. */
+function installFonts(): string | null {
+	const dir = userFontDir();
+	if (!dir || !existsSync(FONT_DIR)) return "manual";
+	try {
+		mkdirSync(dir, { recursive: true });
+		for (const f of FONT_FILES) copyFileSync(join(FONT_DIR, f), join(dir, f));
+		if (process.platform === "linux") {
+			try {
+				execFileSync("fc-cache", ["-f", dir], { stdio: "ignore" });
+			} catch {
+				/* fontconfig not installed — most desktop apps still pick it up */
+			}
+		}
+		return null;
+	} catch (err) {
+		return String(err);
+	}
+}
+
+// ---------------------------------------------------------------- terminal detection + config writers
+
+type TerminalId = "ghostty" | "kitty" | "wezterm" | "alacritty" | "vscode" | "iterm2" | "apple" | "windows" | "unknown";
+
+function detectTerminal(): TerminalId {
+	const e = process.env;
+	if (e.TERM_PROGRAM === "ghostty" || e.GHOSTTY_RESOURCES_DIR) return "ghostty";
+	if (e.TERM_PROGRAM === "iTerm.app") return "iterm2";
+	if (e.TERM_PROGRAM === "Apple_Terminal") return "apple";
+	if (e.TERM_PROGRAM === "vscode" || e.TERM_PROGRAM === "cursor") return "vscode";
+	if (e.TERM_PROGRAM === "WezTerm" || e.WEZTERM_EXECUTABLE) return "wezterm";
+	if (e.TERM_PROGRAM === "mintty" || e.WT_SESSION) return "windows";
+	if (e.KITTY_WINDOW_ID || e.TERM === "xterm-kitty") return "kitty";
+	if (e.ALACRITTY_SOCKET || e.ALACRITTY_LOG || e.TERM === "alacritty") return "alacritty";
+	return "unknown";
+}
+
+const HOME = process.env.HOME ?? "";
+
+interface TerminalTarget {
+	/** Where the config lives (display + backup). */
+	file: string;
+	/** Absolute path if we can write it automatically, else null → snippet only. */
+	writablePath: string | null;
+	/** Lines to append for auto-install (idempotent marker included). */
+	autoBlock: string;
+	/** Human-readable snippet fallback. */
+	snippet: string;
+}
+
+const AUTO_MARKER = "# >>> pi-zense thai font >>>";
+const AUTO_END = "# <<< pi-zense thai font <<<";
+
+const TARGETS: Record<TerminalId, TerminalTarget | null> = {
+	ghostty: {
+		file: "~/.config/ghostty/config",
+		writablePath: join(HOME, ".config", "ghostty", "config"),
+		autoBlock: `${AUTO_MARKER}\nfont-family = ${FONT_FAMILY}\nadjust-cell-width = 0%\n${AUTO_END}`,
+		snippet: `font-family = ${FONT_FAMILY}\nfont-size = 14\n# Thai combining marks + consistent cell widths\nadjust-cell-width = 0%`,
+	},
+	kitty: {
+		file: "~/.config/kitty/kitty.conf",
+		writablePath: join(HOME, ".config", "kitty", "kitty.conf"),
+		autoBlock: `${AUTO_MARKER}\nfont_family      ${FONT_FAMILY}\ndisable_ligatures never\n${AUTO_END}`,
+		snippet: `font_family      ${FONT_FAMILY}\nfont_size 14\ndisable_ligatures never`,
+	},
+	wezterm: {
+		file: "~/.wezterm.lua",
+		writablePath: join(HOME, ".wezterm.lua"),
+		// WezTerm is Lua — can't blindly append inside an existing config-return block,
+		// so auto-write only appends lines that work at the end of a typical config.
+		autoBlock: `-- ${AUTO_MARKER}\nconfig.font = wezterm.font("${FONT_FAMILY}")\nconfig.font_size = 14\n-- ${AUTO_END}`,
+		snippet: `config.font = wezterm.font("${FONT_FAMILY}")\nconfig.font_size = 14`,
+	},
+	alacritty: {
+		file: "~/.config/alacritty/alacritty.toml",
+		writablePath: join(HOME, ".config", "alacritty", "alacritty.toml"),
+		autoBlock: `${AUTO_MARKER}\n[font]\nnormal = { family = "${FONT_FAMILY}" }\nsize = 14\n${AUTO_END}`,
+		snippet: `[font]\nnormal = { family = "${FONT_FAMILY}" }\nsize = 14`,
+	},
+	vscode: {
+		file: "settings.json (Terminal › Integrated: Font Family)",
+		writablePath: null, // settings.json is JSON-with-comments; safer to show snippet
+		autoBlock: "",
+		snippet: JSON.stringify(
+			{ "terminal.integrated.fontFamily": FONT_FAMILY, "terminal.integrated.fontSize": 14 },
+			null,
+			2,
+		),
+	},
+	iterm2: {
+		file: "Preferences → Profiles → Text",
+		writablePath: null,
+		autoBlock: "",
+		snippet: `Font → ${FONT_FAMILY}, 14pt · enable "Use a different font for non-ASCII text" pointing at the same family`,
+	},
+	apple: {
+		file: "Settings → Profiles → Text",
+		writablePath: null,
+		autoBlock: "",
+		snippet: `Font → ${FONT_FAMILY}, 14pt (Terminal.app ต้องเปลี่ยนเองในหน้า Settings)`,
+	},
+	windows: {
+		file: "Windows Terminal settings.json",
+		writablePath: null,
+		autoBlock: "",
+		snippet: JSON.stringify({ profiles: { defaults: { font: { face: FONT_FAMILY, size: 14 } } } }, null, 2),
+	},
+	unknown: null,
+};
 
 export default function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------- theme
@@ -47,83 +184,126 @@ export default function (pi: ExtensionAPI) {
 		return { themePaths: [THEME_DIR] };
 	});
 
-	// Status reminder while in a session.
+	// Status reminder + silent font auto-install while in a session.
 	pi.on("session_start", async (_event, ctx) => {
-		if (ctx.hasUI) ctx.ui.setStatus("thai", `ฟอนต์: ${FONT_FAMILY} · ธีม: ${THEME_NAME}`);
+		let fontNote = FONT_FAMILY;
+		if (!fontsInstalled()) {
+			const err = installFonts();
+			if (err === null) {
+				fontNote += " (ติดตั้งอัตโนมัติแล้ว ✓ — restart terminal 1 ครั้ง)";
+				if (ctx.hasUI)
+					ctx.ui.notify(
+						`ติดตั้งฟอนต์ ${FONT_FAMILY} เข้าระบบแล้วอัตโนมัติ — restart terminal 1 ครั้ง แล้วใช้ /terminal-font เพื่อตั้งค่า terminal ของคุณ`,
+						"info",
+					);
+			} else if (err === "manual") {
+				fontNote += " (ยังไม่ได้ติดตั้ง — ดู /terminal-font)";
+			}
+		}
+		if (ctx.hasUI) ctx.ui.setStatus("thai", `ฟอนต์: ${fontNote} · ธีม: ${THEME_NAME}`);
 	});
 
-	// ---------------------------------------------------------------- font config snippets
+	// ---------------------------------------------------------------- font setup
 
-	const SNIPPETS: Record<string, { file: string; config: string }> = {
-		ghostty: {
-			file: "~/.config/ghostty/config",
-			config: [
-				`font-family = ${FONT_FAMILY}`,
-				`font-size = 14`,
-				`# Thai combining marks + consistent cell widths`,
-				`adjust-cell-width = 0%`,
-			].join("\n"),
-		},
-		kitty: {
-			file: "~/.config/kitty/kitty.conf",
-			config: [
-				`font_family      ${FONT_FAMILY}`,
-				`font_size 14`,
-				`disable_ligatures never`,
-			].join("\n"),
-		},
-		wezterm: {
-			file: "~/.wezterm.lua",
-			config: [
-				`config.font = wezterm.font("${FONT_FAMILY}")`,
-				`config.font_size = 14`,
-			].join("\n"),
-		},
-		alacritty: {
-			file: "~/.config/alacritty/alacritty.toml",
-			config: [
-				`[font]`,
-				`normal = { family = "${FONT_FAMILY}" }`,
-				`size = 14`,
-			].join("\n"),
-		},
-		iterm2: {
-			file: "Preferences → Profiles → Text",
-			config: `Font → ${FONT_FAMILY}, 14pt · enable "Use a different font for non-ASCII text" pointing at the same family`,
-		},
-		vscode: {
-			file: "settings.json",
-			config: JSON.stringify(
-				{ "terminal.integrated.fontFamily": FONT_FAMILY, "terminal.integrated.fontSize": 14 },
-				null,
-				2,
-			),
-		},
-	};
+	/** Append the auto-block to a terminal config file (idempotent, with backup). */
+	function writeTerminalConfig(path: string, block: string): string {
+		const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+		if (existing.includes(AUTO_MARKER)) return "already";
+		mkdirSync(dirname(path), { recursive: true });
+		if (existing.trim()) copyFileSync(path, `${path}.bak-pi-zense`);
+		writeFileSync(path, existing + (existing.endsWith("\n") || !existing ? "" : "\n") + block + "\n");
+		return "ok";
+	}
 
 	pi.registerCommand("terminal-font", {
-		description: `Show terminal font config for Thai support (${FONT_FAMILY}) / แสดงการตั้งค่าฟอนต์ภาษาไทย`,
+		description: `Auto-setup terminal font for Thai (${FONT_FAMILY}) / ตั้งค่าฟอนต์ภาษาไทยอัตโนมัติ`,
+		getArgumentCompletions: (prefix) =>
+			[...Object.keys(TARGETS).filter((k) => k !== "unknown"), "install-fonts"]
+				.filter((s) => s.startsWith(prefix))
+				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
-			const names = Object.keys(SNIPPETS);
-			let picked = args?.trim().toLowerCase();
-			if (!picked || !SNIPPETS[picked]) {
-				if (!ctx.hasUI) return;
-				picked = (await ctx.ui.select(
-					`ติดตั้ง ${FONT_FAMILY} ก่อน: ${FONT_DOWNLOAD} — เลือกเทอร์มินัลของคุณ:`,
-					names,
-				)) ?? undefined;
+			let picked = args?.trim().toLowerCase() as TerminalId | "install-fonts" | "";
+
+			// Explicit font (re)install — useful on Windows or after OS font cache issues.
+			if (picked === "install-fonts") {
+				if (process.platform === "win32") {
+					ctx.ui.notify(
+						`Windows: เปิดโฟลเดอร์ฟอนต์ของ package (${FONT_DIR}) แล้ว double-click ไฟล์ .ttf ทั้งสองเพื่อติดตั้ง`,
+						"info",
+					);
+					return;
+				}
+				const err = installFonts();
+				ctx.ui.notify(
+					err === null ? `ติดตั้ง ${FONT_FAMILY} เข้า ${userFontDir()} แล้ว ✓` : `ติดตั้งไม่สำเร็จ: ${err}`,
+					err === null ? "info" : "error",
+				);
+				return;
 			}
-			if (!picked || !SNIPPETS[picked]) return;
-			const s = SNIPPETS[picked];
-			const out = [
-				`# ${FONT_FAMILY} → ${picked}`,
-				`# 1. Install / ติดตั้ง: ${FONT_DOWNLOAD}`,
-				`#    Strict-mono fallback / สำรอง: ${FONT_FALLBACK}`,
-				`# 2. Edit ${s.file}:`,
-				``,
-				s.config,
-			].join("\n");
-			ctx.ui.notify(out, "info");
+
+			// Default: auto-detect the current terminal.
+			let detected: TerminalId = "unknown";
+			if (!picked || !(picked in TARGETS)) {
+				detected = detectTerminal();
+				picked = detected;
+			}
+			if (!ctx.hasUI) return;
+
+			let target = TARGETS[picked as TerminalId];
+			if (!target) {
+				// Unknown terminal — let the user pick one manually.
+				const names = Object.keys(TARGETS).filter((k) => k !== "unknown");
+				const chosen = await ctx.ui.select(
+					`ตรวจจับ terminal ไม่ได้ — เลือกเทอร์มินัลของคุณ (ฟอนต์ ${FONT_FAMILY} ถูกติดตั้งเข้าระบบให้แล้วอัตโนมัติบน macOS/Linux):`,
+					names,
+				);
+				if (!chosen) return;
+				picked = chosen as TerminalId;
+				target = TARGETS[picked]!;
+			}
+
+			// Auto-write path: confirm, backup, append marked block.
+			if (target.writablePath) {
+				const exists = existsSync(target.writablePath);
+				const already = exists && readFileSync(target.writablePath, "utf8").includes(AUTO_MARKER);
+				if (already) {
+					ctx.ui.notify(`${target.file} มีการตั้งค่าของ pi-zense อยู่แล้ว ✓ — restart terminal ถ้ายังไม่เห็นฟอนต์`, "info");
+					return;
+				}
+				const ok = await ctx.ui.confirm(
+					`เขียน config อัตโนมัติ`,
+					`เพิ่มการตั้งค่าฟอนต์ ${FONT_FAMILY} ลงใน ${target.file}?${exists ? " (ไฟล์เดิมจะถูก backup เป็น .bak-pi-zense)" : ""}`,
+				);
+				if (!ok) {
+					ctx.ui.notify(`# เพิ่มเองใน ${target.file}:\n\n${target.snippet}`, "info");
+					return;
+				}
+				const result = writeTerminalConfig(target.writablePath, target.autoBlock);
+				if (result === "ok")
+					ctx.ui.notify(
+						`เขียน config ลง ${target.file} แล้ว ✓ — **restart terminal 1 ครั้ง** เพื่อให้ฟอนต์มีผล`,
+						"info",
+					);
+				else ctx.ui.notify(`เขียน config ไม่สำเร็จ — เพิ่มเองใน ${target.file}:\n\n${target.snippet}`, "error");
+				return;
+			}
+
+			// Snippet-only path (iterm2 / apple / windows / vscode).
+			const fontStatus = fontsInstalled()
+				? `ฟอนต์ ${FONT_FAMILY} ติดตั้งเข้าระบบแล้ว ✓`
+				: process.platform === "win32"
+					? `Windows: double-click ไฟล์ .ttf ใน ${FONT_DIR} เพื่อติดตั้งฟอนต์`
+					: `ติดตั้งฟอนต์: ${FONT_DOWNLOAD}`;
+			ctx.ui.notify(
+				[
+					`# ${FONT_FAMILY} → ${picked} (ตั้งเองใน ${target.file})`,
+					`# ${fontStatus}`,
+					`# Strict-mono fallback / สำรอง: ${FONT_FALLBACK}`,
+					``,
+					target.snippet,
+				].join("\n"),
+				"info",
+			);
 		},
 	});
 
@@ -170,7 +350,7 @@ ${"    "}|....|....|  ruler alignment check
 }</pre></div>
 
 <div class="card"><h1>สีธีม (theme palette)</h1><table>
-${Object.entries(theme.colors)
+${Object.entries(theme.colors as Record<string, string | number>)
 	.map(([k, v]) => `<tr><td>${k}</td><td style="color:${resolve(v)}">ตัวอย่างข้อความ Thai text</td><td><span class="sw" style="background:${resolve(v)}"></span>${resolve(v)}</td></tr>`)
 	.join("\n")}
 </table></div>

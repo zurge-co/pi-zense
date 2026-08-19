@@ -53,6 +53,7 @@ interface State {
 	trajectoryFlags: string[];
 	gateEnabled: boolean;
 	subagentRuns: SubagentRun[];
+	lastCompileLessons?: number;    // จำนวนบทเรียนจาก memory ที่ feed เข้า compile_spec ล่าสุด
 }
 interface SubagentRun {
 	role: string;
@@ -141,6 +142,60 @@ function runSubagent(
 	});
 }
 
+// ----------------------------------------------------------------------------- memory summary (module scope — export เพื่อ unit-test ได้)
+
+export interface MemoryAgg {
+	total: number;
+	flags: Map<string, number>;
+	esc: Map<string, number>;
+	evals: string[];
+	subFails: Map<string, number>;
+	misc: number;
+}
+
+/** note format conventions (parse targets): "escalation: <kind>: <detail>",
+ *  "flag: <msg>", "signed spec vN", "sub-agent failed: <role>", "eval: spec vN → ... verdict=X" */
+export const aggregateMemory = (cwd: string): MemoryAgg => {
+	const agg: MemoryAgg = { total: 0, flags: new Map(), esc: new Map(), evals: [], subFails: new Map(), misc: 0 };
+	const f = join(zenseDir(cwd), "memory.jsonl");
+	if (!existsSync(f)) return agg;
+	const bump = (m: Map<string, number>, k: string) => m.set(k, (m.get(k) ?? 0) + 1);
+	for (const line of readFileSync(f, "utf8").split("\n")) {
+		if (!line.trim()) continue;
+		agg.total++;
+		let note = line;
+		try {
+			note = String(JSON.parse(line).note ?? line);
+		} catch {
+			/* tolerate non-JSON lines */
+		}
+		let m: RegExpMatchArray | null;
+		if ((m = note.match(/^escalation: ([\w-]+):/))) bump(agg.esc, m[1]);
+		else if (note.startsWith("flag: ")) bump(agg.flags, note.slice(6).slice(0, 60));
+		else if ((m = note.match(/^eval: (.*)/))) agg.evals.push(m[1].slice(0, 60));
+		else if ((m = note.match(/^sub-agent failed: (\w+)/))) bump(agg.subFails, m[1]);
+		else agg.misc++;
+	}
+	return agg;
+};
+
+export const topEntries = (m: Map<string, number>, n: number): string =>
+	[...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, c]) => `${k} ×${c}`).join(", ");
+
+/** สรุปแบบกลุ่ม — ใช้ทั้งโชว์ใน /zense memory และ feed เข้า requirements sub-agent */
+export const memorySummaryLines = (cwd: string): string[] => {
+	const agg = aggregateMemory(cwd);
+	if (!agg.total) return [];
+	return [
+		`📚 Zense memory — ${agg.total} lessons`,
+		`▸ top recurring flags : ${topEntries(agg.flags, 5) || "(none)"}`,
+		`▸ escalations         : ${topEntries(agg.esc, 5) || "(none)"}`,
+		`▸ eval history        : ${agg.evals.join(" | ") || "(none)"}`,
+		`▸ sub-agent failures  : ${topEntries(agg.subFails, 5) || "(none)"}`,
+		...(agg.misc ? [`▸ other notes         : ${agg.misc}`] : []),
+	];
+};
+
 // ----------------------------------------------------------------------------- extension
 
 export default function (pi: ExtensionAPI) {
@@ -204,6 +259,7 @@ export default function (pi: ExtensionAPI) {
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
+			if (!r.ok) learn(ctx, `sub-agent failed: ${role} — ${r.output.split("\n")[0].slice(0, 160)}`);
 			return r;
 		} finally {
 			clearInterval(tick);
@@ -211,6 +267,7 @@ export default function (pi: ExtensionAPI) {
 			updateWidget(ctx);
 		}
 	};
+
 
 	// ----- Phase 1 gate: no implementation on unapproved spec (hard enforcement)
 
@@ -247,6 +304,7 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "sign" || choice?.startsWith("🔏")) approveCurrentSpec(ctx); // เซ็น = เปิด gate, ทำงานต่อเลย
 			else if (choice === "override" || choice?.startsWith("⚠️")) {
 				state.trajectoryFlags.push(`unsigned override: ${ev.toolName}`);
+				learn(ctx, `flag: unsigned override: ${ev.toolName}`);
 				ctx.ui.notify("⚠ override โดยไม่เซ็น spec — เพิ่ม trajectory flag", "warning");
 			} else {
 				escalate("need-permission", "write blocked: spec unsigned", ctx);
@@ -307,12 +365,14 @@ export default function (pi: ExtensionAPI) {
 	const flag = (msg: string, ctx: ExtensionContext) => {
 		if (!state.trajectoryFlags.includes(msg)) {
 			state.trajectoryFlags.push(msg);
+			learn(ctx, `flag: ${msg}`);
 			ctx.ui.notify(`⚠ trajectory-eval: ${msg}`, "warning");
 		}
 	};
 
 	const escalate = (kind: string, detail: string, ctx: ExtensionContext) => {
 		state.escalations.push({ kind, detail, at: Date.now() });
+		learn(ctx, `escalation: ${kind}: ${detail}`);
 		persist();
 		updateWidget(ctx);
 	};
@@ -324,7 +384,15 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 			const title = new Text(theme.fg("accent", theme.bold(`🔏 ${question}`)), 1, 0);
-			const hint = new Text(theme.fg("warning", "อ่าน spec ข้างล่างให้ครบก่อนตัดสินใจเซ็น"), 1, 0);
+			const hint = new Text(
+				theme.fg(
+					"warning",
+					`อ่าน spec ข้างล่างให้ครบก่อนตัดสินใจเซ็น` +
+						(state.lastCompileLessons ? ` · 📚 fed ${state.lastCompileLessons} lessons from memory ตอน compile` : ""),
+				),
+				1,
+				0,
+			);
 			const md = new Markdown(renderSpecMd(spec), 0, 0, {
 				heading: (t) => theme.fg("accent", theme.bold(t)),
 				link: (t) => theme.fg("accent", t),
@@ -372,7 +440,7 @@ export default function (pi: ExtensionAPI) {
 					for (let i = slice.length; i < h; i++) out.push(""); // รักษาความสูง dialog ให้นิ่ง
 					const range =
 						lines.length > h
-							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — PgUp/PgDn เลื่อน —`
+							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — เลื่อน: Space/b, Ctrl+D/U (ครึ่งหน้า), PgUp/PgDn, g/Home/End —`
 							: `— spec ครบทุกบรรทัด (${lines.length} lines) —`;
 					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
 					out.push(...selectList.render(w));
@@ -384,8 +452,19 @@ export default function (pi: ExtensionAPI) {
 					cachedWidth = -1;
 				},
 				handleInput: (data: string) => {
-					if (matchesKey(data, Key.pageDown)) offset = Math.min(maxOffset(), offset + bodyRows());
-					else if (matchesKey(data, Key.pageUp)) offset = Math.max(0, offset - bodyRows());
+					// PgUp/PgDn terminal หลายตัวไม่ส่ง key นี้เข้ามา (เช่น macOS Terminal/iTerm จับไป scroll เอง,
+					// หรือต้องกด fn+↑/fn+↓) — เลยเติมปุ่มสำรองแบบ less/vim ที่กดได้แน่ๆ ทุก session:
+					//   Space เลื่อนลงเต็มหน้า, b เลื่อนขึ้นเต็มหน้า, Ctrl+D/U ครึ่งหน้า, g = บนสุด, Home/End กระโดด
+					if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.space))
+						offset = Math.min(maxOffset(), offset + bodyRows());
+					else if (matchesKey(data, Key.pageUp) || data === "b")
+						offset = Math.max(0, offset - bodyRows());
+					else if (matchesKey(data, Key.ctrl("d")))
+						offset = Math.min(maxOffset(), offset + Math.max(1, bodyRows() >> 1));
+					else if (matchesKey(data, Key.ctrl("u")))
+						offset = Math.max(0, offset - Math.max(1, bodyRows() >> 1));
+					else if (data === "g" || matchesKey(data, Key.home)) offset = 0;
+					else if (matchesKey(data, Key.end)) offset = maxOffset();
 					else selectList.handleInput(data);
 					tui.requestRender();
 				},
@@ -490,6 +569,7 @@ export default function (pi: ExtensionAPI) {
 		state.spec.approved = true;
 		state.spec.approvedAt = Date.now();
 		state.phase = "implementation";
+		learn(ctx, `signed spec v${state.spec.version}`);
 		persist();
 		updateWidget(ctx);
 		ctx.ui.notify(`🔏 Spec v${state.spec.version} signed — implementation gate open.`, "info");
@@ -527,10 +607,18 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _sig, _on, ctx) {
 			if (params.action === "compile_spec") {
+				// Layer 3 (learning loop): ป้อนบทเรียนสะสมจาก memory.jsonl เข้า prompt
+				// ให้ spec ใหม่สะท้อน incident เก่า เช่น scope เคยกว้างเกิน/เคย override บ่อย
+				const lessons = memorySummaryLines(ctx.cwd);
+				state.lastCompileLessons = lessons.length ? aggregateMemory(ctx.cwd).total : 0;
 				const draft = await launchSubagent(
 					ctx,
 					"requirements",
-					`You are the REQUIREMENTS sub-agent. Produce a JSON spec {title,intent,scope[],constraints[],criteria[{id,text,check}],specDebt[]} from this request; criteria[.check] must be machine-checkable where possible. Output ONLY JSON.\n\nRequest: ${params.intent}`,
+					`You are the REQUIREMENTS sub-agent. Produce a JSON spec {title,intent,scope[],constraints[],criteria[{id,text,check}],specDebt[]} from this request; criteria[.check] must be machine-checkable where possible. Output ONLY JSON.` +
+						(lessons.length
+							? `\n\nPast lessons from this project's memory (reflect relevant ones in scope/constraints/criteria when they apply):\n${lessons.join("\n")}`
+							: "") +
+						`\n\nRequest: ${params.intent}`,
 				);
 				return { content: [{ type: "text", text: draft.ok ? draft.output : `sub-agent failed: ${draft.output}` }], details: draft };
 			}
@@ -648,6 +736,8 @@ export default function (pi: ExtensionAPI) {
 					.join("\n")}\nOutput a verdict table then OVERALL: PASS|FAIL.`,
 				streamTail,
 			);
+			const verdict = grade.output.match(/OVERALL:\s*(PASS|FAIL)/i)?.[1]?.toUpperCase() ?? "unknown";
+			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict}`);
 			const report = `${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
 			state.phase = "review";
 			persist(); updateWidget(ctx);
@@ -696,6 +786,7 @@ export default function (pi: ExtensionAPI) {
 		appendFileSync(join(zenseDir(ctx.cwd), "memory.jsonl"), JSON.stringify({ at: Date.now(), phase: state.phase, note }) + "\n");
 	};
 
+
 	// ----- human gates: commands
 
 	pi.registerShortcut("ctrl+shift+a", {
@@ -735,8 +826,17 @@ export default function (pi: ExtensionAPI) {
 			} else if (sub === "agents") {
 				await openAgentsViewer(ctx);
 			} else if (sub === "memory") {
-				const f = join(zenseDir(ctx.cwd), "memory.jsonl");
-				ctx.ui.notify(existsSync(f) ? readFileSync(f, "utf8").slice(-2000) : "(empty)", "info");
+				if (rest[0] === "json") {
+					// raw JSONL tail (ดิบ)
+					const f = join(zenseDir(ctx.cwd), "memory.jsonl");
+					ctx.ui.notify(existsSync(f) ? readFileSync(f, "utf8").slice(-2000) : "(empty)", "info");
+				} else {
+					const lines = memorySummaryLines(ctx.cwd);
+					ctx.ui.notify(
+						lines.length ? [...lines, "(raw: /zense memory json)"].join("\n") : "📚 memory ยังว่าง — บทเรียนจะสะสมเองทุก escalation/flag/eval/sub-agent fail",
+						"info",
+					);
+				}
 			} else {
 				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory", "info");
 			}

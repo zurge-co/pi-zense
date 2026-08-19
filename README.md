@@ -1,10 +1,10 @@
 # pi-zense
 
-> **Spec-gated SDLC harness for pi.** Human attention is the scarcest resource in AI-driven development — pi-zense concentrates it at exactly two gates (spec approval, review) and automates everything between.
+> **Spec-gated, human-signed SDLC harness for pi.** Human attention is the scarcest resource in AI-driven development — pi-zense concentrates it at exactly two gates (spec approval, review) and automates everything between.
 
-`pi-zense` (pi + **zense** / ぜんせ / Zen-sense รอบรู้ตลอดวงจร) bundles:
+`pi-zense` (pi + **zense** / **เซ็น** / sign — ทุกครั้งที่สั่ง agent ทำงาน มีลายเซ็นของมนุษย์กำกับไว้เสมอ) bundles:
 
-1. **`sdlc-harness`** — implements the AI-SDLC loop: **spec → criteria → implementation → dual eval → exception review → learn**. Phase tasks are delegated to **isolated pi sub-agents** (`pi -p`, clean context per phase).
+1. **`zense-harness`** — implements the AI-SDLC loop โดยมี human signature เป็นแกนกลาง: **spec → criteria → implementation → dual eval → exception review → learn**. Phase tasks are delegated to **isolated pi sub-agents** (`pi -p`, clean context per phase).
 2. **`zense` theme** — dark theme built on the Zense design system (green `#00c55a` → lime `#6cdd25` → gold `#facd04` on near-black surfaces).
 
 ## Install
@@ -21,25 +21,26 @@ Enable the theme: `/settings` → theme → `zense`, or set
 { "theme": "zense" }
 ```
 
-## sdlc-harness: what the harness does
+## zense-harness: what the harness does
 
 | Phase (per PLAN.md) | Mechanism | Artifact |
 |---|---|---|
-| **1. Requirements** — spec is the contract | `sdlc_spec` tool; `action:"compile_spec"` delegates drafting to the requirements sub-agent | append-only archive `.pi/sdlc/specs/<timestamp>-v{n}-<slug>.{json,md}` (never overwritten) with machine-checkable criteria & **spec debt**; `.pi/sdlc/spec.{json,md}` = latest copies |
-| **Gate** — never implement on unapproved spec | `tool_call` interceptor blocks `write`/`edit` until a human runs `/sdlc approve` | hard gate |
-| **2. Design** — ADRs prevent architectural drift | `sdlc_adr` tool; `DENY: <path>` rules enforced live on every write; irreversible ADRs flagged for human approval | `.pi/sdlc/adr/NNN-*.md` |
+| **1. Requirements** — spec is the contract | `zense_spec` tool; `action:"compile_spec"` delegates drafting to the requirements sub-agent | append-only archive `.pi/zense/specs/<timestamp>-v{n}-<slug>.{json,md}` (never overwritten) with machine-checkable criteria & **spec debt**; `.pi/zense/spec.{json,md}` = latest copies |
+| **Gate** — never implement on unsigned spec | `tool_call` interceptor stops `write`/`edit` with a **3-choice signing dialog** (🔏 sign & continue / ⚠ one-off override / ⛔ block) | hard gate + dialog signature |
+| **2. Design** — ADRs prevent architectural drift | `zense_adr` tool; `DENY: <path>` rules enforced live on every write; irreversible ADRs flagged for human approval | `.pi/zense/adr/NNN-*.md` |
 | **3. Implementation** — escalation taxonomy | turn/token usage meter; escalation taxonomy: need-permission / need-decision / something-wrong | live widget meter |
-| **4. Dual eval** — output *and* trajectory | `sdlc_eval` → grader sub-agent judges each criterion PASS/FAIL (closes spec→eval loop); `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
-| **5. Review** — exception-based, not wall-of-diff | `sdlc_review` → reviewer sub-agent builds an incident-report-style **review packet** rendered as a transcript card (TL;DR first) | review packet card |
-| **6. Maintenance** — learn every run | escalations/reviews appended to `.pi/sdlc/memory.jsonl`; state persisted via session entries | `/sdlc memory` |
+| **4. Dual eval** — output *and* trajectory | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL (closes spec→eval loop); `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
+| **5. Review** — exception-based, not wall-of-diff | `zense_review` → reviewer sub-agent builds an incident-report-style **review packet** rendered as a transcript card (TL;DR first) | review packet card |
+| **6. Maintenance** — learn every run | escalations/reviews appended to `.pi/zense/memory.jsonl`; state persisted via session entries | `/zense memory` |
 
 ### Human actions (by design: minimal)
 
 ```text
-/sdlc status                 # one-glance: phase, gate, flags, escalations
-/sdlc approve                # 🔏 gate 1 — sign the spec contract
-/sdlc gate on|off            # escape hatch
-/sdlc memory                 # tail the learning log
+/zense status                 # one-glance: phase, gate, flags, escalations
+# gate 1 happens IN the dialog — no command needed
+/zense approve                # 🔏 sign later, only if you skipped the dialog
+/zense gate on|off            # escape hatch
+/zense memory                 # tail the learning log
 ```
 
 Then just tell the agent what to build; the harness gates, evaluates, and hands you a review packet.
@@ -54,14 +55,14 @@ Dark theme from the Zense design system: brand gradient green → lime → gold 
 pi-zense/
 ├── package.json                  # pi manifest
 ├── extensions/
-│   └── sdlc-harness/ index.ts, README.md
+│   └── zense-harness/ index.ts, README.md
 ├── themes/
 │   └── zense.json                # Zense design-system dark theme
 └── docs/
     └── HUMAN-ACTIONS.md          # คู่มือมุมมองผู้ใช้ (ไทย)
 ```
 
-Per-project runtime artifacts live under each repo's `.pi/sdlc/` (append-only `specs/` archive, ADRs, memory) — spec-as-code, diffable and auditable.
+Per-project runtime artifacts live under each repo's `.pi/zense/` (append-only `specs/` archive, ADRs, memory) — spec-as-code, diffable and auditable.
 
 ## License
 

@@ -31,7 +31,7 @@ Enable the theme: `/settings` → theme → `zense`, or set
 | **3. Implementation** — escalation taxonomy | turn/token usage meter; escalation taxonomy: need-permission / need-decision / something-wrong | live widget meter |
 | **4. Dual eval** — output *and* trajectory | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL (closes spec→eval loop); **sub-agent output streams live into the transcript while it runs** — watch it anytime via `ctrl+shift+a` / `/zense agents` (live tail of `.pi/zense/subagents/*.log`); `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
 | **5. Review** — exception-based, not wall-of-diff | `zense_review` → reviewer sub-agent builds an incident-report-style **review packet** rendered as a transcript card (TL;DR first) | review packet card |
-| **6. Maintenance** — learn every run | escalations/reviews appended to `.pi/zense/memory.jsonl`; state persisted via session entries | `/zense memory` |
+| **6. Maintenance** — learn every run | every escalation/flag/signing/eval-verdict/sub-agent-failure appended to `.pi/zense/memory.jsonl`; lessons are **fed back into `compile_spec`** so new specs reflect past incidents | `/zense memory` (grouped summary; `/zense memory json` = raw) |
 
 ### Human actions (by design: minimal)
 
@@ -41,7 +41,7 @@ Enable the theme: `/settings` → theme → `zense`, or set
 /zense approve                # 🔏 sign later, only if you skipped the dialog
 ctrl+shift+a                  # watch sub-agent runs LIVE (grader/reviewer) — or /zense agents
 /zense gate on|off            # escape hatch
-/zense memory                 # tail the learning log
+/zense memory                 # grouped lesson summary (top flags / escalations / eval history); /zense memory json = raw tail
 ```
 
 Then just tell the agent what to build; the harness gates, evaluates, and hands you a review packet.

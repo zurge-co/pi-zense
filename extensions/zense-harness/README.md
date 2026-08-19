@@ -24,7 +24,7 @@ finished artifact — exactly the harness design plan.md recommends.
 | P4 Output eval — spec→eval closed loop | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL | verdict text |
 | P4 Trajectory eval | `agent_end` heuristics: test files modified/deleted, out-of-scope writes, retry storms | `trajectoryFlags` |
 | P5 Review — exception-based, incident-report style | `zense_review` → reviewer sub-agent builds **review packet** (TL;DR first), rendered in transcript via `registerEntryRenderer` | card + entry |
-| P6 Maintenance — learn | every review/escalation logged to `.pi/zense/memory.jsonl` | `/zense memory` |
+| P6 Maintenance — learn | every escalation/flag/signing/eval verdict/sub-agent failure logged to `.pi/zense/memory.jsonl`; lessons feed back into `compile_spec` prompts (closed learning loop) | `/zense memory` = grouped summary, `/zense memory json` = raw tail |
 
 ## Human attention points (the scarce resource, per PLAN.md)
 
@@ -42,7 +42,7 @@ finished artifact — exactly the harness design plan.md recommends.
 | `/zense approve` | sign current spec later (usually unnecessary — dialog covers it) |
 | `ctrl+shift+a` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.pi/zense/subagents/*.log` (written live while they run) |
 | `/zense gate off` | disable the spec gate (escape hatch) |
-| `/zense memory` | tail the learning log |
+| `/zense memory` | grouped lesson summary (top recurring flags, escalations by kind, eval history, sub-agent failures); `/zense memory json` for the raw JSONL tail |
 
 ## Agent-facing tools
 

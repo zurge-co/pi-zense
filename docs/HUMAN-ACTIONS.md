@@ -69,10 +69,12 @@ grader sub-agent เช็คผลงานเทียบทุก criterion �
 
 **📍 หน้าที่คุณ:** อ่าน TL;DR → accept / สั่งแก้ / ย้อนด้วย `/tree`
 
-## 6. Maintenance
+## 6. Maintenance — memory เรียนรู้อัตโนมัติ
 
-- `/zense memory` — ดู learning log
-- production incident → บอก agent แปลงเป็น criterion ใหม่ใน spec รอบหน้า
+- ทุก escalation / trajectory flag / การเซ็น/override spec / eval verdict / sub-agent fail ถูกเขียนลง `.pi/zense/memory.jsonl` เอง — ไม่ต้องทำอะไร
+- `/zense memory` — ดูสรุปเป็นกลุ่ม (top flags, escalations by kind, eval history, sub-agent failures); อยากดู raw ใช้ `/zense memory json`
+- บทเรียนสะสมจะถูก **feed เข้า compile_spec อัตโนมัติ** — spec ถัดไปจะ reflect incident เก่า เช่น scope เคยกว้างเกิน, override บ่อย (sign dialog จะมี hint `📚 fed N lessons` บอกด้วย)
+- production incident → บอก agent แปลงเป็น criterion ใหม่ใน spec รอบหน้า (หรือมันถูก memory ดูดเข้าไปเองถ้าเกิด flag/escalation)
 
 ## Cheat sheet คำสั่งสำหรับมนุษย์
 
@@ -83,7 +85,7 @@ grader sub-agent เช็คผลงานเทียบทุก criterion �
 | `/zense status` | ทุกเวลา | phase / flags / escalations |
 | `ctrl+shift+a` หรือ `/zense agents` | ระหว่าง sub-agent รัน / ย้อนหลัง | ดู live tail ของ grader/reviewer กันสับสนว่าค้างไหม |
 | `/zense gate on\|off` | ฉุกเฉิน | ปิด/เปิด spec gate |
-| `/zense memory` | จบงาน | ดู learning log |
+| `/zense memory` | ทุกเวลา / จบงาน | ดูบทเรียนสรุปเป็นกลุ่ม (`json` = raw) |
 
 สรุป: **พิมพ์ requirement → เซ็นใน dialog → ปล่อยจนจบ → อ่าน review packet**
 interaction ส่วนใหญ่มีแค่นี้ — zense (เซ็น) คือลายเซ็นของคุณใน dialog เดียวจบ

@@ -10,8 +10,9 @@
  *   - Gates are enforced with pi's tool_call interception + human confirms.
  *
  * Phases:
- *   P1 Requirements : sdlc_spec tool → .pi/sdlc/spec.md + machine-checkable
- *                     .pi/sdlc/spec.json (acceptance criteria, scope, spec-debt)
+ *   P1 Requirements : sdlc_spec tool → append-only archive .pi/sdlc/specs/
+ *                     <timestamp>-v{n}-<slug>.{json,md} (never overwritten) +
+ *                     .pi/sdlc/spec.{json,md} as always-latest copies
  *   P2 Design       : sdlc_adr tool → .pi/sdlc/adr/NNN-*.md (deny rules checked live)
  *   P3 Implementation: specification gate + escalation
  *   P4 Dual eval    : sdlc_eval (output eval vs criteria) + trajectory heuristics
@@ -19,7 +20,7 @@
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
  */
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { Type } from "typebox";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -257,13 +258,26 @@ export default function (pi: ExtensionAPI) {
 				specDebt: params.specDebt ?? [],
 				approved: false,
 			};
+			// Specs are append-only: every version gets a unique timestamped file in
+			// .pi/sdlc/specs/ so any past spec can be re-read. spec.{json,md} stay as
+			// always-latest convenience copies.
 			mkdirSync(sdlcDir(ctx.cwd), { recursive: true });
-			writeFileSync(join(sdlcDir(ctx.cwd), "spec.json"), JSON.stringify(state.spec, null, 2));
-			writeFileSync(join(sdlcDir(ctx.cwd), "spec.md"), renderSpecMd(state.spec));
+			const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-"); // YYYY-MM-DD-HH-mm-ss
+			const slug =
+				(state.spec.title ?? "untitled").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40) ||
+				"untitled";
+			const specDir = join(sdlcDir(ctx.cwd), "specs");
+			mkdirSync(specDir, { recursive: true });
+			const jsonPath = join(specDir, `${stamp}-v${version}-${slug}.json`);
+			const mdPath = join(specDir, `${stamp}-v${version}-${slug}.md`);
+			writeFileSync(jsonPath, JSON.stringify(state.spec, null, 2));
+			writeFileSync(mdPath, renderSpecMd(state.spec));
+			copyFileSync(jsonPath, join(sdlcDir(ctx.cwd), "spec.json"));
+			copyFileSync(mdPath, join(sdlcDir(ctx.cwd), "spec.md"));
 			persist();
 			updateWidget(ctx);
 			return {
-				content: [{ type: "text", text: `Spec v${version} written to .pi/sdlc/spec.{json,md}. NOT approved — user must run /sdlc approve.` }],
+				content: [{ type: "text", text: `Spec v${version} archived at ${mdPath} (latest copies: .pi/sdlc/spec.{json,md}). NOT approved — user must run /sdlc approve.` }],
 				details: { version },
 			};
 		},

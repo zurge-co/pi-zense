@@ -1,5 +1,9 @@
 /**
- * sdlc-harness — AI-driven SDLC harness for pi, per PLAN.md.
+ * zense-harness — AI-driven SDLC harness for pi, per PLAN.md.
+ *
+ * ชื่อ "zense" (เซ็น) พ้องเสียงกับ sign — สื่อว่าทุกครั้งที่สั่ง agent ทำงาน
+ * จะมีลายเซ็นของมนุษย์กำกับอยู่เสมอ (spec approval = ลายเซ็นฝั่ง input,
+ * review packet = การอนุมัติฝั่ง output)
  *
  * Loop: spec → criteria → implementation → dual eval → exception review → learn.
  *
@@ -10,13 +14,13 @@
  *   - Gates are enforced with pi's tool_call interception + human confirms.
  *
  * Phases:
- *   P1 Requirements : sdlc_spec tool → append-only archive .pi/sdlc/specs/
+ *   P1 Requirements : zense_spec tool → append-only archive .pi/zense/specs/
  *                     <timestamp>-v{n}-<slug>.{json,md} (never overwritten) +
- *                     .pi/sdlc/spec.{json,md} as always-latest copies
- *   P2 Design       : sdlc_adr tool → .pi/sdlc/adr/NNN-*.md (deny rules checked live)
+ *                     .pi/zense/spec.{json,md} as always-latest copies
+ *   P2 Design       : zense_adr tool → .pi/zense/adr/NNN-*.md (deny rules checked live)
  *   P3 Implementation: specification gate + escalation
- *   P4 Dual eval    : sdlc_eval (output eval vs criteria) + trajectory heuristics
- *   P5 Review/Deploy: sdlc_review builds a review-packet card (exception-based)
+ *   P4 Dual eval    : zense_eval (output eval vs criteria) + trajectory heuristics
+ *   P5 Review/Deploy: zense_review builds a review-packet card (exception-based)
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
  */
 import { execFile } from "node:child_process";
@@ -51,7 +55,7 @@ interface State {
 	subagentRuns: { role: string; ok: boolean; summary: string; at: number }[];
 }
 
-const sdlcDir = (cwd: string) => join(cwd, ".pi", "sdlc");
+const zenseDir = (cwd: string) => join(cwd, ".pi", "zense");
 
 const freshState = (): State => ({
 	phase: "requirements",
@@ -75,7 +79,7 @@ function runSubagent(
 	return new Promise((res) => {
 		execFile(
 			"env",
-			["PI_SDLC_SUBAGENT=1", "pi", "--mode", "print", "--no-session", task],
+			["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "print", "--no-session", task],
 			{ cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
 			(err, stdout, stderr) => {
 				if (err) res({ ok: false, output: (stderr || String(err)).slice(0, 4000) });
@@ -89,26 +93,26 @@ function runSubagent(
 
 export default function (pi: ExtensionAPI) {
 	// Sub-agent invocations must not re-enter the harness.
-	if (process.env.PI_SDLC_SUBAGENT === "1") return;
+	if (process.env.PI_ZENSE_SUBAGENT === "1") return;
 
 	let state = freshState();
 
 	// ----- persistence (appendEntry restores across reloads/resumes)
-	const persist = () => pi.appendEntry("sdlc-state", state);
+	const persist = () => pi.appendEntry("zense-state", state);
 	const readdirAdrs = (cwd: string): string[] => {
-		const dir = join(sdlcDir(cwd), "adr");
+		const dir = join(zenseDir(cwd), "adr");
 		if (!existsSync(dir)) return [];
 		return readdirSync(dir).filter((f) => f.endsWith(".md"));
 	};
 	const adrText = (cwd: string) =>
 		readdirAdrs(cwd)
-			.map((f) => readFileSync(join(sdlcDir(cwd), "adr", f), "utf8"))
+			.map((f) => readFileSync(join(zenseDir(cwd), "adr", f), "utf8"))
 			.join("\n---\n")
 			.slice(0, 12_000);
 
 	pi.on("session_start", async (_ev, ctx) => {
 		for (const e of ctx.sessionManager.getEntries())
-			if (e.type === "custom" && e.customType === "sdlc-state")
+			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
 		updateWidget(ctx);
 	});
@@ -116,8 +120,8 @@ export default function (pi: ExtensionAPI) {
 	const updateWidget = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
 		const s = state.spec;
-		ctx.ui.setWidget("sdlc", [
-			`SDLC ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
+		ctx.ui.setWidget("zense", [
+			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
 				` · turns ${state.turnsUsed} · tok ${Math.round(state.tokensUsed / 1000)}k` +
 				(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 				(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : ""),
@@ -132,15 +136,27 @@ export default function (pi: ExtensionAPI) {
 		if (!isWrite) return;
 
 		if (state.phase === "requirements" || !state.spec?.approved) {
-			const ok = ctx.hasUI
-				? await ctx.ui.confirm(
-						"SDLC gate: spec not approved",
-						`Block ${ev.toolName}? Approve the spec first (/sdlc approve) or override.`,
-				  )
-				: false;
-			if (!ok) {
-				escalate("need-permission", `write blocked: spec unapproved`, ctx);
-				return { block: true, reason: "Spec gate: approve the spec via /sdlc approve before implementation." };
+			if (!ctx.hasUI) {
+				escalate("need-permission", "write blocked: spec unsigned (no UI)", ctx);
+				return { block: true, reason: "Zense gate: spec ยังไม่ได้เซ็น — ให้ user เซ็นผ่าน dialog ครั้งต่อไปหรือ /zense approve ก่อน" };
+			}
+			// ลายเซ็นอยู่ที่ dialog นี่เอง — เลือกเซ็นแล้วทำงานต่อได้ทันที ไม่ต้อง /zense approve ย้ำ
+			const s = state.spec;
+			const choice = await ctx.ui.select(
+				`Zense gate: ${ev.toolName} จะเขียนโค้ดทั้งที่ spec ยังไม่ได้เซ็น${s ? ` (v${s.version}: ${s.title})` : " (ยังไม่มี spec)"}`,
+				[
+					...(s ? ["🔏 เซ็นอนุมัติ spec แล้วทำงานต่อ"] : []),
+					"⚠️ อนุญาตรอบนี้รอบเดียว (override โดยไม่เซ็น)",
+					"⛔ บล็อกไว้ก่อน (ให้ agent compile spec/รอเซ็น)",
+				],
+			);
+			if (choice?.startsWith("🔏")) approveCurrentSpec(ctx); // เซ็น = เปิด gate, ทำงานต่อเลย
+			else if (choice?.startsWith("⚠️")) {
+				state.trajectoryFlags.push(`unsigned override: ${ev.toolName}`);
+				ctx.ui.notify("⚠ override โดยไม่เซ็น spec — เพิ่ม trajectory flag", "warning");
+			} else {
+				escalate("need-permission", "write blocked: spec unsigned", ctx);
+				return { block: true, reason: "Zense gate: spec ยังไม่ได้เซ็น — เลือก 🔏 เซ็นจาก dialog ครั้งหน้า หรือให้ user รัน /zense approve" };
 			}
 		}
 
@@ -207,17 +223,29 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	};
 
+	/** 🔏 ลายเซ็น spec — helper เดียวใช้ร่วมกันโดย zense_spec dialog, gate dialog และ /zense approve */
+	const approveCurrentSpec = (ctx: ExtensionContext) => {
+		if (!state.spec) return false;
+		state.spec.approved = true;
+		state.spec.approvedAt = Date.now();
+		state.phase = "implementation";
+		persist();
+		updateWidget(ctx);
+		ctx.ui.notify(`🔏 Spec v${state.spec.version} signed — implementation gate open.`, "info");
+		return true;
+	};
+
 	// ----- tools exposed to the agent ("phase sub-agents" via pi.registerTool)
 
 	pi.registerTool({
-		name: "sdlc_spec",
-		label: "SDLC Spec",
+		name: "zense_spec",
+		label: "Zense Spec",
 		description:
 			"Phase 1 (Requirements): compile conversation requirements into a structured, versioned spec artifact with machine-checkable acceptance criteria. Human approval is required before implementation.",
 		promptSnippet: "Compile/approve the structured spec: intent, scope, criteria, spec-debt",
 		promptGuidelines: [
-			"Use sdlc_spec before any implementation to write the spec; list unverifiable requirements under specDebt.",
-			"Use sdlc_spec with action=compile_spec to delegate drafting to the requirements sub-agent.",
+			"Use zense_spec before any implementation to write the spec; list unverifiable requirements under specDebt.",
+			"Use zense_spec with action=compile_spec to delegate drafting to the requirements sub-agent.",
 		],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("set"), Type.Literal("compile_spec")] as const),
@@ -259,35 +287,49 @@ export default function (pi: ExtensionAPI) {
 				approved: false,
 			};
 			// Specs are append-only: every version gets a unique timestamped file in
-			// .pi/sdlc/specs/ so any past spec can be re-read. spec.{json,md} stay as
+			// .pi/zense/specs/ so any past spec can be re-read. spec.{json,md} stay as
 			// always-latest convenience copies.
-			mkdirSync(sdlcDir(ctx.cwd), { recursive: true });
+			mkdirSync(zenseDir(ctx.cwd), { recursive: true });
 			const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-"); // YYYY-MM-DD-HH-mm-ss
 			const slug =
 				(state.spec.title ?? "untitled").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40) ||
 				"untitled";
-			const specDir = join(sdlcDir(ctx.cwd), "specs");
+			const specDir = join(zenseDir(ctx.cwd), "specs");
 			mkdirSync(specDir, { recursive: true });
 			const jsonPath = join(specDir, `${stamp}-v${version}-${slug}.json`);
 			const mdPath = join(specDir, `${stamp}-v${version}-${slug}.md`);
 			writeFileSync(jsonPath, JSON.stringify(state.spec, null, 2));
 			writeFileSync(mdPath, renderSpecMd(state.spec));
-			copyFileSync(jsonPath, join(sdlcDir(ctx.cwd), "spec.json"));
-			copyFileSync(mdPath, join(sdlcDir(ctx.cwd), "spec.md"));
+			copyFileSync(jsonPath, join(zenseDir(ctx.cwd), "spec.json"));
+			copyFileSync(mdPath, join(zenseDir(ctx.cwd), "spec.md"));
+			// ช่วงเวลาเซ็น (zense/sign): ถามอนุมัติทันทีตอน spec ถูกนำเสนอ
+			let signed = false;
+			if (ctx.hasUI) {
+				const choice = await ctx.ui.select(
+					`🔏 เซ็น Spec v${version}: ${state.spec.title}?`,
+					[
+						"🔏 เซ็นอนุมัติ — เปิด implementation gate",
+						"✏️ ยังไม่เซ็น (จะแก้ spec ก่อน / เซ็นทีหลังด้วย /zense approve)",
+					],
+				);
+				signed = !!choice && choice.startsWith("🔏");
+				if (signed) approveCurrentSpec(ctx);
+			}
 			persist();
 			updateWidget(ctx);
+			const verb = signed ? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open" : "NOT approved — เซ็นทีหลังด้วย /zense approve";
 			return {
-				content: [{ type: "text", text: `Spec v${version} archived at ${mdPath} (latest copies: .pi/sdlc/spec.{json,md}). NOT approved — user must run /sdlc approve.` }],
-				details: { version },
+				content: [{ type: "text", text: `Spec v${version} archived at ${mdPath} (latest copies: .pi/zense/spec.{json,md}). ${verb}.` }],
+				details: { version, approved: signed },
 			};
 		},
 	});
 
 	pi.registerTool({
-		name: "sdlc_adr",
-		label: "SDLC ADR",
+		name: "zense_adr",
+		label: "Zense ADR",
 		description:
-			"Phase 2 (Design): record an Architecture Decision Record. One-way-door decisions need human approval (/sdlc adr-approve N). ADRs are re-read before every implementation run and DENY rules are enforced live.",
+			"Phase 2 (Design): record an Architecture Decision Record. One-way-door decisions need human approval (/zense adr-approve N). ADRs are re-read before every implementation run and DENY rules are enforced live.",
 		promptSnippet: "Record an architecture decision (ADR) with status and optional DENY rules",
 		parameters: Type.Object({
 			title: Type.String(),
@@ -297,7 +339,7 @@ export default function (pi: ExtensionAPI) {
 			denyRules: Type.Optional(Type.Array(Type.String(), { description: "Path substrings forbidden by this decision" })),
 		}),
 		async execute(_id, p, _s, _o, ctx) {
-			const dir = join(sdlcDir(ctx.cwd), "adr");
+			const dir = join(zenseDir(ctx.cwd), "adr");
 			mkdirSync(dir, { recursive: true });
 			const n = String(readdirAdrs(ctx.cwd).length + 1).padStart(3, "0");
 			const file = join(dir, `${n}-${p.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40)}.md`);
@@ -312,8 +354,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "sdlc_eval",
-		label: "SDLC Eval",
+		name: "zense_eval",
+		label: "Zense Eval",
 		description:
 			"Phase 4: dual evaluation — output eval grades the artifact against approved spec criteria (delegated to the grader sub-agent); trajectory flags are attached. Spec-debt items become forced human review.",
 		parameters: Type.Object({ note: Type.Optional(Type.String()) }),
@@ -336,8 +378,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "sdlc_review",
-		label: "SDLC Review Packet",
+		name: "zense_review",
+		label: "Zense Review Packet",
 		description: "Phase 5: build the exception-based review packet (TL;DR first, evidence linked, anomalies highlighted).",
 		parameters: Type.Object({}),
 		async execute(_id, _p, _s, _o, ctx) {
@@ -352,14 +394,14 @@ export default function (pi: ExtensionAPI) {
 				specDebt: state.spec?.specDebt ?? [],
 				escalations: state.escalations,
 			};
-			pi.appendEntry("sdlc-review-packet", packet);
+			pi.appendEntry("zense-review-packet", packet);
 			learn(ctx, `review packet: flags=${packet.trajectory.length}, escalations=${packet.escalations.length}`);
 			return { content: [{ type: "text", text: packet.tlDr }], details: packet };
 		},
 	});
 
 	// Review-packet card in the transcript.
-	pi.registerEntryRenderer("sdlc-review-packet", (entry, { expanded }, theme) => {
+	pi.registerEntryRenderer("zense-review-packet", (entry, { expanded }, theme) => {
 		const d = entry.data as any;
 		const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
 		box.addChild(new Text(theme.fg("accent", theme.bold("📋 Review packet"))));
@@ -372,14 +414,14 @@ export default function (pi: ExtensionAPI) {
 	// ----- Phase 6: memory/learning log
 
 	const learn = (ctx: ExtensionContext, note: string) => {
-		mkdirSync(sdlcDir(ctx.cwd), { recursive: true });
-		appendFileSync(join(sdlcDir(ctx.cwd), "memory.jsonl"), JSON.stringify({ at: Date.now(), phase: state.phase, note }) + "\n");
+		mkdirSync(zenseDir(ctx.cwd), { recursive: true });
+		appendFileSync(join(zenseDir(ctx.cwd), "memory.jsonl"), JSON.stringify({ at: Date.now(), phase: state.phase, note }) + "\n");
 	};
 
 	// ----- human gates: commands
 
-	pi.registerCommand("sdlc", {
-		description: "SDLC harness: status | approve | gate on|off | memory",
+	pi.registerCommand("zense", {
+		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | gate on|off | memory",
 		getArgumentCompletions: (prefix) =>
 			["status", "approve", "gate", "memory"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
@@ -393,23 +435,17 @@ export default function (pi: ExtensionAPI) {
 				);
 			} else if (sub === "approve") {
 				if (!state.spec) return ctx.ui.notify("No spec to approve.", "warning");
-				const ok = await ctx.ui.confirm("Approve spec?", `${state.spec.title} v${state.spec.version}\nIntent: ${state.spec.intent.slice(0, 300)}`);
-				if (ok) {
-					state.spec.approved = true;
-					state.spec.approvedAt = Date.now();
-					state.phase = "implementation";
-					persist(); updateWidget(ctx);
-					ctx.ui.notify(`Spec v${state.spec.version} approved — implementation gate open.`, "info");
-				}
+				const ok = await ctx.ui.confirm("🔏 เซ็น approve spec?", `${state.spec.title} v${state.spec.version}\nIntent: ${state.spec.intent.slice(0, 300)}`);
+				if (ok) approveCurrentSpec(ctx);
 			} else if (sub === "gate") {
 				state.gateEnabled = rest[0] !== "off";
 				persist();
 				ctx.ui.notify(`Gate ${state.gateEnabled ? "ON" : "OFF"}`, state.gateEnabled ? "info" : "warning");
 			} else if (sub === "memory") {
-				const f = join(sdlcDir(ctx.cwd), "memory.jsonl");
+				const f = join(zenseDir(ctx.cwd), "memory.jsonl");
 				ctx.ui.notify(existsSync(f) ? readFileSync(f, "utf8").slice(-2000) : "(empty)", "info");
 			} else {
-				ctx.ui.notify("usage: /sdlc status|approve|gate on|off|memory", "info");
+				ctx.ui.notify("usage: /zense status|approve|gate on|off|memory", "info");
 			}
 		},
 	});

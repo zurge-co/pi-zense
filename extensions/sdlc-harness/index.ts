@@ -13,7 +13,7 @@
  *   P1 Requirements : sdlc_spec tool → .pi/sdlc/spec.md + machine-checkable
  *                     .pi/sdlc/spec.json (acceptance criteria, scope, spec-debt)
  *   P2 Design       : sdlc_adr tool → .pi/sdlc/adr/NNN-*.md (deny rules checked live)
- *   P3 Implementation: budgeted autonomy meter (turns/tokens) + escalation
+ *   P3 Implementation: specification gate + escalation
  *   P4 Dual eval    : sdlc_eval (output eval vs criteria) + trajectory heuristics
  *   P5 Review/Deploy: sdlc_review builds a review-packet card (exception-based)
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
@@ -44,7 +44,6 @@ interface State {
 	spec?: Spec;
 	turnsUsed: number;
 	tokensUsed: number;
-	budget: { maxTurns: number; maxTokens: number };
 	escalations: { kind: string; detail: string; at: number }[];
 	trajectoryFlags: string[];
 	gateEnabled: boolean;
@@ -57,7 +56,6 @@ const freshState = (): State => ({
 	phase: "requirements",
 	turnsUsed: 0,
 	tokensUsed: 0,
-	budget: { maxTurns: 25, maxTokens: 400_000 },
 	escalations: [],
 	trajectoryFlags: [],
 	gateEnabled: true,
@@ -119,7 +117,7 @@ export default function (pi: ExtensionAPI) {
 		const s = state.spec;
 		ctx.ui.setWidget("sdlc", [
 			`SDLC ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
-				` · turns ${state.turnsUsed}/${state.budget.maxTurns} · tok ${Math.round(state.tokensUsed / 1000)}k/${Math.round(state.budget.maxTokens / 1000)}k` +
+				` · turns ${state.turnsUsed} · tok ${Math.round(state.tokensUsed / 1000)}k` +
 				(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 				(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : ""),
 		]);
@@ -165,17 +163,12 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ----- Phase 3: budgeted autonomy meter
+	// ----- Phase 3: turn/token usage meter
 
 	pi.on("turn_end", async (ev, ctx) => {
 		state.turnsUsed++;
 		state.tokensUsed += ev.message?.usage?.totalTokens ?? 0;
 		updateWidget(ctx);
-		if (state.turnsUsed > state.budget.maxTurns || state.tokensUsed > state.budget.maxTokens) {
-			escalate("something-wrong", `budget exceeded (${state.turnsUsed} turns, ${state.tokensUsed} tok)`, ctx);
-			ctx.ui.notify("🚨 SDLC budget exceeded — pausing agent. /sdlc budget to adjust.", "error");
-			ctx.abort();
-		}
 		persist();
 	});
 
@@ -197,9 +190,6 @@ export default function (pi: ExtensionAPI) {
 		if (calls.length >= 5 && failed / calls.length > 0.5)
 			flag(`retry storm: ${failed}/${calls.length} tool calls failed`, ctx);
 
-		const usage = ev.messages.reduce((n: number, m: any) => n + (m.usage?.totalTokens ?? 0), 0);
-		if (usage > 0 && state.spec?.criteria?.length && usage > state.budget.maxTokens * 0.8)
-			flag(`near-budget token usage: ${Math.round(usage / 1000)}k`, ctx);
 		persist();
 	});
 
@@ -375,15 +365,15 @@ export default function (pi: ExtensionAPI) {
 	// ----- human gates: commands
 
 	pi.registerCommand("sdlc", {
-		description: "SDLC harness: status | approve | budget <turns> <tokens> | gate on|off | memory",
+		description: "SDLC harness: status | approve | gate on|off | memory",
 		getArgumentCompletions: (prefix) =>
-			["status", "approve", "budget", "gate", "memory"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
+			["status", "approve", "gate", "memory"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			if (sub === "status") {
 				ctx.ui.notify(
 					`phase=${state.phase} spec=${state.spec ? `v${state.spec.version} approved=${state.spec.approved}` : "—"}\n` +
-						`turns=${state.turnsUsed}/${state.budget.maxTurns} tokens=${state.tokensUsed}/${state.budget.maxTokens}\n` +
+						`turns=${state.turnsUsed} tokens=${state.tokensUsed}\n` +
 						`trajectory flags:\n${state.trajectoryFlags.join("\n") || "(none)"}\nescalations:\n${state.escalations.map((e) => `${e.kind}: ${e.detail}`).join("\n") || "(none)"}`,
 					"info",
 				);
@@ -397,11 +387,6 @@ export default function (pi: ExtensionAPI) {
 					persist(); updateWidget(ctx);
 					ctx.ui.notify(`Spec v${state.spec.version} approved — implementation gate open.`, "info");
 				}
-			} else if (sub === "budget") {
-				state.budget.maxTurns = Number(rest[0]) || state.budget.maxTurns;
-				state.budget.maxTokens = Number(rest[1]) || state.budget.maxTokens;
-				persist(); updateWidget(ctx);
-				ctx.ui.notify(`Budget: ${state.budget.maxTurns} turns / ${state.budget.maxTokens} tokens`, "info");
 			} else if (sub === "gate") {
 				state.gateEnabled = rest[0] !== "off";
 				persist();
@@ -410,7 +395,7 @@ export default function (pi: ExtensionAPI) {
 				const f = join(sdlcDir(ctx.cwd), "memory.jsonl");
 				ctx.ui.notify(existsSync(f) ? readFileSync(f, "utf8").slice(-2000) : "(empty)", "info");
 			} else {
-				ctx.ui.notify("usage: /sdlc status|approve|budget <turns> <tokens>|gate on|off|memory", "info");
+				ctx.ui.notify("usage: /sdlc status|approve|gate on|off|memory", "info");
 			}
 		},
 	});

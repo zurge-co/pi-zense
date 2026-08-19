@@ -23,13 +23,13 @@ pi                                                # เปิด session — ext
 "compile spec ก่อน" มันจะเรียก requirements sub-agent มาเขียน `.pi/zense/spec.json` ให้
 
 **📍 หน้าที่คุณ (gate #1) — ลายเซ็นของคุณอยู่ที่ dialog:**
-1. เมื่อ spec compile เสร็จ dialog จะเด้งขึ้นมาให้เลือก:
+1. เมื่อ spec compile เสร็จ dialog จะเด้งขึ้นมา **พร้อม spec เต็มฉบับให้อ่านใน dialog นั้นเลย** (PgUp/PgDn เลื่อนดูถ้ายาว มีตัวเลขบอกว่าอ่านถึงบรรทัดไหน) แล้วจึงเลือก:
    - **🔏 เซ็นอนุมัติ** — spec.approved + เปิด implementation gate ทันที จบในจังหวะเดียว
-   - **✏️ ยังไม่เซ็น** — เปิด `.pi/zense/spec.md` แก้เอง, สั่ง agent ปรับ criteria
-2. อยากอ่าน spec ก่อนเซ็น: `/zense status` ดูภาพรวม หรือเปิด spec.md (ทุก version ถูกเก็บถาวรไม่ทับกันใน `.pi/zense/specs/…-<slug>.md`)
+   - **✏️ ยังไม่เซ็น** — ออกไปแก้ spec ก่อน: `Esc` ปิด dialog, เปิด `.pi/zense/spec.md` แก้เอง, สั่ง agent ปรับ criteria
+2. dialog เซ็นทุกจุด (ตอน compile เสร็จ / gate เด้งตอน write / `/zense approve`) โชว์เนื้อ spec แบบเดียวกัน — อ่านครบก่อนเซ็นเสมอ ไม่ต้องเปิดไฟล์แยก (แต่ทุก version ยังถูกเก็บถาวรไม่ทับกันใน `.pi/zense/specs/…-<slug>.md`)
 3. ถ้าเลือก "ยังไม่เซ็น" ไว้ก่อน ค่อยเซ็นทีหลังได้ที่ `/zense approve`
 
-ถ้า dialog เด้งตอน agent กำลังจะเขียนโค้ดทั้งที่ยังไม่เซ็น มันจะมี 3 ทางเลือก:
+ถ้า dialog เด้งตอน agent กำลังจะเขียนโค้ดทั้งที่ยังไม่เซ็น มันจะโชว์ spec เต็มให้อ่านก่อน (PgUp/PgDn เลื่อน) แล้วมี 3 ทางเลือก:
 - **🔏 เซ็นอนุมัติ spec แล้วทำงานต่อ** — เซ็น + ปล่อย write นั้นผ่านเลย
 - **⚠️ อนุญาตรอบนี้รอบเดียว** — override โดยไม่เซ็น (ถูกบันทึกเป็น trajectory flag)
 - **⛔ Block ไว้** — ให้ agent หยุด/compile spec ก่อน
@@ -46,14 +46,19 @@ Agent เขียน ADR ลง `.pi/zense/adr/` เองรายการท
 
 ## 3. Implementation — แทบไม่ต้องทำอะไร
 
-เฝ้า widget: `ZENSE ▸ IMPLEMENTATION · spec: ✅v1 · turns 12 · tok 180k`
+เฝ้า widget: `ZENSE ▸ IMPLEMENTATION · spec: ✅v1 · turns 12 · tok 1.2M` (token ≥ 1 ล้านแสดงเป็น M)
+
+ตอน agent spawn sub-agent (grader/reviewer) widget จะขึ้น `🧪 grader ▶ 12s` — อยากดูสดว่ามันทำอะไรอยู่
+(ไม่ค้าง?) กด **ctrl+shift+a** หรือพิมพ์ `/zense agents` แล้วเลือก run → live tail อัปเดตเองทุก 1 วิ
+(grep ไฟล์ .pi/zense/subagents/*.log เองก็ได้ — เขียน live ระหว่างรัน) กด Esc ปิด viewer งานยังรันต่อ
 
 **📍 คุณจะถูกเรียกกลับมาเมื่อ:**
 - ⚠ trajectory flag เด้ง (out-of-scope write / แก้ไฟล์ test) → ตรวจนัดเดียว
 
 ## 4. Eval — สั่ง agent `run eval`
 
-grader sub-agent เช็คผลงานเทียบทุก criterion
+grader sub-agent เช็คผลงานเทียบทุก criterion — output ของมัน stream เข้า transcript สดๆ ระหว่างรัน
+(ดูย้อนหลังได้ที่ /zense agents)
 
 **📍 หน้าที่คุณ:** โฟกัส 2 ส่วนของรายงาน — `Spec debt (needs human)` (ต้อง review ด้วยตา)
 และ `Trajectory flags` (เช็ค reward hacking)
@@ -76,6 +81,7 @@ grader sub-agent เช็คผลงานเทียบทุก criterion
 | 🔏 dialog เซ็น spec | ตอน spec compile เสร็จ / gate เด้ง | ลายเซ็นในจังหวะเดียว ไม่ต้องพิมพ์คำสั่ง |
 | `/zense approve` | เซ็นย้อนหลัง (ถ้ากด ยังไม่เซ็น ไว้ก่อน) | 🔏 ลงนาม spec เดิม |
 | `/zense status` | ทุกเวลา | phase / flags / escalations |
+| `ctrl+shift+a` หรือ `/zense agents` | ระหว่าง sub-agent รัน / ย้อนหลัง | ดู live tail ของ grader/reviewer กันสับสนว่าค้างไหม |
 | `/zense gate on\|off` | ฉุกเฉิน | ปิด/เปิด spec gate |
 | `/zense memory` | จบงาน | ดู learning log |
 

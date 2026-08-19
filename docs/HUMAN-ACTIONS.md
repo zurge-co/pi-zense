@@ -38,10 +38,9 @@ Agent เขียน ADR ลง `.pi/sdlc/adr/` เองรายการท�
 
 ## 3. Implementation — แทบไม่ต้องทำอะไร
 
-เฝ้า widget: `SDLC ▸ IMPLEMENTATION · spec: ✅v1 · turns 12/25 · tok 180k/400k`
+เฝ้า widget: `SDLC ▸ IMPLEMENTATION · spec: ✅v1 · turns 12 · tok 180k`
 
 **📍 คุณจะถูกเรียกกลับมาเมื่อ:**
-- 🚨 budget เกิน → agent ถูก abort → เลือกเพิ่มงบ `/sdlc budget <turns> <tokens>` หรือสั่งหยุด
 - ⚠ trajectory flag เด้ง (out-of-scope write / แก้ไฟล์ test) → ตรวจนัดเดียว
 
 ## 4. Eval — สั่ง agent `run eval`
@@ -67,8 +66,7 @@ grader sub-agent เช็คผลงานเทียบทุก criterion
 | คำสั่ง | เมื่อ | ทำอะไร |
 |---|---|---|
 | `/sdlc approve` | หลัง spec compile | 🔏 ประตู 1: ลงนาม spec |
-| `/sdlc status` | ทุกเวลา | phase / budget / flags / escalations |
-| `/sdlc budget 40 800000` | โดน abort | เพิ่มงบ autonomy |
+| `/sdlc status` | ทุกเวลา | phase / flags / escalations |
 | `/sdlc gate on\|off` | ฉุกเฉิน | ปิด/เปิด spec gate |
 | `/sdlc memory` | จบงาน | ดู learning log |
 | `/terminal-font ghostty` | ครั้งแรก | config ฟอนต์ไทยสำหรับ terminal นั้น |

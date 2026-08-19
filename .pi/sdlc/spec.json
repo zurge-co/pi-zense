@@ -1,50 +1,46 @@
 {
   "version": 1,
-  "title": "Embed Thai font in pi-zense with auto-install",
-  "intent": "ผู้ใช้ต้องการให้ pi-zense ติดตั้งฟอนต์ภาษาไทยให้อัตโนมัติ (ไม่ต้อง download/install เอง) โดย embed ไฟล์ฟอนต์ลงใน npm package แล้วคัดลอกเข้า OS user font dir ตอน session_start พร้อมเขียน config ให้ terminal ที่ตรวจจับได้แบบ opt-in — ข้อจำกัดที่ยอมรับ: terminal emulator เป็นเจ้าของ font rendering โปรแกรมใน terminal เปลี่ยนฟอนต์ให้ไม่ได้ จึงเหลือขั้นตอน restart terminal 1 ครั้งเท่านั้น",
+  "title": "Harden sdlc-harness: validate /sdlc args, never crash pi",
+  "intent": "ผู้ใช้รายงานว่า /sdlc commands ต่างๆ error/crash pi — ต้องการให้ทุก subcommand validate parameters และแสดง usage แทนที่จะพัง: (1) แก้ agent_end handler ที่อ่าน m.toolCalls/m.details.isError ผิด shape ของ pi, (2) ใช้ StringEnum แทน Type.Union/Type.Literal (รองรับ Google API), (3) tool sdlc_spec/sdlc_adr/sdlc_eval validate params ที่ runtime แล้ว throw descriptive error แทน undefined crash, (4) ครอบ event handlers ด้วย try/catch เพราะ tool_call handler ที่ throw จะ block tool ทุกตัว (fail-safe) ทำให้ดูเหมือน pi crash, (5) ทำ /sdlc adr-approve N ให้มีจริงตามที่ description ของ sdlc_adr อ้างถึง",
   "scope": [
-    "extensions/thai-terminal/",
-    "fonts/",
-    "package.json",
-    "README.md"
+    "extensions/sdlc-harness/",
+    "package.json"
   ],
   "constraints": [
-    "ฟอนต์ต้อง redistributable (SIL OFL) และต้องแนบ OFL.txt ไปด้วยตามเงื่อนไข license",
-    "ใช้เฉพาะน้ำหนักที่จำเป็น (Regular + Bold) เพื่อจำกัดขนาด tarball",
-    "การคัดลอกฟอนต์เข้า OS font dir เป็น no-admin (user-level dir เท่านั้น)",
-    "การแก้ config ของ user ต้องมีการยืนยันและ backup ไฟล์เดิมก่อน",
-    "ไม่แตะ Windows Terminal/iTerm2 แบบอัตโนมัติ — แสดง snippet ให้เหมือนเดิม"
+    "ต้องไม่เปลี่ยนพฤติกรรม gate โดยเจตนา (spec ต้อง approve ก่อน implement เหมือนเดิม)",
+    "ทุก event handler ต้อง fail-safe: harness bug ห้าม crash pi หรือ block tool ทั้งหมดถาวร",
+    "validation error ต้อง throw Error ที่อ่านรู้เรื่อง (pi จะ mark isError ให้ LLM เห็น) ห้ามปล่อย undefined access"
   ],
   "criteria": [
     {
-      "id": "fonts-embedded",
-      "text": "fonts/ มี IBM Plex Sans Thai Looped Regular+Bold (TTF) + OFL.txt",
-      "check": "ls fonts/*.ttf fonts/OFL.txt | wc -l  => 3"
+      "id": "loads-clean",
+      "text": "extension โหลดได้ไม่มี syntax/type error ร้ายแรง (node --check ผ่าน jiti-compatible syntax)",
+      "check": "npx tsc --noEmit หรือ node syntax check ผ่าน"
     },
     {
-      "id": "auto-install",
-      "text": "session_start ตรวจว่าฟอนต์อยู่ใน OS user font dir หรือยัง ถ้ายังให้คัดลอกอัตโนมัติ (macOS ~/Library/Fonts, Linux ~/.local/share/fonts + fc-cache) และแจ้งเตือน",
-      "check": "grep -q 'Library/Fonts' extensions/thai-terminal/index.ts && grep -q 'local/share/fonts' extensions/thai-terminal/index.ts"
+      "id": "stringenum",
+      "text": "sdlc_spec ใช้ StringEnum จาก @earendil-works/pi-ai แทน Type.Union/Type.Literal",
+      "check": "grep -q 'StringEnum' extensions/sdlc-harness/index.ts && ! grep -q 'Type.Literal(\"set\")' extensions/sdlc-harness/index.ts"
     },
     {
-      "id": "config-writer",
-      "text": "คำสั่ง /terminal-font ตรวจจับ terminal จาก env (TERM_PROGRAM, KITTY_WINDOW_ID, WT_SESSION ฯลฯ) และเสนอเขียน config อัตโนมัติสำหรับ ghostty/kitty/wezterm/alacritty/vscode พร้อมยืนยัน + backup",
-      "check": "grep -q 'TERM_PROGRAM' extensions/thai-terminal/index.ts && grep -q 'confirm' extensions/thai-terminal/index.ts"
+      "id": "agent-end-shape",
+      "text": "agent_end อ่าน toolCall จาก m.content blocks และ toolResult.isError แบบ top-level",
+      "check": "grep -q 'type === \"toolCall\"' extensions/sdlc-harness/index.ts && grep -q 'm?.isError' extensions/sdlc-harness/index.ts"
     },
     {
-      "id": "tarball",
-      "text": "npm pack tarball มี fonts/ รวมอยู่และขนาดรวม < 2MB",
-      "check": "npm pack --dry-run 2>&1 | grep -q 'fonts/'"
+      "id": "cmd-validation",
+      "text": "/sdlc gate รับเฉพาะ on|off, มี subcommand adr และ adr-approve <N>",
+      "check": "grep -q 'adr-approve' extensions/sdlc-harness/index.ts && grep -q 'Number.isFinite' extensions/sdlc-harness/index.ts"
     },
     {
-      "id": "docs",
-      "text": "README ของ thai-terminal อธิบาย flow อัตโนมัติ + ข้อจำกัด (ต้อง restart terminal)",
-      "check": "path exists: extensions/thai-terminal/README.md (updated)"
+      "id": "no-crash-handlers",
+      "text": "ทุก pi.on handler ถูกครอบ safe()/try-catch และ tool gate fail-open พร้อม warning แทนที่จะ block ถาวรเมื่อ harness มี bug",
+      "check": "grep -cq 'safe(ctx' extensions/sdlc-harness/index.ts"
     }
   ],
   "specDebt": [
-    "การ render จริง (สระ/วรรณยุกต์ซ้อนถูกต้อง, cell width) ตรวจใน CI ไม่ได้ — ต้อง manual review บน terminal จริงหลัง restart",
-    "Windows auto-install ไม่ได้ implement (user font install บน Windows ต้องผ่าน registry) — Windows users ยังต้อง double-click ไฟล์ .ttf เอง"
+    "พฤติกรรมจริงของ /sdlc approve/gate ใน TUI ตรวจไม่ได้จากที่นี่ — ต้อง user ทดสอบ interactive หลัง /reload",
+    "sub-agent spawn ต้องการ pi binary บน PATH — ถ้าไม่พบจะ fail อย่างสุภาพแต่ยังไม่มี fallback"
   ],
   "approved": false
 }

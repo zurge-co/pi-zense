@@ -28,7 +28,7 @@ Enable the theme: `/settings` → theme → `thai-looped-night`, or set
 | **1. Requirements** — spec is the contract | `sdlc_spec` tool; `action:"compile_spec"` delegates drafting to the requirements sub-agent | `.pi/sdlc/spec.{json,md}` versioned, with machine-checkable criteria & **spec debt** |
 | **Gate** — never implement on unapproved spec | `tool_call` interceptor blocks `write`/`edit` until a human runs `/sdlc approve` | hard gate |
 | **2. Design** — ADRs prevent architectural drift | `sdlc_adr` tool; `DENY: <path>` rules enforced live on every write; irreversible ADRs flagged for human approval | `.pi/sdlc/adr/NNN-*.md` |
-| **3. Implementation** — budgeted autonomy | turn/token meter vs `/sdlc budget`; overage ⇒ abort + escalate (escalation taxonomy: need-permission / need-decision / something-wrong) | live widget meter |
+| **3. Implementation** — escalation taxonomy | turn/token usage meter; escalation taxonomy: need-permission / need-decision / something-wrong | live widget meter |
 | **4. Dual eval** — output *and* trajectory | `sdlc_eval` → grader sub-agent judges each criterion PASS/FAIL (closes spec→eval loop); `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
 | **5. Review** — exception-based, not wall-of-diff | `sdlc_review` → reviewer sub-agent builds an incident-report-style **review packet** rendered as a transcript card (TL;DR first) | review packet card |
 | **6. Maintenance** — learn every run | escalations/reviews appended to `.pi/sdlc/memory.jsonl`; state persisted via session entries | `/sdlc memory` |
@@ -36,14 +36,13 @@ Enable the theme: `/settings` → theme → `thai-looped-night`, or set
 ### Human actions (by design: minimal)
 
 ```text
-/sdlc status                 # one-glance: phase, gate, budget, flags, escalations
+/sdlc status                 # one-glance: phase, gate, flags, escalations
 /sdlc approve                # 🔏 gate 1 — sign the spec contract
-/sdlc budget 40 800000       # raise autonomy budget (turns tokens)
 /sdlc gate on|off            # escape hatch
 /sdlc memory                 # tail the learning log
 ```
 
-Then just tell the agent what to build; the harness gates, budgets, evaluates, and hands you a review packet.
+Then just tell the agent what to build; the harness gates, evaluates, and hands you a review packet.
 
 ## thai-terminal: font & colors for Thai
 

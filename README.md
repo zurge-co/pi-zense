@@ -26,10 +26,10 @@ Enable the theme: `/settings` → theme → `zense`, or set
 | Phase (per PLAN.md) | Mechanism | Artifact |
 |---|---|---|
 | **1. Requirements** — spec is the contract | `zense_spec` tool; `action:"compile_spec"` delegates drafting to the requirements sub-agent | append-only archive `.pi/zense/specs/<timestamp>-v{n}-<slug>.{json,md}` (never overwritten) with machine-checkable criteria & **spec debt**; `.pi/zense/spec.{json,md}` = latest copies |
-| **Gate** — never implement on unsigned spec | `tool_call` interceptor stops `write`/`edit` with a **3-choice signing dialog** (🔏 sign & continue / ⚠ one-off override / ⛔ block) | hard gate + dialog signature |
+| **Gate** — never implement on unsigned spec | `tool_call` interceptor stops `write`/`edit` with a **3-choice signing dialog that renders the full spec inline** (PgUp/PgDn to read before deciding: 🔏 sign & continue / ⚠ one-off override / ⛔ block) | hard gate + dialog signature |
 | **2. Design** — ADRs prevent architectural drift | `zense_adr` tool; `DENY: <path>` rules enforced live on every write; irreversible ADRs flagged for human approval | `.pi/zense/adr/NNN-*.md` |
 | **3. Implementation** — escalation taxonomy | turn/token usage meter; escalation taxonomy: need-permission / need-decision / something-wrong | live widget meter |
-| **4. Dual eval** — output *and* trajectory | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL (closes spec→eval loop); `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
+| **4. Dual eval** — output *and* trajectory | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL (closes spec→eval loop); **sub-agent output streams live into the transcript while it runs** — watch it anytime via `ctrl+shift+a` / `/zense agents` (live tail of `.pi/zense/subagents/*.log`); `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
 | **5. Review** — exception-based, not wall-of-diff | `zense_review` → reviewer sub-agent builds an incident-report-style **review packet** rendered as a transcript card (TL;DR first) | review packet card |
 | **6. Maintenance** — learn every run | escalations/reviews appended to `.pi/zense/memory.jsonl`; state persisted via session entries | `/zense memory` |
 
@@ -39,6 +39,7 @@ Enable the theme: `/settings` → theme → `zense`, or set
 /zense status                 # one-glance: phase, gate, flags, escalations
 # gate 1 happens IN the dialog — no command needed
 /zense approve                # 🔏 sign later, only if you skipped the dialog
+ctrl+shift+a                  # watch sub-agent runs LIVE (grader/reviewer) — or /zense agents
 /zense gate on|off            # escape hatch
 /zense memory                 # tail the learning log
 ```

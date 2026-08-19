@@ -1,6 +1,6 @@
 {
   "name": "pi-zense",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Spec-gated SDLC harness for pi — sub-agents, dual eval, budgeted autonomy — plus Thai-language terminal font & color setup.",
   "keywords": [
     "pi-package",

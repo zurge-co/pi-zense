@@ -377,7 +377,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("sdlc", {
 		description: "SDLC harness: status | approve | budget <turns> <tokens> | gate on|off | memory",
 		getArgumentCompletions: (prefix) =>
-			["status", "approve", "budget", "gate", "memory"].filter((s) => s.startsWith(prefix)).map((value) => ({ value })),
+			["status", "approve", "budget", "gate", "memory"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			if (sub === "status") {

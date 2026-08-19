@@ -1,0 +1,23 @@
+# Spec v1: Show plan summary before approval prompt
+approved: false
+
+## Intent
+ตอนนี้ sdlc-harness ขอ approve spec โดยไม่สรุป plan ให้อ่านก่อน (confirm dialog มีแค่ title + intent 300 ตัวอักษรแรก ไม่มี scope/criteria/spec-debt) ผู้ใช้ต้องการเห็นสรุป plan แบบอ่านรู้เรื่องก่อนตัดสินใจ approve ทุกจุดที่ขอ approval
+
+## Scope
+- extensions/sdlc-harness/index.ts
+
+## Constraints
+- ไม่เปลี่ยน tool/parameter schema ภายนอก (agent-facing API เดิม)
+- ยังคง gate เดิม: implementation ต้องรอ spec approved
+- sync ทั้ง repo copy และ ~/.pi/agent install copy
+
+## Acceptance criteria
+- [ ] C1: หลัง sdlc_spec (action=set) เขียน spec แล้ว ต้องแสดงสรุป plan แบบอ่านได้ (title, intent, scope, constraints, criteria+check, specDebt) ก่อนขอ approve โดยตรงทันที *(check: grep หา specSummary + ctx.ui.confirm หลัง writeFileSync spec ใน index.ts)*
+- [ ] C2: /sdlc approve ต้องแสดง criteria list และ specDebt เต็ม ไม่ใช่แค่ intent slice *(check: grep หา call ctx.ui.confirm ที่ approve spec ใช้ specSummary)*
+- [ ] C3: tool_call gate dialog (block write เพราะ spec unapproved) ต้องมี compact plan summary (ชื่อ, จำนวน criteria, scope, debt) *(check: grep dialog message ใน tool_call handler)*
+- [ ] C4: spec.json/spec.md schema เดิมไม่เปลี่ยน, approve flow ยัง persist ถูกต้อง *(check: npx tsc parse ไฟล์ผ่าน (ไม่มี syntax error นอกเหนือ missing types เดิม))*
+- [ ] C5: แก้ทั้งสอง copy: repo (extensions/sdlc-harness/index.ts) และ install (~/.pi/agent/extensions/sdlc-harness/index.ts) ให้ logic เหมือนกัน *(check: diff ส่วน handler ทั้งสองไฟล์ตรงกัน)*
+
+## Spec debt (human-verified only)
+- ความยาว dialog ใน TUI เหมาะสมหรือไม่ (อ่านง่ายใน confirm box) — ตรวจด้วยมนุษย์ตอนใช้งานจริง

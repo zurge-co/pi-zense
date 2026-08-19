@@ -34,10 +34,18 @@ const FONT_FALLBACK = "Sarasa Term Nerd Font (brew install --cask font-sarasa-ne
 export default function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------- theme
 
-	// Make the project theme discoverable.
-	pi.on("resources_discover", async () => ({
-		themePaths: [THEME_DIR],
-	}));
+	// Make the theme discoverable — but only when THEME_DIR is not one of pi's
+	// default theme dirs (~/.pi/agent/themes, <cwd>/.pi/themes), which pi scans
+	// automatically. Contributing a default dir would load the theme twice and
+	// trigger a "Theme conflicts" warning at startup.
+	pi.on("resources_discover", async (event) => {
+		const defaultDirs = [
+			join(process.env.HOME ?? "", ".pi", "agent", "themes"),
+			join(event.cwd, ".pi", "themes"),
+		];
+		if (defaultDirs.includes(THEME_DIR)) return {};
+		return { themePaths: [THEME_DIR] };
+	});
 
 	// Status reminder while in a session.
 	pi.on("session_start", async (_event, ctx) => {

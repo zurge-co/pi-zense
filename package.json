@@ -1,14 +1,14 @@
 {
   "name": "pi-zense",
-  "version": "0.3.0",
-  "description": "Spec-gated SDLC harness for pi — sub-agents, dual eval, escalation gates — plus Thai-language terminal font & color setup.",
+  "version": "0.4.0",
+  "description": "Spec-gated SDLC harness for pi — sub-agents, dual eval, escalation gates — plus the Zense dark theme.",
   "keywords": [
     "pi-package",
     "pi",
     "sdlc",
     "harness",
     "agent",
-    "thai",
+    "zense",
     "theme"
   ],
   "license": "MIT",

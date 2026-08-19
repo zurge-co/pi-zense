@@ -22,7 +22,7 @@ pi                                                # เปิด session — ext
 "compile spec ก่อน" มันจะเรียก requirements sub-agent มาเขียน `.pi/sdlc/spec.json` ให้
 
 **📍 หน้าที่คุณ (gate #1):**
-1. `/sdlc status` — ดูภาพรวม; เปิด `.pi/sdlc/spec.md` อ่าน spec ได้
+1. `/sdlc status` — ดูภาพรวม; เปิด `.pi/sdlc/spec.md` อ่าน spec ปัจจุบันได้ (ทุก version ถูกเก็บถาวรไม่ทับกันใน `.pi/sdlc/specs/…-<slug>.md`)
 2. โอเค → `/sdlc approve` แล้วยืนยันใน dialog → นี่คือลายเซ็นสัญญาของคุณ
 3. ไม่โอเค → แก้ `.pi/sdlc/spec.md` เอง หรือสั่ง agent ปรับ criteria
 
@@ -69,9 +69,6 @@ grader sub-agent เช็คผลงานเทียบทุก criterion
 | `/sdlc status` | ทุกเวลา | phase / flags / escalations |
 | `/sdlc gate on\|off` | ฉุกเฉิน | ปิด/เปิด spec gate |
 | `/sdlc memory` | จบงาน | ดู learning log |
-| `/terminal-font ghostty` | ครั้งแรก | config ฟอนต์ไทยสำหรับ terminal นั้น |
-| `/thai-preview` | ตั้งค่าธีม | ตัวอย่างสี+ฟอนต์ใน browser |
-| `/thai-theme` | จะใช้ธีม | ตั้ง `thai-looped-night` ให้ project |
 
 สรุป: **พิมพ์ requirement → `/sdlc approve` → ปล่อยจนจบ → อ่าน review packet**
 interaction ส่วนใหญ่มีแค่นี้

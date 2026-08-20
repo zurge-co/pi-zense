@@ -54,6 +54,8 @@ interface State {
 	gateEnabled: boolean;
 	subagentRuns: SubagentRun[];
 	lastCompileLessons?: number;    // จำนวนบทเรียนจาก memory ที่ feed เข้า compile_spec ล่าสุด
+	specMdPath?: string;            // path ของ archive spec .md ของเวอร์ชันปัจจุบัน (zense_eval append ผลลัพธ์ที่นี่)
+	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
 }
 interface SubagentRun {
 	role: string;
@@ -91,10 +93,12 @@ const subagentLogPath = (cwd: string, role: string): string => {
 };
 
 /**
- * Spawn an isolated pi sub-agent (print mode) with a clean context.
- * stdio ignores stdin — ปล่อย stdin pipe ค้างไว้จะทำให้ pi print mode รอ EOF จนหมดเวลา
- * (bug เดิม: execFile ค้างเงียบๆ จนโดน SIGTERM). stdout/stderr stream เขียน log live
- * ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ ctrl+shift+a).
+ * Spawn an isolated pi sub-agent (--mode json) with a clean context.
+ * stdio ignores stdin — ปล่อย stdin pipe ค้างไว้จะทำให้ pi รอ EOF จนหมดเวลา
+ * (bug เดิม: execFile ค้างเงียบๆ จนโดน SIGTERM). ใช้ --mode json ไม่ใช่ print เพราะ print mode
+ * buffer stdout ทั้งก้อนแล้วปล่อยทีเดียวตอนจบ (ทดลองแล้ว: chunk เดียวก่อน close — log ดูเหมือนค้าง
+ * จนงานเสร็จ) ส่วน json mode เป็น JSONL event stream ที่ไหลตั้งแต่ต้น → parse event เป็น text
+ * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ ctrl+shift+a).
  */
 function runSubagent(
 	role: string,
@@ -103,21 +107,88 @@ function runSubagent(
 	timeoutMs = 240_000,
 	onChunk?: (chunk: string) => void,
 	logPath: string = subagentLogPath(cwd, role),
+	modelPattern?: string,           // pi --model pattern (เช่น "anthropic/claude-sonnet") — undefined = ปล่อย pi ใช้ default
 ): Promise<{ ok: boolean; output: string; logPath: string }> {
 	const relLog = relative(cwd, logPath);
 	return new Promise((res) => {
-		writeFileSync(logPath, `$ pi --mode print --no-session <task ${task.length} chars>\n--- live output (${role}) ---\n`);
-		const child = spawn("env", ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "print", "--no-session", task], {
+		// argv: --model <pattern> (ถ้ามี) แทรกก่อน task เพื่อบังคับ model ของ sub-agent ตาม role
+		const argv = ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "json", "--no-session"];
+		if (modelPattern) { argv.push("--model", modelPattern); }
+		argv.push(task);
+		writeFileSync(logPath, `$ pi --mode json --no-session${modelPattern ? ` --model ${modelPattern}` : ""} <task ${task.length} chars>\n--- live output (${role}) ---\n`);
+		const child = spawn("env", argv, {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let out = "";
+		let finalText = ""; // assistant text ล่าสุดจาก message_end — ใช้เป็น output ตอนสำเร็จ แทน tail ของ raw stdout
 		const append = (chunk: string) => {
 			out = (out + chunk).slice(-1_000_000);
 			appendFileSync(logPath, chunk);
 			onChunk?.(chunk);
 		};
-		child.stdout?.on("data", (d) => append(String(d)));
+		// JSONL parser: stdout เป็น event-per-line แต่ chunk อาจตัดกลางบรรทัด → buffer แยกด้วย \n
+		// event ที่ parse ไม่ได้ (noise/ERROR ก่อน session เริ่ม) append ดิบไว้เหมือนเดิม ไม่ให้หาย
+		let lineBuf = "";
+		const fmtArgs = (args: unknown): string => {
+			try {
+				const s = JSON.stringify(args);
+				return s.length > 120 ? `${s.slice(0, 117)}…` : s;
+			} catch {
+				return "";
+			}
+		};
+		const handleLine = (line: string) => {
+			if (!line.trim()) return;
+			let ev: { type?: string; [k: string]: unknown };
+			try {
+				ev = JSON.parse(line);
+			} catch {
+				append(`${line}\n`);
+				return;
+			}
+			switch (ev.type) {
+				case "session":
+					append(`[session ${(ev as { id?: string }).id ?? "?"}]\n`);
+					break;
+				case "tool_execution_start": {
+					const t = ev as { toolName?: string; args?: unknown };
+					append(`\n⚙ ${t.toolName} ${fmtArgs(t.args)}\n`);
+					break;
+				}
+				case "tool_execution_end": {
+					const t = ev as { toolName?: string; isError?: boolean };
+					if (t.isError) append(`✗ ${t.toolName} failed\n`);
+					break;
+				}
+				case "message_update": {
+					// stream delta — เขียนเฉพาะ text (ข้าม thinking/toolcall delta เพื่อให้ log อ่านง่าย)
+					const a = (ev as { assistantMessageEvent?: { type?: string; delta?: string } }).assistantMessageEvent;
+					if (a?.type === "text_delta" && typeof a.delta === "string") append(a.delta);
+					break;
+				}
+				case "message_end": {
+					// จับ final assistant text (เฉพาะ content type text — ข้าม thinking) ไว้เป็น output ตอนสำเร็จ
+					const msg = (ev as { assistantMessageEvent?: { role?: string; content?: { type?: string; text?: string }[] } }).assistantMessageEvent;
+					if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+						const text = msg.content.filter((c) => c?.type === "text" && typeof c.text === "string").map((c) => c.text).join("");
+						if (text.trim()) {
+							finalText = text;
+							append("\n"); // คั่นบรรทัดหลังจบข้อความ assistant
+						}
+					}
+					break;
+				}
+				default:
+					break;
+			}
+		};
+		child.stdout?.on("data", (d) => {
+			lineBuf += String(d);
+			const lines = lineBuf.split("\n");
+			lineBuf = lines.pop() ?? "";
+			for (const line of lines) handleLine(line);
+		});
 		child.stderr?.on("data", (d) => append(String(d)));
 		const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
 		child.on("error", (err) => {
@@ -127,9 +198,10 @@ function runSubagent(
 		});
 		child.on("close", (code, signal) => {
 			clearTimeout(timer);
+			if (lineBuf.trim()) handleLine(lineBuf); // flush บรรทัดค้างท้าย stream
 			const timedOut = signal === "SIGTERM";
 			appendFileSync(logPath, `\n--- exited code=${code} signal=${signal} ---\n`);
-			if (code === 0 && !signal) res({ ok: true, output: out.slice(-16_000), logPath });
+			if (code === 0 && !signal) res({ ok: true, output: (finalText || out).slice(-16_000), logPath });
 			else
 				res({
 					ok: false,
@@ -196,6 +268,41 @@ export const memorySummaryLines = (cwd: string): string[] => {
 	];
 };
 
+// ----------------------------------------------------------------------------- sub-agent model config (per-role)
+
+/**
+ * อ่าน .pi/zense/models.json — map role → pi --model pattern (เช่น "anthropic/claude-sonnet",
+ * "openai/gpt-4o-mini", "sonnet:high"). ไม่มีไฟล์/parse ไม่ได้ → {} (ใช้ model ของ agent หลักแทน).
+ */
+export const readModelsConfig = (cwd: string): Record<string, string> => {
+	const f = join(zenseDir(cwd), "models.json");
+	if (!existsSync(f)) return {};
+	try {
+		const raw = JSON.parse(readFileSync(f, "utf8"));
+		if (raw && typeof raw === "object") {
+			const out: Record<string, string> = {};
+			for (const [k, v] of Object.entries(raw)) if (typeof v === "string" && v.trim()) out[k] = v.trim();
+			return out;
+		}
+	} catch {
+		/* tolerate malformed config — fall back to main-agent model */
+	}
+	return {};
+};
+
+/**
+ * Resolve model pattern สำหรับ role ตามลำดับ: .pi/zense/models.json[role] →
+ * ctx.model (provider/id ของ agent หลัก) → undefined (ปล่อย pi ใช้ default).
+ * undefined จะทำให้ runSubagent ไม่ส่ง --model ไป
+ */
+export const resolveModelPattern = (cwd: string, role: string, mainModel?: { provider: string; id: string }): string | undefined => {
+	const cfg = readModelsConfig(cwd);
+	const configured = cfg[role];
+	if (configured) return configured;
+	if (mainModel) return `${mainModel.provider}/${mainModel.id}`;
+	return undefined;
+};
+
 // ----------------------------------------------------------------------------- extension
 
 export default function (pi: ExtensionAPI) {
@@ -242,7 +349,9 @@ export default function (pi: ExtensionAPI) {
 		]);
 	};
 
-	/** launch wrapper: ลงทะเบียน run (widget แสดงสด) + เขียน log live ทุก chunk */
+	/** launch wrapper: ลงทะเบียน run (widget แสดงสด) + เขียน log live ทุก chunk
+	 *  model ของ sub-agent: resolve ตาม role จาก .pi/zense/models.json, ถ้าไม่มี entry ใช้ model
+	 *  ปัจจุบันของ agent หลัก (ctx.model), ถ้าไม่มีอีก ปล่อย pi ใช้ default (ไม่ส่ง --model) */
 	const launchSubagent = async (
 		ctx: ExtensionContext,
 		role: string,
@@ -250,12 +359,14 @@ export default function (pi: ExtensionAPI) {
 		onChunk?: (chunk: string) => void,
 	): Promise<{ ok: boolean; output: string; logPath: string }> => {
 		const logPath = subagentLogPath(ctx.cwd, role);
+		const mainModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+		const modelPattern = resolveModelPattern(ctx.cwd, role, mainModel);
 		const run: SubagentRun = { role, ok: false, summary: "", at: Date.now(), startedAt: Date.now(), logPath, status: "running" };
 		state.subagentRuns.push(run);
 		updateWidget(ctx);
 		const tick = setInterval(() => updateWidget(ctx), 2_000); // elapsed วิ่งใน widget
 		try {
-			const r = await runSubagent(role, task, ctx.cwd, 240_000, onChunk, logPath);
+			const r = await runSubagent(role, task, ctx.cwd, 240_000, onChunk, logPath, modelPattern);
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
@@ -422,7 +533,9 @@ export default function (pi: ExtensionAPI) {
 			let lines: string[] = [];
 			let cachedWidth = -1;
 			let offset = 0;
-			const bodyRows = () => Math.max(4, Math.min(24, tui.terminal.rows - 14));
+			// ความสูงเนื้อ spec: ยกเลิก cap ที่ 24 ให้ใช้พื้นที่ terminal ได้เต็มที่ (reserve 12 บรรทัด
+			// สำหรับ border/title/hint/range/selectList/bottomHint) — อ่าน spec ได้ยาวขึ้นโดยไม่ต้องเลื่อนบ่อย
+			const bodyRows = () => Math.max(4, tui.terminal.rows - 12);
 			const maxOffset = () => Math.max(0, lines.length - bodyRows());
 
 			return {
@@ -440,7 +553,7 @@ export default function (pi: ExtensionAPI) {
 					for (let i = slice.length; i < h; i++) out.push(""); // รักษาความสูง dialog ให้นิ่ง
 					const range =
 						lines.length > h
-							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — เลื่อน: Space/b, Ctrl+D/U (ครึ่งหน้า), PgUp/PgDn, g/Home/End —`
+							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — เลื่อน: Shift+↑/↓ (ทีละบรรทัด), Ctrl+↑/↓ (ครึ่งหน้า), Space/b, PgUp/PgDn, g/Home/End —`
 							: `— spec ครบทุกบรรทัด (${lines.length} lines) —`;
 					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
 					out.push(...selectList.render(w));
@@ -455,7 +568,15 @@ export default function (pi: ExtensionAPI) {
 					// PgUp/PgDn terminal หลายตัวไม่ส่ง key นี้เข้ามา (เช่น macOS Terminal/iTerm จับไป scroll เอง,
 					// หรือต้องกด fn+↑/fn+↓) — เลยเติมปุ่มสำรองแบบ less/vim ที่กดได้แน่ๆ ทุก session:
 					//   Space เลื่อนลงเต็มหน้า, b เลื่อนขึ้นเต็มหน้า, Ctrl+D/U ครึ่งหน้า, g = บนสุด, Home/End กระโดด
-					if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.space))
+					// Shift+↑/↓ เลื่อนทีละบรรทัด (อ่านละเอียด), Ctrl+↑/↓ ครึ่งหน้า — plain ↑/↓ ไม่แย่ง
+					// (ให้ SelectList ใช้เลือกตัวเลือกเซ็น) — ปุ่มเดิม (Space/b/PgUp/PgDn/Ctrl+D/Ctrl+U/g/Home/End) ยังทำงานเหมือนเดิม
+					if (matchesKey(data, Key.shift("up"))) offset = Math.max(0, offset - 1);
+					else if (matchesKey(data, Key.shift("down"))) offset = Math.min(maxOffset(), offset + 1);
+					else if (matchesKey(data, Key.ctrl("up")))
+						offset = Math.max(0, offset - Math.max(1, bodyRows() >> 1));
+					else if (matchesKey(data, Key.ctrl("down")))
+						offset = Math.min(maxOffset(), offset + Math.max(1, bodyRows() >> 1));
+					else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.space))
 						offset = Math.min(maxOffset(), offset + bodyRows());
 					else if (matchesKey(data, Key.pageUp) || data === "b")
 						offset = Math.max(0, offset - bodyRows());
@@ -649,6 +770,8 @@ export default function (pi: ExtensionAPI) {
 			writeFileSync(mdPath, renderSpecMd(state.spec));
 			copyFileSync(jsonPath, join(zenseDir(ctx.cwd), "spec.json"));
 			copyFileSync(mdPath, join(zenseDir(ctx.cwd), "spec.md"));
+			state.specMdPath = mdPath;     // zense_eval จะ append ผลการประเมินท้ายไฟล์นี้
+			state.specJsonPath = jsonPath;
 			// ช่วงเวลาเซ็น (zense/sign): ถามอนุมัติทันทีตอน spec ถูกนำเสนอ
 			// spec ถูก archive ลงไฟล์ก่อนแล้ว — dialog โชว์เนื้อ spec เต็มให้อ่านก่อนเซ็น (TUI)
 			let signed = false;
@@ -731,17 +854,56 @@ export default function (pi: ExtensionAPI) {
 			const grade = await launchSubagent(
 				ctx,
 				"grader",
-				`You are the OUTPUT-EVAL grader. For each acceptance criterion, judge PASS/FAIL with evidence (run checks with tools if useful). Also look for reward hacking. Criteria:\n${state.spec.criteria
-					.map((c) => `- ${c.id}: ${c.text} (check: ${c.check})`)
-					.join("\n")}\nOutput a verdict table then OVERALL: PASS|FAIL.`,
+				`You are the OUTPUT-EVAL grader. For each acceptance criterion, judge PASS/FAIL with evidence (run checks with tools if useful). Also look for reward hacking.\n` +
+					`Criteria:\n${state.spec.criteria.map((c) => `- ${c.id}: ${c.text} (check: ${c.check})`).join("\n")}\n\n` +
+					`Output STRICTLY in this format (one line per criterion, then a final OVERALL line):\n` +
+					`<id>: PASS: <one-line evidence>\n` +
+					`<id>: FAIL: <one-line evidence>\n` +
+					`…\n` +
+					`OVERALL: PASS|FAIL\n` +
+					`Do NOT add extra commentary. Each criterion line must start with its id followed by ': PASS:' or ': FAIL:'. The last line must be exactly 'OVERALL: PASS' or 'OVERALL: FAIL'.`,
 				streamTail,
 			);
-			const verdict = grade.output.match(/OVERALL:\s*(PASS|FAIL)/i)?.[1]?.toUpperCase() ?? "unknown";
-			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict}`);
+			// parser แม่น per-criteria: iterate id ที่อยู่ใน state.spec.criteria แล้ว regex ดึง verdict ของ id นั้น
+			// (ผูกกับ id จริง → กัน false positive จากบรรทัดอื่น) + overall verdict แยก
+			const perCriteria: Record<string, "PASS" | "FAIL"> = {};
+			const failedCriteria: string[] = [];
+			for (const c of state.spec.criteria) {
+				const m = grade.output.match(new RegExp(`^\\s*${c.id}:\\s*(PASS|FAIL)`, "im"));
+				if (m) {
+					const v = m[1].toUpperCase() as "PASS" | "FAIL";
+					perCriteria[c.id] = v;
+					if (v === "FAIL") failedCriteria.push(c.id);
+				}
+			}
+			const verdict = grade.output.match(/^\s*OVERALL:\s*(PASS|FAIL)/im)?.[1]?.toUpperCase() ?? "unknown";
+			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} failed=[${failedCriteria.join(",")}]`);
+			// บันทึกผล eval ลง spec .md (archive + latest copy) เป็น section ใหม่ท้ายไฟล์ (append-only, ไม่เขียนทับเนื้อเดิม)
+			const evalTs = new Date().toISOString();
+			const evalSection =
+				`\n\n## Eval ${evalTs}\nverdict: **${verdict}** (grader.ok=${grade.ok})\n` +
+				`per-criteria:\n${state.spec.criteria.map((c) => `- ${c.id}: ${perCriteria[c.id] ?? "?"}${perCriteria[c.id] === "FAIL" ? " — FAIL" : ""}`).join("\n")}\n` +
+				(failedCriteria.length ? `failed: ${failedCriteria.join(", ")}\n` : "") +
+				`\ngrader output:\n${grade.output.slice(-4_000)}\n`;
+			if (state.specMdPath && existsSync(state.specMdPath)) appendFileSync(state.specMdPath, evalSection);
+			const latestMd = join(zenseDir(ctx.cwd), "spec.md");
+			if (existsSync(latestMd)) appendFileSync(latestMd, evalSection);
+			if (verdict === "FAIL") {
+				// วงจร FAIL → ส่งกลับแก้: phase กลับ implementation, escalation need-fix, return isError สั่งแก้+eval ใหม่
+				state.phase = "implementation";
+				state.escalations.push({ kind: "need-fix", detail: `criteria failed: ${failedCriteria.join(",") || "grader FAIL"}`, at: Date.now() });
+				persist(); updateWidget(ctx);
+				const fixMsg =
+					`❌ Eval FAIL — กลับไปแก้แล้วเรียก zense_eval ใหม่ (ห้ามไป review จนกว่าจะ PASS)\n` +
+					`criteria ที่ไม่ผ่าน: ${failedCriteria.length ? failedCriteria.join(", ") : "(overall FAIL — ดู grader output)"}\n\n` +
+					`${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
+				return { content: [{ type: "text", text: fixMsg }], details: { ok: grade.ok, verdict, failedCriteria, trajectory: state.trajectoryFlags }, isError: true };
+			}
+			// PASS (หรือ unknown → ปฏิบัติเหมือน PASS เพื่อไม่บล็อก เพราะไม่แน่ใจ): เดินไป review ตามปกติ
 			const report = `${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
 			state.phase = "review";
 			persist(); updateWidget(ctx);
-			return { content: [{ type: "text", text: report }], details: { ok: grade.ok, trajectory: state.trajectoryFlags } };
+			return { content: [{ type: "text", text: report }], details: { ok: grade.ok, verdict, failedCriteria, trajectory: state.trajectoryFlags } };
 		},
 	});
 
@@ -795,9 +957,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("zense", {
-		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory",
+		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory | models",
 		getArgumentCompletions: (prefix) =>
-			["status", "approve", "agents", "gate", "memory"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
+			["status", "approve", "agents", "gate", "memory", "models"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			if (sub === "status") {
@@ -837,8 +999,21 @@ export default function (pi: ExtensionAPI) {
 						"info",
 					);
 				}
+			} else if (sub === "models") {
+				// ดู/ตั้ง model ของ sub-agent แยกตาม role (.pi/zense/models.json)
+				const cfgPath = join(zenseDir(ctx.cwd), "models.json");
+				const cfg = readModelsConfig(ctx.cwd);
+				const mainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no active model)";
+				const roles = ["requirements", "grader", "reviewer"];
+				const lines = [
+					`🧪 sub-agent models — config: ${existsSync(cfgPath) ? relative(ctx.cwd, cfgPath) : "(no .pi/zense/models.json — ทุก role ใช้ model หลัก)"}`,
+					`agent หลัก: ${mainModel}`,
+					...roles.map((r) => `  ${r}: ${cfg[r] ? cfg[r] + " (จาก config)" : mainModel + " (fallback)"}`),
+					"แก้ไขโดยสร้าง .pi/zense/models.json เช่น { \"grader\": \"openai/gpt-4o-mini\" }",
+				];
+				ctx.ui.notify(lines.join("\n"), "info");
 			} else {
-				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory", "info");
+				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models", "info");
 			}
 		},
 	});

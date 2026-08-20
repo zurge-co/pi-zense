@@ -1,0 +1,74 @@
+{
+  "version": 3,
+  "title": "Eval FAIL loop + grader structured output (แม่น per-criteria)",
+  "intent": "สองปัญหาที่ต้องแก้ใน zense_eval: (1) ตอนนี้ grader บอก FAIL แล้ว harness ปล่อยผ่านไป review เลย ไม่วนกลับแก้ — อยากให้ FAIL ส่งกลับเป็น implementation phase พร้อมสั่งให้แก้แล้ว eval ใหม่ และบันทึกผล eval ลง spec .md; (2) grader output เป็น free-form text ทำให้ parser ดึง per-criteria PASS/FAIL ไม่แม่น (grader เขียนตามใจ) — อยากให้ grader ส่ง output แบบ structured (บรรทัดต่อ criterion รูปแบน `Cx: PASS|FAIL: <evidence>` และบรรทัด `OVERALL: PASS|FAIL`) แล้ว parser ดึง per-criteria verdict แม่นยำจาก format นั้น ไม่ใช่ดึงแค่ OVERALL ด้วย regex หลวมๆ",
+  "scope": [
+    "extensions/zense-harness/"
+  ],
+  "constraints": [
+    "spec archive เดิมเป็น append-only — ผล eval ต้อง append เป็น section ใหม่ท้ายไฟล์ ห้ามแก้บรรทัดเดิม",
+    "PASS ต้องยังเดินไป phase=review เหมือนเดิม",
+    "การตัดสินใจ phase ต้องใช้ verdict จาก OVERALL ที่ parse แม่น ไม่ใช่ grade.ok (subprocess exit)",
+    "learn() memory, trajectory flags, report ยังคง return กลับเหมือนเดิม",
+    "grader prompt ต้องระบุ format ของ output ชัดเจน (per-criteria บรรทัด + OVERALL) และ parser ต้อง tolerant ต่อ whitespace/ตัวพิมพ์เล็กใหญ่ แต่ strict ต่อรูปแบบหลัก",
+    "กระทบเฉพาะ zense_eval execute + State (เพิ่ม specMdPath/specJsonPath) + zense_spec execute (เก็บ path) + grader prompt — ห้ามแตะ tool/phase อื่น",
+    "parser ดึง per-criteria verdict ต้องใช้ regex ผูกกับ criterion id ที่อยู่ใน state.spec.criteria (ไม่ใช่ดึงบรรทัดอะไรก็ตั้ง) เพื่อกัน false positive"
+  ],
+  "criteria": [
+    {
+      "id": "C1",
+      "text": "grader prompt สั่งให้ output แบบ structured: บรรทัดต่อ criterion รูปแบบ `<id>: PASS|FAIL: <evidence>` และบรรทัดสุดท้าย `OVERALL: PASS|FAIL`",
+      "check": "rg 'PASS\\|FAIL|OVERALL' ใน grader prompt string ของ zense_eval พบ format spec ชัดเจน"
+    },
+    {
+      "id": "C2",
+      "text": "parser ดึง per-criteria verdict แม่นยำ: สำหรับทุก c.id ใน state.spec.criteria ให้หาบรรทัดที่ตรง `^<id>:\\s*(PASS|FAIL)` (case-insensitive) และเก็บผลเป็น map {id → PASS|FAIL} — ไม่ดึงบรรทัดที่ id ไม่ตรงกับ criteria ที่มี",
+      "check": "rg 'criteria.*PASS.*FAIL|for.*criteria.*match|verdicts.*Map|per-criteria' ใน zense_eval พบ logic ที่ iterate state.spec.criteria แล้ว regex ดึง verdict ของ id นั้น"
+    },
+    {
+      "id": "C3",
+      "text": "overall verdict มาจากการ parse บรรทัด `OVERALL: PASS|FAIL` (แม่น) และมี fallback = 'unknown' ถ้าหาไม่ได้",
+      "check": "rg 'OVERALL:\\\\s*\\(PASS\\|FAIL\\)' ใน zense_eval พบ และมี ?? 'unknown'"
+    },
+    {
+      "id": "C4",
+      "text": "เมื่อ overall verdict = FAIL: state.phase กลับเป็น \"implementation\" (ไม่ใช่ review) และเพิ่ม escalation {kind:\"need-fix\", detail: <รายการ criteria id ที่ fail หรือ 'grader FAIL'>} เข้า state.escalations",
+      "check": "rg 'need-fix|phase = \"implementation\"' ในบล็อก verdict FAIL พบ"
+    },
+    {
+      "id": "C5",
+      "text": "เมื่อ verdict = FAIL: return content มี isError=true และข้อความสั่งชัดว่ากลับไปแก้ criteria ที่ fail แล้วเรียก zense_eval ใหม่ พร้อม list criteria ที่ fail",
+      "check": "rg 'isError.*true|FAIL|eval ใหม่|กลับไปแก้' ใน return path ของ verdict FAIL พบ และมีการ list id ที่ fail"
+    },
+    {
+      "id": "C6",
+      "text": "เมื่อ verdict = PASS: state.phase = \"review\" และ return report ปกติ (ไม่ isError)",
+      "check": "rg 'phase = \"review\"' อยู่ในบรรทัด PASS และไม่มี isError ใน path นั้น"
+    },
+    {
+      "id": "C7",
+      "text": "details ของ zense_eval return มีฟิลด์ verdict (\"PASS\"|\"FAIL\"|\"unknown\") และ failedCriteria (array ของ id ที่ fail)",
+      "check": "rg 'verdict|failedCriteria' ใน details object ของ return พบ"
+    },
+    {
+      "id": "C8",
+      "text": "ผล eval (verdict + per-criteria results + สรุป grader output) ถูก append เป็น section ใหม่ (เช่น `## Eval <timestamp>`) ต่อท้าย spec.md (latest copy) และไฟล์ archive .md ของเวอร์ชันนั้น โดยเนื้อ spec ต้นฉบับไม่ถูกเขียนทับ",
+      "check": "rg '## Eval|appendFileSync' ใน zense_eval พบ และตรวจว่า append ไม่ใช่ writeFileSync ที่ทั้งไฟล์"
+    },
+    {
+      "id": "C9",
+      "text": "state เก็บ path ของ spec md/json ปัจจุบัน (specMdPath/specJsonPath หรือเทียบเท่า) เพื่อให้ zense_eval หาไฟล์ที่จะ append ได้ถูกเวอร์ชัน",
+      "check": "rg 'specMdPath|specJsonPath' ใน State interface และ zense_spec execute พบ และ zense_eval ใช้ค่านั้น"
+    },
+    {
+      "id": "C10",
+      "text": "TypeScript compile ไม่เพิ่ม type error ใหม่ (error เดิม 2 ตัวที่มีอยู่ก่อนยังพอได้)",
+      "check": "npx tsc -p tsconfig ผ่าน โดยจำนวน error ไม่มากกว่าต้นฉบับ (2 ตัว)"
+    }
+  ],
+  "specDebt": [
+    "structured format ยังเป็น text ไม่ใช่ JSON — grader อาจเบี่ยน format บ้าง (เช่นเพิ่มคำนำหน้า) ต้อง verify กับ grader จริง; ถ้ายังไม่แม่นพออาจต้องเปลี่ยนเป็น JSON output แล้ว parse JSON",
+    "การ append eval section ลง archive .md เปลี่ยนไฟล์ append-only แต่เป็นการเพิ่มท้าย — ต้อง verify ว่าเข้าใจว่าไม่ทำลายประวัติเดิม"
+  ],
+  "approved": false
+}

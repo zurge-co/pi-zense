@@ -28,7 +28,7 @@ finished artifact — exactly the harness design plan.md recommends.
 
 ## Human attention points (the scarce resource, per PLAN.md)
 
-- **🔏 Signing dialog** — the signature happens *inside* the dialog the moment the spec is compiled (or when the gate fires, or via `/zense approve`): the dialog renders the **full spec inline** (PgUp/PgDn to scroll) so you always read before signing; sign & continue in one shot, no extra command.
+- **🔏 Signing dialog** — the signature happens *inside* the dialog the moment the spec is compiled (or when the gate fires, or via `/zense approve`): the dialog renders the **full spec inline** (Ctrl+D/U half page, Ctrl+F/B full page to scroll — works on every terminal) so you always read before signing; sign & continue in one shot, no extra command.
 - **`/zense approve`** — only for signing later, if you chose "ยังไม่เซ็น" before.
 - **`/zense status`** — one-glance: phase, gate, trajectory flags, escalations.
 - Forced review items from `specDebt` surface in every eval report.
@@ -40,7 +40,7 @@ finished artifact — exactly the harness design plan.md recommends.
 |---|---|
 | `/zense status` | phase, spec version/approval, flags, escalations |
 | `/zense approve` | sign current spec later (usually unnecessary — dialog covers it) |
-| `ctrl+shift+a` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.pi/zense/subagents/*.log` (written live while they run) |
+| `ctrl+r` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.pi/zense/subagents/*.log` (written live while they run) |
 | `/zense gate off` | disable the spec gate (escape hatch) |
 | `/zense memory` | grouped lesson summary (top recurring flags, escalations by kind, eval history, sub-agent failures); `/zense memory json` for the raw JSONL tail |
 

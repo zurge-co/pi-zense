@@ -303,6 +303,55 @@ export const resolveModelPattern = (cwd: string, role: string, mainModel?: { pro
 	return undefined;
 };
 
+/**
+ * เขียน/ลบ model override ของ role หนึ่งใน .pi/zense/models.json — สร้าง dir ให้ถ้ายังไม่มี,
+ * คง key อื่นของไฟล์เดิมไว้ (อ่าน raw เอง เพราะ readModelsConfig ตัดค่าที่ไม่ใช่ string ทิ้ง)
+ */
+export const writeModelsConfig = (cwd: string, role: string, pattern: string | null): void => {
+	const dir = zenseDir(cwd);
+	mkdirSync(dir, { recursive: true });
+	const f = join(dir, "models.json");
+	let cfg: Record<string, unknown> = {};
+	if (existsSync(f)) {
+		try {
+			const raw = JSON.parse(readFileSync(f, "utf8"));
+			if (raw && typeof raw === "object") cfg = raw as Record<string, unknown>;
+		} catch {
+			/* malformed เดิม — เริ่มจาก {} ใหม่ */
+		}
+	}
+	if (pattern && pattern.trim()) cfg[role] = pattern.trim();
+	else delete cfg[role];
+	writeFileSync(f, JSON.stringify(cfg, null, 2) + "\n");
+};
+
+/**
+ * รายการ model ที่เลือกได้สำหรับ picker: scopedModels ของ session ก่อน (mirror ของ /model picker)
+ * ถ้าไม่มี scoping ค่อย fallback เป็น catalogue ทั้งหมดจาก modelRegistry.getAvailable()
+ */
+const availableModelChoices = (ctx: ExtensionContext): { pattern: string; label: string; description: string }[] => {
+	try {
+		if (ctx.scopedModels?.length) {
+			return ctx.scopedModels.map((s) => {
+				const base = `${s.model.provider}/${s.model.id}`;
+				const pattern = s.thinkingLevel ? `${base}:${s.thinkingLevel}` : base;
+				return {
+					pattern,
+					label: pattern,
+					description: s.thinkingLevel ? `${s.model.name} (scoped, thinking pinned)` : `${s.model.name} (scoped)`,
+				};
+			});
+		}
+		return ctx.modelRegistry.getAvailable().map((m) => ({
+			pattern: `${m.provider}/${m.id}`,
+			label: `${m.provider}/${m.id}`,
+			description: m.name,
+		}));
+	} catch {
+		return [];
+	}
+};
+
 // ----------------------------------------------------------------------------- extension
 
 export default function (pi: ExtensionAPI) {
@@ -587,6 +636,49 @@ export default function (pi: ExtensionAPI) {
 					else if (data === "g" || matchesKey(data, Key.home)) offset = 0;
 					else if (matchesKey(data, Key.end)) offset = maxOffset();
 					else selectList.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		});
+
+	// ----- picker กลางของ zense: title + search filter + SelectList (ใช้ซ้ำได้ทั้งเลือก role/model)
+
+	const zensePick = (ctx: ExtensionContext, title: string, items: SelectItem[], hint = ""): Promise<string | null> =>
+		ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
+			const selectList = new SelectList(items, Math.min(items.length, 12), {
+				selectedPrefix: (t) => theme.fg("accent", t),
+				selectedText: (t) => theme.fg("accent", t),
+				description: (t) => theme.fg("muted", t),
+				scrollInfo: (t) => theme.fg("dim", t),
+				noMatch: (t) => theme.fg("warning", t),
+			});
+			selectList.onSelect = (item) => done(item.value);
+			selectList.onCancel = () => done(null);
+			let filter = "";
+			return {
+				render: (w: number) => [
+					...border.render(w),
+					...new Text(theme.fg("accent", theme.bold(title)), 1, 0).render(w),
+					...new Text(theme.fg("dim", `filter: ${filter || "(พิมพ์เพื่อคัดกรอง)"}${hint ? ` • ${hint}` : ""}`), 1, 0).render(w),
+					...selectList.render(w),
+					...new Text(theme.fg("dim", "↑↓ เลือก • Enter ยืนยัน • Esc ยกเลิก • พิมพ์ = filter"), 1, 0).render(w),
+					...border.render(w),
+				],
+				invalidate: () => {
+					selectList.invalidate();
+				},
+				handleInput: (data: string) => {
+					// ปุ่มนำทาง/ยืนยัน/ยกเลิกส่งให้ SelectList — ตัวอักษร printable เข้า search filter แทน
+					if (matchesKey(data, Key.backspace)) {
+						filter = filter.slice(0, -1);
+						selectList.setFilter(filter);
+					} else if (data.length === 1 && data >= " " && !matchesKey(data, Key.enter)) {
+						filter += data;
+						selectList.setFilter(filter);
+					} else {
+						selectList.handleInput(data);
+					}
 					tui.requestRender();
 				},
 			};
@@ -1005,13 +1097,54 @@ export default function (pi: ExtensionAPI) {
 				const cfg = readModelsConfig(ctx.cwd);
 				const mainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no active model)";
 				const roles = ["requirements", "grader", "reviewer"];
-				const lines = [
-					`🧪 sub-agent models — config: ${existsSync(cfgPath) ? relative(ctx.cwd, cfgPath) : "(no .pi/zense/models.json — ทุก role ใช้ model หลัก)"}`,
+				if (ctx.mode !== "tui") {
+					// non-TUI (rpc/print): แสดง summary ให้แก้เองเหมือนเดิม
+					const lines = [
+						`🧪 sub-agent models — config: ${existsSync(cfgPath) ? relative(ctx.cwd, cfgPath) : "(no .pi/zense/models.json — ทุก role ใช้ model หลัก)"}`,
+						`agent หลัก: ${mainModel}`,
+						...roles.map((r) => `  ${r}: ${cfg[r] ? cfg[r] + " (จาก config)" : mainModel + " (fallback)"}`),
+						"แก้ไขโดยสร้าง .pi/zense/models.json เช่น { \"grader\": \"openai/gpt-4o-mini\" } — หรือเปิด TUI แล้ว /zense models เพื่อเลือกแบบ interactive",
+					];
+					ctx.ui.notify(lines.join("\n"), "info");
+					return;
+				}
+				// TUI: interactive picker — เลือก role → เลือก model จาก catalogue → เขียน models.json ให้เลย
+				const role = await zensePick(
+					ctx,
+					"🧪 เลือก role ของ sub-agent ที่จะตั้ง model",
+					roles.map((r) => ({
+						value: r,
+						label: r,
+						description: cfg[r] ? `${cfg[r]} (จาก config)` : `${mainModel} (fallback)`,
+					})),
 					`agent หลัก: ${mainModel}`,
-					...roles.map((r) => `  ${r}: ${cfg[r] ? cfg[r] + " (จาก config)" : mainModel + " (fallback)"}`),
-					"แก้ไขโดยสร้าง .pi/zense/models.json เช่น { \"grader\": \"openai/gpt-4o-mini\" }",
-				];
-				ctx.ui.notify(lines.join("\n"), "info");
+				);
+				if (!role) return;
+				const choices = availableModelChoices(ctx);
+				const sel = await zensePick(
+					ctx,
+					`🧪 เลือก model สำหรับ role "${role}"`,
+					[
+						{ value: "__default__", label: "↩️ ใช้ model หลัก (ลบ override)", description: `กลับไป fallback เป็น ${mainModel}` },
+						{ value: "__custom__", label: "✏️ พิมพ์ pattern เอง", description: "เช่น openai/gpt-4o-mini หรือ sonnet:high" },
+						...choices.map((c) => ({ value: c.pattern, label: c.label, description: c.description })),
+					],
+					choices.length ? `${choices.length} models จาก catalogue` : "catalogue ว่าง — เลือก 'พิมพ์ pattern เอง'",
+				);
+				if (!sel) return;
+				if (sel === "__default__") {
+					writeModelsConfig(ctx.cwd, role, null);
+					ctx.ui.notify(`✅ ${role}: ลบ override แล้ว — sub-agent run ถัดไปจะ fallback เป็น model หลัก (${mainModel})`, "info");
+					return;
+				}
+				let pattern = sel;
+				if (sel === "__custom__") {
+					const typed = (await ctx.ui.input(`model pattern สำหรับ "${role}":`, "provider/model-id"))?.trim();
+					if (!typed) return ctx.ui.notify("ยกเลิก — ไม่ได้เปลี่ยน model", "info");
+					pattern = typed;
+				}
+				writeModelsConfig(ctx.cwd, role, pattern);
+				ctx.ui.notify(`✅ ${role}: ${pattern} — เขียน ${relative(ctx.cwd, cfgPath)} แล้ว (มีผล sub-agent run ถัดไปทันที)`, "info");
 			} else {
 				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models", "info");
 			}

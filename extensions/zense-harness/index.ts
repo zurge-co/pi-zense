@@ -98,7 +98,7 @@ const subagentLogPath = (cwd: string, role: string): string => {
  * (bug เดิม: execFile ค้างเงียบๆ จนโดน SIGTERM). ใช้ --mode json ไม่ใช่ print เพราะ print mode
  * buffer stdout ทั้งก้อนแล้วปล่อยทีเดียวตอนจบ (ทดลองแล้ว: chunk เดียวก่อน close — log ดูเหมือนค้าง
  * จนงานเสร็จ) ส่วน json mode เป็น JSONL event stream ที่ไหลตั้งแต่ต้น → parse event เป็น text
- * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ ctrl+shift+a).
+ * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ ctrl+r).
  */
 function runSubagent(
 	role: string,
@@ -392,7 +392,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget("zense", [
 			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
 				` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
-				(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+shift+a ดูสด)` : "") +
+				(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+r ดูสด)` : "") +
 				(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 				(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : ""),
 		]);
@@ -538,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// ----- spec presentation: dialog ต้องโชว์ spec เต็มๆ ให้อ่านก่อนตัดสินใจเซ็น
-	// (ScrollView ของ pi-tui ต้องการ layout integration เลย scroll เองด้วย PgUp/PgDn + slice)
+	// (ScrollView ของ pi-tui ต้องการ layout integration เลย scroll เองด้วย offset + slice)
 
 	const specSignDialog = (ctx: ExtensionContext, spec: Spec, question: string, items: SelectItem[]): Promise<string | null> =>
 		ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
@@ -602,7 +602,7 @@ export default function (pi: ExtensionAPI) {
 					for (let i = slice.length; i < h; i++) out.push(""); // รักษาความสูง dialog ให้นิ่ง
 					const range =
 						lines.length > h
-							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — เลื่อน: Shift+↑/↓ (ทีละบรรทัด), Ctrl+↑/↓ (ครึ่งหน้า), Space/b, PgUp/PgDn, g/Home/End —`
+							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — เลื่อน: Ctrl+D/U (ครึ่งหน้า), Ctrl+F/B (เต็มหน้า) —`
 							: `— spec ครบทุกบรรทัด (${lines.length} lines) —`;
 					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
 					out.push(...selectList.render(w));
@@ -614,27 +614,16 @@ export default function (pi: ExtensionAPI) {
 					cachedWidth = -1;
 				},
 				handleInput: (data: string) => {
-					// PgUp/PgDn terminal หลายตัวไม่ส่ง key นี้เข้ามา (เช่น macOS Terminal/iTerm จับไป scroll เอง,
-					// หรือต้องกด fn+↑/fn+↓) — เลยเติมปุ่มสำรองแบบ less/vim ที่กดได้แน่ๆ ทุก session:
-					//   Space เลื่อนลงเต็มหน้า, b เลื่อนขึ้นเต็มหน้า, Ctrl+D/U ครึ่งหน้า, g = บนสุด, Home/End กระโดด
-					// Shift+↑/↓ เลื่อนทีละบรรทัด (อ่านละเอียด), Ctrl+↑/↓ ครึ่งหน้า — plain ↑/↓ ไม่แย่ง
-					// (ให้ SelectList ใช้เลือกตัวเลือกเซ็น) — ปุ่มเดิม (Space/b/PgUp/PgDn/Ctrl+D/Ctrl+U/g/Home/End) ยังทำงานเหมือนเดิม
-					if (matchesKey(data, Key.shift("up"))) offset = Math.max(0, offset - 1);
-					else if (matchesKey(data, Key.shift("down"))) offset = Math.min(maxOffset(), offset + 1);
-					else if (matchesKey(data, Key.ctrl("up")))
-						offset = Math.max(0, offset - Math.max(1, bodyRows() >> 1));
-					else if (matchesKey(data, Key.ctrl("down")))
-						offset = Math.min(maxOffset(), offset + Math.max(1, bodyRows() >> 1));
-					else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.space))
-						offset = Math.min(maxOffset(), offset + bodyRows());
-					else if (matchesKey(data, Key.pageUp) || data === "b")
-						offset = Math.max(0, offset - bodyRows());
-					else if (matchesKey(data, Key.ctrl("d")))
+					// ใช้เฉพาะ ctrl+letter แบบ less/vim — control char ตัวเดียว กดได้แน่ๆ ทุก terminal ทั้ง mac/windows
+					// (shift+↑/↓ โดน terminal ยึดไป scroll เอง, ctrl+↑/↓ ชน Mission Control บน mac,
+					//  PgUp/PgDn บน mac ต้องกด fn — เลยตัดทิ้งหมด)
+					//   Ctrl+D/U = ครึ่งหน้า, Ctrl+F/B = เต็มหน้า (forward/back) — ↑/↓ ปล่อยให้ SelectList เลือกตัวเลือก
+					if (matchesKey(data, Key.ctrl("d")))
 						offset = Math.min(maxOffset(), offset + Math.max(1, bodyRows() >> 1));
 					else if (matchesKey(data, Key.ctrl("u")))
 						offset = Math.max(0, offset - Math.max(1, bodyRows() >> 1));
-					else if (data === "g" || matchesKey(data, Key.home)) offset = 0;
-					else if (matchesKey(data, Key.end)) offset = maxOffset();
+					else if (matchesKey(data, Key.ctrl("f"))) offset = Math.min(maxOffset(), offset + bodyRows());
+					else if (matchesKey(data, Key.ctrl("b"))) offset = Math.max(0, offset - bodyRows());
 					else selectList.handleInput(data);
 					tui.requestRender();
 				},
@@ -991,8 +980,13 @@ export default function (pi: ExtensionAPI) {
 					`${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
 				return { content: [{ type: "text", text: fixMsg }], details: { ok: grade.ok, verdict, failedCriteria, trajectory: state.trajectoryFlags }, isError: true };
 			}
-			// PASS (หรือ unknown → ปฏิบัติเหมือน PASS เพื่อไม่บล็อก เพราะไม่แน่ใจ): เดินไป review ตามปกติ
-			const report = `${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
+			// PASS (หรือ unknown → ปฏิบัติเหมือน PASS เพื่อไม่บล็อก เพราะไม่แน่ใจ): เดินไป review
+			// ต้องสั่งขั้นต่อไป explicit ในข้อความที่คืนให้ agent (เหมือน FAIL branch) —
+			// ถ้าไม่เขียนบอก agent จะถือว่างานจบแล้วตอบ user ทันที ทำให้ reviewer ไม่ถูกเรียกเลย
+			const report =
+				`${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}` +
+				`\n\n✅ Eval PASS — ขั้นต่อไป (บังคับ): เรียก \`zense_review\` ทันทีเพื่อให้ reviewer sub-agent สร้าง review packet` +
+				` — ห้ามสรุป/ตอบ user จบงานก่อนจนกว่าจะเรียก zense_review แล้ว`;
 			state.phase = "review";
 			persist(); updateWidget(ctx);
 			return { content: [{ type: "text", text: report }], details: { ok: grade.ok, verdict, failedCriteria, trajectory: state.trajectoryFlags } };
@@ -1005,6 +999,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Phase 5: build the exception-based review packet (TL;DR first, evidence linked, anomalies highlighted).",
 		parameters: Type.Object({}),
 		async execute(_id, _p, _s, _o, ctx) {
+			// guard ลำดับ phase: review ต้องมาหลัง eval PASS เท่านั้น (phase ถูก set เป็น "review" ใน zense_eval)
+			if (state.phase !== "review")
+				return {
+					content: [{ type: "text", text: `⛔ ยัง review ไม่ได้ — phase ปัจจุบันคือ "${state.phase}" (ต้อง eval PASS ก่อน)\nไปเรียก \`zense_eval\` ก่อน แล้วค่อยกลับมาเรียก zense_review` }],
+					details: { phase: state.phase },
+					isError: true,
+				};
 			const reviewer = await launchSubagent(
 				ctx,
 				"reviewer",
@@ -1043,7 +1044,10 @@ export default function (pi: ExtensionAPI) {
 
 	// ----- human gates: commands
 
-	pi.registerShortcut("ctrl+shift+a", {
+	// ctrl+r — plain ctrl+letter ที่ว่างใน pi main loop ตัวเดียวที่ไม่ชน terminal/เครื่อง:
+	// ctrl+shift+letter terminal ส่วนใหญ่ส่งมาเป็น ctrl+letter เฉยๆ (แยก shift ไม่ได้), ctrl+s/ctrl+q เสี่ยง XON/XOFF,
+	// ตัวอักษรอื่น pi จองไว้กับ editor/app หมด — ctrl+r ของ pi เองใช้เฉพาะในหน้า /resume (rename) เท่านั้น
+	pi.registerShortcut("ctrl+r", {
 		description: "Zense: ดู sub-agent runs สดๆ (live tail)",
 		handler: (ctx) => openAgentsViewer(ctx),
 	});

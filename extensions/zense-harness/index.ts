@@ -23,9 +23,9 @@
  *   P5 Review/Deploy: zense_review builds a review-packet card (exception-based)
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join, resolve, relative } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, type SelectItem } from "@earendil-works/pi-tui";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -56,6 +56,8 @@ interface State {
 	lastCompileLessons?: number;    // จำนวนบทเรียนจาก memory ที่ feed เข้า compile_spec ล่าสุด
 	specMdPath?: string;            // path ของ archive spec .md ของเวอร์ชันปัจจุบัน (zense_eval append ผลลัพธ์ที่นี่)
 	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
+	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
+	worktreeLeaveNotified?: boolean; // dedupe notify “unmerged worktree” 1 ครั้ง/การสร้าง
 }
 interface SubagentRun {
 	role: string;
@@ -66,8 +68,88 @@ interface SubagentRun {
 	logPath?: string;            // .pi/zense/subagents/<stamp>-<role>.log — เขียน live ระหว่างรัน
 	status?: "running" | "done" | "failed";
 }
+/** Active per-session worktree: redirect ทุก tool call ของ main agent เข้าไปทำงานในนี้
+ *  (ผ่านการ mutate event.input) จนกว่า eval PASS จะ merge กลับเข้า main; กัน 2 session เขียนทับกัน */
+interface Worktree {
+	root: string;               // absolute path ของ worktree (sibling dir นอก repo)
+	branch: string;             // zense/impl/v<N>-<stamp>
+	dir: string;                // === root (เก็บซ้ำเพื่อ semantic clarity ตอน worktree remove)
+}
 
 const zenseDir = (cwd: string) => join(cwd, ".pi", "zense");
+
+/** shell-quote แบบ single-quote สำหรับ path ที่อาจมี space/special char */
+const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * Remap path ที่ agent ขอ (relative ต่อ session cwd = main repo) ไปเป็น path ใต้ worktree root
+ * โดย relative structure เดิม. path นอก repo (เช่น pi docs ใน node_modules) และ path ใต้
+ * .pi/zense/ (harness state ที่ต้องอยู่ใน main) คืนค่าเดิม — ไม่ redirect.
+ * Pure function → unit-test ได้ (export เผื่อ test ใช้โดยตรง).
+ */
+export const rewritePathForWorktree = (cwd: string, wtRoot: string, path: string): string => {
+	if (!path) return path;
+	const abs = resolve(cwd, path);
+	const rel = relative(cwd, abs).split(sep).join("/");
+	if (!rel || rel.startsWith("..")) return path;           // นอก repo → ไม่ redirect
+	if (rel === ".pi/zense" || rel.startsWith(".pi/zense/")) return path; // harness state อยู่ main
+	return join(wtRoot, rel);
+};
+
+/** นำหน้า bash command ด้วย `cd <wtRoot> &&` เพื่อให้รันใน worktree (path มี space ก็ quote) */
+export const buildWorktreeCommand = (cmd: string, wtRoot: string): string =>
+	`cd ${shellQuote(wtRoot)} && ${cmd}`;
+
+// ----- git worktree helpers (module scope — export เพื่อ integration-test ใน temp git repo ได้)
+
+/** git runner ที่ไม่ throw — คืน {ok,out,err} ให้ caller ตัดสินใจ (สำหรับ best-effort worktree ops) */
+export const gitOk = (args: string[], cwd: string): { ok: boolean; out: string; err: string } => {
+	try {
+		const out = execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		return { ok: true, out: out.toString(), err: "" };
+	} catch (e: any) {
+		const err = (e?.stderr?.toString?.() ?? e?.message ?? String(e)).split("\n")[0];
+		return { ok: false, out: "", err };
+	}
+};
+
+/** สร้าง git worktree ของ session นี้ที่ spec approval (phase → implementation). best-effort:
+ *  ล้มเหลว (ไม่ใช่ git repo / ชื่อซ้ำ) → คืน null (caller degrade กลับทำงานใน main ตามปกติ ไม่พัง). */
+export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+	const branch = `zense/impl/v${spec.version}-${stamp}`;
+	const wtRoot = join(dirname(cwd), `${basename(cwd)}-wt-${stamp}`);
+	if (gitOk(["worktree", "add", wtRoot, "-b", branch], cwd).ok !== true) return null;
+	// copy current spec + memory เข้า worktree ให้ bash-based read ในนั่นเห็น state ปัจจุบัน (ไม่ใช่ตอน checkout)
+	const wtZense = join(wtRoot, ".pi", "zense");
+	mkdirSync(wtZense, { recursive: true });
+	for (const f of ["spec.json", "spec.md", "memory.jsonl"]) {
+		const src = join(zenseDir(cwd), f);
+		if (existsSync(src)) copyFileSync(src, join(wtZense, f));
+	}
+	return { root: wtRoot, branch, dir: wtRoot };
+};
+
+/** merge worktree branch กลับเข้า main (auto-commit ใน worktree ก่อน, แล้ว git merge --no-ff).
+ *  conflict (เช่นอีก session merge ชน) → ไม่ force, คืน {ok:false,conflict:true} ให้ caller escalate.
+ *  success → cleanup worktree + branch ด้วย */
+export const mergeWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): { ok: boolean; conflict?: boolean; msg: string } => {
+	// 1. stage changes ใน worktree (ยกเว้น .pi/zense) แล้ว commit ถ้ามี — รวม untracked files ด้วย
+	//    (git diff --quiet HEAD ไม่เห็น untracked → ต้อง add ก่อนแล้วเช็ค --cached)
+	gitOk(["add", "-A", "--", ".", ":!.pi/zense"], wt.root);
+	if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
+		gitOk(["commit", "-m", `zense: impl v${spec.version} (eval PASS)`, "--no-verify"], wt.root);
+	}
+	// 2. merge เข้า main (main อาจมี uncommitted .pi/zense/ — disjoint กับ source changes → git อนุญาต)
+	if (!gitOk(["merge", "--no-ff", wt.branch, "-m", `zense: merge impl v${spec.version} (eval PASS)`], cwd).ok) {
+		gitOk(["merge", "--abort"], cwd);
+		return { ok: false, conflict: true, msg: `merge conflict — แก้ด้วยมือ: cd ${wt.root} แล้ว resolve/commit ใน branch ${wt.branch}; จากนั้น git merge ${wt.branch}` };
+	}
+	// 3. cleanup worktree + branch
+	gitOk(["worktree", "remove", wt.dir, "--force"], cwd);
+	gitOk(["branch", "-D", wt.branch], cwd);
+	return { ok: true, msg: `merged ${wt.branch} → main` };
+};
 
 const freshState = (): State => ({
 	phase: "requirements",
@@ -418,6 +500,10 @@ export default function (pi: ExtensionAPI) {
 			.join("\n---\n")
 			.slice(0, 12_000);
 
+	// ----- git worktree helpers (per-session isolation: redirect ทุก tool call ของ main
+	//       agent เข้า worktree จนกว่า eval PASS จะ merge กลับ — กัน 2 session เขียนทับกัน)
+	// (git helpers gitOk/createWorktree/mergeWorktreeBack อยู่ที่ module scope เพื่อ export ให้ test ได้)
+
 	pi.on("session_start", async (_ev, ctx) => {
 		for (const e of ctx.sessionManager.getEntries())
 			if (e.type === "custom" && e.customType === "zense-state")
@@ -438,9 +524,24 @@ export default function (pi: ExtensionAPI) {
 			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
 				` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
 				(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+r ดูสด)` : "") +
+				(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
 				(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 				(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : ""),
 		]);
+	};
+
+	/** redirect tool call ของ main agent เข้า worktree (mutate event.input) — ทำให้ agent
+	 *  ทำงานใน worktree โดยไม่รู้ตัว. sub-agent เป็นคนละ process จึงไม่ถูกตัวนี้ (และใช้ cwd ของมันเอง). */
+	const applyRedirect = (ev: any, ctx: ExtensionContext) => {
+		const wt = state.worktree;
+		if (!wt) return;
+		if (ev.toolName === "write" || ev.toolName === "edit" || ev.toolName === "read") {
+			const p = (ev.input as { path?: string })?.path;
+			if (typeof p === "string") ev.input.path = rewritePathForWorktree(ctx.cwd, wt.root, p);
+		} else if (ev.toolName === "bash") {
+			const c = (ev.input as { command?: string })?.command;
+			if (typeof c === "string") ev.input.command = buildWorktreeCommand(c, wt.root);
+		}
 	};
 
 	/** launch wrapper: ลงทะเบียน run (widget แสดงสด) + เขียน log live ทุก chunk
@@ -460,7 +561,9 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 		const tick = setInterval(() => updateWidget(ctx), 2_000); // elapsed วิ่งใน widget
 		try {
-			const r = await runSubagent(role, task, ctx.cwd, 240_000, onChunk, logPath, modelPattern);
+			// ใช้ worktree root เป็น cwd ถ้ามี worktree active → grader/reviewer รัน/เทสใน worktree (โค้ดที่แก้จริง)
+			const subCwd = state.worktree?.root ?? ctx.cwd;
+			const r = await runSubagent(role, task, subCwd, 240_000, onChunk, logPath, modelPattern);
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
@@ -477,9 +580,11 @@ export default function (pi: ExtensionAPI) {
 	// ----- Phase 1 gate: no implementation on unapproved spec (hard enforcement)
 
 	pi.on("tool_call", async (ev, ctx) => {
-		if (!state.gateEnabled) return;
+		// gate ปิด → ข้าม gate/scope/ADR แต่ยัง redirect เข้า worktree (ถ้า active)
+		if (!state.gateEnabled) { applyRedirect(ev, ctx); return; }
 		const isWrite = ev.toolName === "write" || ev.toolName === "edit";
-		if (!isWrite) return;
+		// read/bash: ไม่ผ่าน gate/scope (write-only) — แค่ redirect ถ้ามี worktree แล้วจบ
+		if (!isWrite) { applyRedirect(ev, ctx); return; }
 
 		if (state.phase === "requirements" || !state.spec?.approved) {
 			if (!ctx.hasUI) {
@@ -528,9 +633,12 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+
 		// Design-constraint checker: complete ADR "DENY:" constraints block matching write targets.
 		const adrViolation = firstAdrDenyViolation(target, adrText(ctx.cwd));
 		if (adrViolation) return { block: true, reason: adrViolation };
+		// redirect write นี้เข้า worktree ที่ท้ายสุด (หลัง scope/ADR ที่ใช้ path เดิมของ main)
+		applyRedirect(ev, ctx);
 	});
 
 	// ----- Phase 3: turn/token usage meter
@@ -560,6 +668,12 @@ export default function (pi: ExtensionAPI) {
 		if (calls.length >= 5 && failed / calls.length > 0.5)
 			flag(`retry storm: ${failed}/${calls.length} tool calls failed`, ctx);
 
+		// worktree ยัง active ตอน agent run จบ (eval ยังไม่ PASS) → แจ้ง 1 ครั้ง/การสร้าง (dedupe) ให้มนุษย์รู้ว่ามี worktree ค้างอยู่
+		if (state.worktree && !state.worktreeLeaveNotified) {
+			state.worktreeLeaveNotified = true;
+			ctx.ui.notify(`🌳 worktree ค้างอยู่ (ยังไม่ merge): ${state.worktree.dir}\nbranch ${state.worktree.branch} — จะ merge อัตโนมัติเมื่อ eval PASS (หรือ merge ด้วยมือ: git merge ${state.worktree.branch})`, "info");
+			persist();
+		}
 		persist();
 	});
 
@@ -812,6 +926,16 @@ export default function (pi: ExtensionAPI) {
 		state.spec.approved = true;
 		state.spec.approvedAt = Date.now();
 		state.phase = "implementation";
+		// auto worktree-per-session: สร้าง worktree ของ session นี้ตอนเริ่ม implementation
+		// (ก่อนหน้านี้ไม่มี source write เพราะ gate กั้น) → redirect ทุก tool call เข้า worktree จนกว่า eval PASS
+		const wt = createWorktree(ctx.cwd, state.spec);
+		if (wt) {
+			state.worktree = wt;
+			state.worktreeLeaveNotified = false;
+			learn(ctx, `worktree created: ${wt.branch} @ ${wt.root}`);
+		} else {
+			ctx.ui.notify(`🌳 worktree สร้างไม่ได้ — ทำงานใน main ตามปกติ (ไม่มี isolation ระหว่าง session)`, "warning");
+		}
 		learn(ctx, `signed spec v${state.spec.version}`);
 		persist();
 		updateWidget(ctx);
@@ -1028,6 +1152,18 @@ export default function (pi: ExtensionAPI) {
 				`${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}` +
 				`\n\n✅ Eval PASS — ขั้นต่อไป (บังคับ): เรียก \`zense_review\` ทันทีเพื่อให้ reviewer sub-agent สร้าง review packet` +
 				` — ห้ามสรุป/ตอบ user จบงานก่อนจนกว่าจะเรียก zense_review แล้ว`;
+			// auto merge-back: เมื่อ eval PASS งาน verified สมบูรณ์ → merge worktree กลับเข้า main (auto-commit + git merge --no-ff)
+			if (state.worktree) {
+				const mr = mergeWorktreeBack(ctx.cwd, state.spec, state.worktree);
+				if (!mr.ok) {
+					escalate("need-decision", `worktree merge: ${mr.msg}`, ctx);
+					ctx.ui.notify(`⚠ ${mr.msg}`, "warning"); // เก็บ worktree ไว้ — reviewer ยังอ่าน worktree ได้
+				} else {
+					learn(ctx, `worktree merged: ${mr.msg}`);
+					state.worktree = null;
+					ctx.ui.notify(`🌳 worktree merged → main`, "info");
+				}
+			}
 			state.phase = "review";
 			persist(); updateWidget(ctx);
 			return { content: [{ type: "text", text: report }], details: { ok: grade.ok, verdict, failedCriteria, trajectory: state.trajectoryFlags } };
@@ -1102,6 +1238,7 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "status") {
 				ctx.ui.notify(
 					`phase=${state.phase} spec=${state.spec ? `v${state.spec.version} approved=${state.spec.approved}` : "—"}\n` +
+						(state.worktree ? `worktree: ${state.worktree.dir}\n  branch ${state.worktree.branch} (active — merge อัตโนมัติเมื่อ eval PASS)\n` : `worktree: (none — ทำงานใน main)\n`) +
 						`turns=${state.turnsUsed} tokens=${state.tokensUsed}\n` +
 						`trajectory flags:\n${state.trajectoryFlags.join("\n") || "(none)"}\nescalations:\n${state.escalations.map((e) => `${e.kind}: ${e.detail}`).join("\n") || "(none)"}`,
 					"info",

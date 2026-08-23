@@ -46,7 +46,9 @@ Agent เขียน ADR ลง `.pi/zense/adr/` เองรายการท
 
 ## 3. Implementation — แทบไม่ต้องทำอะไร
 
-เฝ้า widget: `ZENSE ▸ IMPLEMENTATION · spec: ✅v1 · turns 12 · tok 1.2M` (token ≥ 1 ล้านแสดงเป็น M)
+เฝ้า widget: `ZENSE ▸ IMPLEMENTATION · spec: ✅v1 · 🌳 pi-zense-wt-… · turns 12 · tok 1.2M` (token ≥ 1 ล้านแสดงเป็น M)
+
+**🌳 ทันทีที่คุณเซ็น spec** harness สร้าง `git worktree` ของ session นี้ให้เอง (branch `zense/impl/v1-…` อยู่ใน sibling dir ถัดจาก repo) แล้ว redirect ทุก `write`/`edit`/`read`/`bash` ของ agent เข้าไปทำงานในนั้นโดย agent ไม่รู้ตัว — ดังนั้น**เปิด pi 2 session ใน repo เดียวกันได้โดยไม่เขียนทับกัน** แต่ละ session มี worktree ของตัวเอง grader/reviewer ก็รันใน worktree ด้วยเลยเทสโค้ดที่แก้จริง ไม่ต้องจัดการอะไรเอง
 
 ตอน agent spawn sub-agent (grader/reviewer) widget จะขึ้น `🧪 grader ▶ 12s` — อยากดูสดว่ามันทำอะไรอยู่
 (ไม่ค้าง?) กด **ctrl+r** หรือพิมพ์ `/zense agents` แล้วเลือก run → live tail อัปเดตเองทุก 1 วิ
@@ -58,6 +60,8 @@ Agent เขียน ADR ลง `.pi/zense/adr/` เองรายการท
 ## 4. Eval — สั่ง agent `run eval`
 
 grader sub-agent เช็คผลงานเทียบทุก criterion — output ของมัน stream เข้า transcript สดๆ ระหว่างรัน
+
+**🌳 พอ eval PASS** harness auto-commit งานใน worktree แล้ว `git merge --no-ff` กลับเข้า `main` ให้เอง แล้ว cleanup worktree — ไม่ต้อง merge เอง ถ้าอีก session ไป merge ของตัวเองชนก่อนจะเกิด conflict → harness **escalate** (`need-decision`) แล้วเก็บ worktree ไว้ให้คุณ resolve ด้วยมือ (ไม่ clobber เงียบ) ถ้า eval **FAIL** เก็บ worktree ไว้แก้ต่อ ถ้าคุณปิด session ก่อน eval PASS เก็บ worktree ไว้ให้ merge ด้วยมือ (`git merge zense/impl/…`) — harness ไม่ auto-merge งานที่ยังไม่ verified
 (ดูย้อนหลังได้ที่ /zense agents)
 
 **📍 หน้าที่คุณ:** โฟกัส 2 ส่วนของรายงาน — `Spec debt (needs human)` (ต้อง review ด้วยตา)

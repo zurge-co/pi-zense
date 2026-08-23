@@ -40,7 +40,7 @@ finished artifact — exactly the harness design plan.md recommends.
 |---|---|
 | `/zense status` | phase, spec version/approval, flags, escalations |
 | `/zense approve` | sign current spec later (usually unnecessary — dialog covers it) |
-| `ctrl+r` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.pi/zense/subagents/*.log` (written live while they run) |
+| `alt+z` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.pi/zense/subagents/*.log` (written live while they run) |
 | `/zense gate off` | disable the spec gate (escape hatch) |
 | `/zense memory` | grouped lesson summary (top recurring flags, escalations by kind, eval history, sub-agent failures); `/zense memory json` for the raw JSONL tail |
 

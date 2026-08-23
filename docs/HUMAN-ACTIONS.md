@@ -51,7 +51,7 @@ Agent เขียน ADR ลง `.pi/zense/adr/` เองรายการท
 **🌳 ทันทีที่คุณเซ็น spec** harness สร้าง `git worktree` ของ session นี้ให้เอง (branch `zense/impl/v1-…` อยู่ใน sibling dir ถัดจาก repo) แล้ว redirect ทุก `write`/`edit`/`read`/`bash` ของ agent เข้าไปทำงานในนั้นโดย agent ไม่รู้ตัว — ดังนั้น**เปิด pi 2 session ใน repo เดียวกันได้โดยไม่เขียนทับกัน** แต่ละ session มี worktree ของตัวเอง grader/reviewer ก็รันใน worktree ด้วยเลยเทสโค้ดที่แก้จริง ไม่ต้องจัดการอะไรเอง
 
 ตอน agent spawn sub-agent (grader/reviewer) widget จะขึ้น `🧪 grader ▶ 12s` — อยากดูสดว่ามันทำอะไรอยู่
-(ไม่ค้าง?) กด **ctrl+r** หรือพิมพ์ `/zense agents` แล้วเลือก run → live tail อัปเดตเองทุก 1 วิ
+(ไม่ค้าง?) กด **alt+z** หรือพิมพ์ `/zense agents` แล้วเลือก run → live tail อัปเดตเองทุก 1 วิ
 (grep ไฟล์ .pi/zense/subagents/*.log เองก็ได้ — เขียน live ระหว่างรัน) กด Esc ปิด viewer งานยังรันต่อ
 
 **📍 คุณจะถูกเรียกกลับมาเมื่อ:**
@@ -87,7 +87,7 @@ grader sub-agent เช็คผลงานเทียบทุก criterion �
 | 🔏 dialog เซ็น spec | ตอน spec compile เสร็จ / gate เด้ง | ลายเซ็นในจังหวะเดียว ไม่ต้องพิมพ์คำสั่ง |
 | `/zense approve` | เซ็นย้อนหลัง (ถ้ากด ยังไม่เซ็น ไว้ก่อน) | 🔏 ลงนาม spec เดิม |
 | `/zense status` | ทุกเวลา | phase / flags / escalations |
-| `ctrl+r` หรือ `/zense agents` | ระหว่าง sub-agent รัน / ย้อนหลัง | ดู live tail ของ grader/reviewer กันสับสนว่าค้างไหม |
+| `alt+z` หรือ `/zense agents` | ระหว่าง sub-agent รัน / ย้อนหลัง | ดู live tail ของ grader/reviewer กันสับสนว่าค้างไหม |
 | `/zense gate on\|off` | ฉุกเฉิน | ปิด/เปิด spec gate |
 | `/zense memory` | ทุกเวลา / จบงาน | ดูบทเรียนสรุปเป็นกลุ่ม (`json` = raw) |
 

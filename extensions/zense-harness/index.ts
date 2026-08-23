@@ -225,7 +225,7 @@ const subagentLogPath = (cwd: string, role: string): string => {
  * (bug เดิม: execFile ค้างเงียบๆ จนโดน SIGTERM). ใช้ --mode json ไม่ใช่ print เพราะ print mode
  * buffer stdout ทั้งก้อนแล้วปล่อยทีเดียวตอนจบ (ทดลองแล้ว: chunk เดียวก่อน close — log ดูเหมือนค้าง
  * จนงานเสร็จ) ส่วน json mode เป็น JSONL event stream ที่ไหลตั้งแต่ต้น → parse event เป็น text
- * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ ctrl+r).
+ * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ alt+z).
  */
 function runSubagent(
 	role: string,
@@ -523,7 +523,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget("zense", [
 			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
 				` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
-				(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+r ดูสด)` : "") +
+				(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (alt+z ดูสด)` : "") +
 				(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
 				(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 				(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : ""),
@@ -1221,10 +1221,10 @@ export default function (pi: ExtensionAPI) {
 
 	// ----- human gates: commands
 
-	// ctrl+r — plain ctrl+letter ที่ว่างใน pi main loop ตัวเดียวที่ไม่ชน terminal/เครื่อง:
-	// ctrl+shift+letter terminal ส่วนใหญ่ส่งมาเป็น ctrl+letter เฉยๆ (แยก shift ไม่ได้), ctrl+s/ctrl+q เสี่ยง XON/XOFF,
-	// ตัวอักษรอื่น pi จองไว้กับ editor/app หมด — ctrl+r ของ pi เองใช้เฉพาะในหน้า /resume (rename) เท่านั้น
-	pi.registerShortcut("ctrl+r", {
+	// alt+z — pi รุ่นใหม่เอา ctrl+r ไปใช้กับ app.session.rename แล้ว (shortcut conflict ตอนโหลด) และ
+	// ctrl+letter อื่นก็โดนจองหมด (b/f/a/e/d/w/u/k/j/y/c/z/g/v/p/l/t/o/x/s/n) — ctrl+s/ctrl+q เสี่ยง XON/XOFF อีก
+	// เลยหนีมาใช้ alt+letter: alt+b/f/d/y ถูกใช้ใน editor แต่ alt+z ว่าง (fallback: /zense agents)
+	pi.registerShortcut("alt+z", {
 		description: "Zense: ดู sub-agent runs สดๆ (live tail)",
 		handler: (ctx) => openAgentsViewer(ctx),
 	});

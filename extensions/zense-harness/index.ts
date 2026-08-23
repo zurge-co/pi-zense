@@ -24,7 +24,7 @@
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
  */
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, type SelectItem } from "@earendil-works/pi-tui";
@@ -71,7 +71,7 @@ interface SubagentRun {
 /** Active per-session worktree: redirect ทุก tool call ของ main agent เข้าไปทำงานในนี้
  *  (ผ่านการ mutate event.input) จนกว่า eval PASS จะ merge กลับเข้า main; กัน 2 session เขียนทับกัน */
 interface Worktree {
-	root: string;               // absolute path ของ worktree (sibling dir นอก repo)
+	root: string;               // absolute path ของ worktree (nested ใต้ <repo>/.pi/zense/worktree/)
 	branch: string;             // zense/impl/v<N>-<stamp>
 	dir: string;                // === root (เก็บซ้ำเพื่อ semantic clarity ตอน worktree remove)
 }
@@ -113,13 +113,18 @@ export const gitOk = (args: string[], cwd: string): { ok: boolean; out: string; 
 	}
 };
 
-/** สร้าง git worktree ของ session นี้ที่ spec approval (phase → implementation). best-effort:
+/** สร้าง git worktree ของ session นี้ที่ spec approval (phase → implementation).
+ *  worktree อยู่ใต้ <repo>/.pi/zense/worktree/ (nested ใน main working tree — git รองรับ)
+ *  เพื่อให้ state ของ zense รวมอยู่ใน workspace ที่เดียว ไม่รก parent dir. best-effort:
  *  ล้มเหลว (ไม่ใช่ git repo / ชื่อซ้ำ) → คืน null (caller degrade กลับทำงานใน main ตามปกติ ไม่พัง). */
 export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 	const branch = `zense/impl/v${spec.version}-${stamp}`;
-	const wtRoot = join(dirname(cwd), `${basename(cwd)}-wt-${stamp}`);
+	const wtParent = join(zenseDir(cwd), "worktree");
+	const wtRoot = join(wtParent, `${basename(cwd)}-wt-${stamp}`);
+	mkdirSync(wtParent, { recursive: true });
 	if (gitOk(["worktree", "add", wtRoot, "-b", branch], cwd).ok !== true) return null;
+	excludeFromGitStatus(cwd, wtParent);
 	// copy current spec + memory เข้า worktree ให้ bash-based read ในนั่นเห็น state ปัจจุบัน (ไม่ใช่ตอน checkout)
 	const wtZense = join(wtRoot, ".pi", "zense");
 	mkdirSync(wtZense, { recursive: true });
@@ -128,6 +133,27 @@ export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 		if (existsSync(src)) copyFileSync(src, join(wtZense, f));
 	}
 	return { root: wtRoot, branch, dir: wtRoot };
+};
+
+/** cursor ใต้ repo ที่ zense สร้าง (เช่น .pi/zense/worktree/) ไม่ควรโผล่ใน git status ของ main —
+ *  best-effort append ลง .git/info/exclude (local-only ไม่แตะไฟล์ tracked ของผู้ใช้). ล้มเหลว → ข้ามเงียบๆ */
+const excludeFromGitStatus = (cwd: string, absPath: string): void => {
+	try {
+		const top = gitOk(["rev-parse", "--show-toplevel"], cwd);
+		if (!top.ok) return;
+		const repoRoot = realpathSync(top.out.trim());
+		const rel = relative(repoRoot, realpathSync(absPath)).split(sep).join("/");
+		if (!rel || rel.startsWith("..")) return;
+		const gitCommon = gitOk(["rev-parse", "--git-common-dir"], cwd);
+		if (!gitCommon.ok) return;
+		const excludeFile = join(resolve(cwd, gitCommon.out.trim()), "info", "exclude");
+		const line = `/${rel}/`;
+		const cur = existsSync(excludeFile) ? readFileSync(excludeFile, "utf8") : "";
+		if (cur.split("\n").some((l) => l.trim() === line)) return;
+		appendFileSync(excludeFile, `${cur && !cur.endsWith("\n") ? "\n" : ""}${line}\n`);
+	} catch {
+		/* best-effort */
+	}
 };
 
 /** merge worktree branch กลับเข้า main (auto-commit ใน worktree ก่อน, แล้ว git merge --no-ff).

@@ -1,0 +1,25 @@
+{"at":1787134356794,"phase":"implementation","note":"signed spec v1"}
+{"at":1787204887062,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787205065555,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787205180127,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787205208577,"phase":"requirements","note":"escalation: need-permission: write blocked: spec unsigned"}
+{"at":1787205283131,"phase":"implementation","note":"signed spec v1"}
+{"at":1787205547816,"phase":"implementation","note":"eval: spec v1 → grader.ok=true verdict=PASS"}
+{"at":1787206885937,"phase":"implementation","note":"signed spec v4"}
+{"at":1787207089379,"phase":"implementation","note":"eval: spec v4 → grader.ok=true verdict=PASS"}
+{"at":1787247476977,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787294897987,"phase":"implementation","note":"signed spec v1"}
+{"at":1787295259860,"phase":"implementation","note":"eval: spec v1 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787299034169,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787299218335,"phase":"requirements","note":"escalation: need-permission: write blocked: spec unsigned"}
+{"at":1787299281502,"phase":"implementation","note":"signed spec v1"}
+{"at":1787299431777,"phase":"implementation","note":"eval: spec v1 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787299689906,"phase":"implementation","note":"signed spec v2"}
+{"at":1787299767121,"phase":"implementation","note":"eval: spec v2 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787299795253,"phase":"review","note":"review packet: flags=1, escalations=1"}
+{"at":1787468773526,"phase":"implementation","note":"signed spec v1"}
+{"at":1787468925083,"phase":"implementation","note":"eval: spec v1 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787468975709,"phase":"review","note":"review packet: flags=0, escalations=0"}
+{"at":1787474092789,"phase":"implementation","note":"signed spec v3"}
+{"at":1787474789292,"phase":"implementation","note":"eval: spec v3 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787474843724,"phase":"review","note":"review packet: flags=1, escalations=0"}

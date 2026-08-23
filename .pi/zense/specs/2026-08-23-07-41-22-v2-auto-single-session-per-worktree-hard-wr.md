@@ -1,0 +1,49 @@
+# Spec v2: Auto single-session-per-worktree: hard write-lock + auto-release + worktree scaffold
+approved: false
+
+## Intent
+ป้องกันไม่ให้มี 2 main agent session ทำงานพร้อมกันใน working tree เดียวกันโดยอัตโนมัติ ไม่ต้องให้มนุษย์ตัดสินใจ: session ที่สองที่เปิดใน worktree เดียวกันจะถูกล็อกเขียนอัตโนมัติ (hard gate, no dialog) จนกว่า session แรกจะจบ แล้วปลดล็อกเอง; ส่วน `/zense worktree <name>` scaffold เป็นทางเลือกสำหรับผู้ที่ต้องการ parallel จริงๆ (แต่ละ worktree มี lock ของตัวเองใน .pi/zense/ จึงไม่ชนกัน); widget บอก branch + สถานะล็อก
+
+## Scope
+- extensions/zense-harness/
+- test/
+- docs/HUMAN-ACTIONS.md
+- README.md
+
+## Constraints
+- ห้ามมี human dialog สำหรับ collision — ทุกอย่างอัตโนมัติ: detect → lock writes → poll → auto-release
+- session แรก (เจ้า lock) ไม่ถูกกระทบเลย ทำงานปกติ; session ที่สองเท่านั้นที่ถูกล็อก
+- tool_call interceptor: ถ้า state.colliding === true ให้ block write tools อัตโนมัติด้วย reason ตายตัว (ไม่เรียก select/confirm) — เหมือน spec gate แต่ auto
+- session ที่สอง poll lock ทุก ~2s ด้วย setInterval; เมื่อ pid ใน lock ตายแล้ว (process.kill(pid,0) throws) → reclaim lock (เขียนทับด้วย pid ตัวเอง), state.colliding=false, notify '🔓 ปลดล็อกแล้ว', เคลียร์ interval
+- lockfile stale-safe เสมอ: ถ้า session แรก crash (pid ตาย) session ที่สอง reclaim ได้เองโดยไม่ต้องรอมนุษย์
+- sub-agent (PI_ZENSE_SUBAGENT=1) ไม่เขียน/อ่าน lock และไม่ถูกล็อก — มัน ephemeral และอาจ share cwd กับ main
+- lock เป็น per-worktree (อยู่ใน .pi/zense/ ของแต่ละ worktree) → 2 session ใน worktree คนละอันไม่ชน ซึ่งก็คือวิธีที่ `/zense worktree` เปิดให้
+- agent_end: ลบ lock ของตัวเอง best-effort (ถ้ายังเป็น pid ตัวเอง); ถ้า fail ไม่ throw; เคลียร์ poll interval ด้วย
+- pid-alive check ใช้ process.kill(pid,0); เก็บ pid/startedAt/cwd/branch ใน lock เป็น evidence
+- ห้ามย้าย session ปัจจุบัน — `/zense worktree` แค่สร้าง worktree + symlink deps + copy memory แล้วบอก user ให้ cd + เปิด pi ใหม่ที่นั่น
+- ห้ามใช้ native git binding — ใช้ spawn('git',...) / execSync เท่านั้น; จัดการ error ถ้าไม่ใช่ git repo
+- worktree สร้างเป็น sibling dir (../<name>); branch = work/<name>; ห้ามซ้ำชื่อที่มีอยู่
+
+## Acceptance criteria
+- [ ] lock-write: session_start เขียน .pi/zense/session.lock (JSON: pid, startedAt, cwd, branch) เมื่อไม่ชน *(check: unit-test: trigger session_start (no existing lock) → readFileSync('.pi/zense/session.lock') เป็น JSON มี pid/startedAt/cwd/branch)*
+- [ ] stale-reclaim-first: session_start ถ้าเจอ lock เดิมที่ pid ตายแล้ว → reclaim เงียบๆ (เขียนทับด้วย pid ตัวเอง), state.colliding=false, ไม่ notify warning *(check: unit-test: pre-write lock pid=999999 → session_start → lock ถูกเขียนทับด้วย pid จริง, state.colliding===false, notify 'warning' ไม่ถูกเรียก)*
+- [ ] collision-hardlock: session_start ถ้าเจอ lock ที่ pid ยัง live และ != ตัวเอง → state.colliding=true, notify ครั้งเดียวว่าถูกล็อกเขียน, เริ่ม poll interval *(check: unit-test: mock lock ด้วย pid ของ child process ที่ยังรัน → session_start → state.colliding===true, notify ถูกเรียก (info/warning), setInterval ถูก register)*
+- [ ] write-blocked-while-colliding: tool_call interceptor: ขณะ state.colliding===true, write tools (edit/write/bash ที่เขียนไฟล์) ถูก block อัตโนมัติ ด้วย reason ตายตัว ไม่มี dialog *(check: unit-test: set state.colliding=true → trigger tool_call write → ผล return {block:true, reason:...} มีคำว่า 'session'/'lock'/'active'; ไม่มี ctx.ui.select/confirm ถูกเรียก)*
+- [ ] read-tools-not-blocked: ขณะ colliding, read-only tools (read/grep/ls ผ่าน bash แบบไม่เขียน) ไม่ถูก block — session ยังอ่านได้ *(check: unit-test: set state.colliding=true → trigger tool_call read (read tool) → ไม่ block (return undefined/allow))*
+- [ ] auto-release: poll interval ตรวจ lock ทุก ~2s; เมื่อ pid ใน lock ตาย → reclaim, state.colliding=false, notify 'unlock', เคลียร์ interval *(check: unit-test: mock collision (live child pid) → ฆ่า child → รอ poll → state.colliding===false, notify ถูกเรียกอีกครั้ง (info), setInterval ถูก clear)*
+- [ ] subagent-no-lock: PI_ZENSE_SUBAGENT=1 → ไม่เขียน/เขียนทับ lockfile และ state.colliding ไม่ถูก set *(check: unit-test: set env PI_ZENSE_SUBAGENT=1 → session_start → existsSync('.pi/zense/session.lock') ไม่ถูกสร้างหรือไม่ถูกแตะ, state.colliding===false)*
+- [ ] lock-cleanup: agent_end ลบ lock ของตัวเอง (ถ้า pid ใน lock ยังเป็นตัวเอง) + เคลียร์ poll interval; fail ไม่ throw *(check: unit-test: trigger agent_end → existsSync('.pi/zense/session.lock')===false (หรือถูกเขียนใหม่โดยอื่น))*
+- [ ] widget-branch-lock: widget ZENSE แสดง branch ปัจจุบัน (git branch --show-current) และ marker 🔒 เมื่อ state.colliding===true *(check: grep 'branch' ใน updateWidget index.ts; unit-test: stub git→'feature/x' + state.colliding=true → widget string มี 'feature/x' และ '🔒')*
+- [ ] worktree-create: /zense worktree <name>: git worktree add ../<name> -b work/<name> + symlink node_modules จาก cwd + copy memory.jsonl ถ้ามี + notify บอก path และ 'cd ../<name> && pi' *(check: integration temp git repo: สร้าง memory.jsonl ก่อน → handler 'worktree foo' → git worktree list มี foo && readlink('../foo/node_modules')==<cwd>/node_modules && existsSync('../foo/.pi/zense/memory.jsonl')===true && notify text มี 'cd' และ 'pi')*
+- [ ] worktree-no-memory-ok: /zense worktree เมื่อไม่มี memory.jsonl → ข้าม copy ไม่ error *(check: integration: ลบ memory.jsonl → 'worktree foo' → ไม่ throw, worktree สร้างสำเร็จ)*
+- [ ] worktree-dup-error: /zense worktree <name> เมื่อ <name> มีอยู่ → notify error ไม่สร้าง/ไม่ทำลาย *(check: integration: สร้าง ../foo ไว้ก่อน → 'worktree foo' → notify warning/error, git worktree list ไม่เพิ่ม)*
+- [ ] worktree-no-arg: /zense worktree ไม่มี arg → notify usage พร้อมตัวอย่าง *(check: unit-test: handler 'worktree' → notify text มี 'usage' หรือ '/zense worktree <name>')*
+- [ ] worktree-non-git: /zense worktree ใน non-git dir → notify error ไม่ crash *(check: integration: temp dir ไม่มี .git → 'worktree foo' → notify warning/error, handler resolve ปกติ)*
+- [ ] command-completion: /zense worktree ปรากฏใน getArgumentCompletions (พิมพ์ 'work' เสนอ 'worktree') *(check: grep 'worktree' ใน getArgumentCompletions array index.ts)*
+- [ ] readme-doc: README.md + docs/HUMAN-ACTIONS.md อธิบาย auto single-session lock + /zense worktree + merge-back *(check: grep -l 'worktree' README.md docs/HUMAN-ACTIONS.md ครบ)*
+
+## Spec debt (human-verified only)
+- auto-release รู้สึกเนียนจริงไหมเมื่อ session แรกจบ (ต้องเปิด 2 session จริงเพื่อยืนยัน timing ของ poll)
+- write-block reason ชัดพอให้ agent ตอบ user ได้ว่าทำไมเขียนไม่ได้ (manual review ใน session จริง)
+- widget 🔒 + branch อ่านง่ายไม่รบกวนบน main (manual TUI)
+- merge branch work/<name> กลับ main มี conflict จัดการได้ตาม workflow ปกติหรือไม่ — นอก scope ฟีเจอร์ ต้องเช็ค manual

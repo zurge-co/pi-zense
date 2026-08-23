@@ -1,0 +1,42 @@
+# Spec v1: Worktree-per-session: collision guard + widget branch label + /zense worktree scaffold
+approved: false
+
+## Intent
+เมื่อ human เปิด pi 2 sessions พร้อมกันใน working tree เดียวกัน ไฟล์ชนกัน (clobber เงียบ → state พังกลางงาน) ต้องการ worktree-per-session workflow ที่ (1) ดักจับการชนตั้งแต่เปิด session ผ่าน lockfile + warning, (2) widget บอก branch/worktree ปัจจุบัน ให้รู้ว่าอยู่ session ไหน, (3) คำสั่ง `/zense worktree <name>` scaffold สร้าง worktree + symlink deps + copy memory + แนะนำ cd/pi ถัดไป — ทั้งหมดเป็น advisory (ไม่ block) เพราะบางทีจงใจรัน 2 ตัว; conflict ย้ายไปจ่ายที่ merge-back ตามธรรมชาติของ git
+
+## Scope
+- extensions/zense-harness/
+- test/
+- docs/HUMAN-ACTIONS.md
+- README.md
+
+## Constraints
+- Advisory ทั้งหมด — ห้าม block session ที่ตรวจพบ collision (บางครั้งจงใจรัน 2 ตัว); แค่ warning + trajectory flag
+- Sub-agents (PI_ZENSE_SUBAGENT=1) ต้องไม่เขียน/อ่าน lockfile — มัน ephemeral และอาจ share cwd กับ main, จะแย่งกันเขียน lock
+- Lockfile ต้อง stale-safe: ถ้า pid ใน lock ตายแล้ว ให้ reclaim เงียบๆ ไม่ต้อง warning (pi อาจ crash ได้)
+- pid-alive check ใช้ process.kill(pid,0) — ระวัง pid reuse; เก็บ startedAt + cwd ใน lock เป็น evidence ประกอบ แต่ไม่ต้องเช็คกลางตัวทุก tick
+- lock เป็น per-worktree (อยู่ใน .pi/zense/ ซึ่งอยู่ในแต่ละ worktree) → ไม่ใช่ global; การชนที่ detect ได้คือ 2 session ใน worktree/branch เดียวกันเท่านั้น ซึ่งก็คือกรณีที่อันตรายจริง
+- อย่าย้าย session ปัจจุยัด/อยู่ — `/zense worktree` แค่สร้าง worktree แล้วบอก user ให้ cd + เปิด pi ใหม่ที่นั่น; extension ไม่สามารถ hot-swap cwd ของ session ตัวเองได้
+- ห้ามใช้ native git binding — ใช้ spawn('git',...) หรือ execSync เท่านั้น (เหมือนที่ runSubagent ใช้ spawn); จัดการ error ถ้าไม่ใช่ git repo
+- worktree สร้างเป็น sibling dir (../<name>) ค่าเริ่มต้น; ชื่อ branch = work/<name>; ห้ามซ้ำชื่อที่มีอยู่
+
+## Acceptance criteria
+- [ ] lock-write: session_start เขียน .pi/zense/session.lock ใน cwd ที่มี field pid, startedAt, cwd, branch *(check: node -e "import('./extensions/zense-harness/index.ts')…" หรือ unit-test: หลังจาก trigger session_start mock แล้ว readFileSync('.pi/zense/session.lock') เป็น JSON มี key pid/startedAt/cwd/branch)*
+- [ ] stale-reclaim: session_start ถ้าเจอ lock เดิมที่ pid ตายแล้ว (process.kill(pid,0) throws) → เขียนทับด้วย lock ของตัวเองเงียบๆ ไม่ warning *(check: unit-test: เตรียม lock มี pid=999999 (ไม่มีจริง) → trigger session_start → ไม่มี collision warning, lock ถูกเขียนทับด้วย pid ของ process จริง)*
+- [ ] collision-warn: session_start ถ้าเจอ lock ที่ pid ยัง live และ != pid ตัวเอง → notify warning + เพิ่ม trajectory flag 'worktree-collision' + widget แสดง ⚠ *(check: unit-test: mock lock ด้วย pid=process.pid ของ child process อีกตัวที่ยังรัน → trigger session_start → state.trajectoryFlags มี 'worktree-collision', notify ถูกเรียกด้วย 'warning')*
+- [ ] subagent-no-lock: เมื่อ PI_ZENSE_SUBAGENT=1 อยู่ (sub-agent) ต้องไม่เขียน/เขียนทับ lockfile *(check: unit-test: set env PI_ZENSE_SUBAGENT=1 → trigger session_start → .pi/zense/session.lock ไม่ถูกสร้างหรือไม่ถูกแตะ)*
+- [ ] lock-cleanup: agent_end ลบ lock ของตัวเอง best-effort (ถ้ายังเป็น pid ตัวเองอยู่); ถ้า fail ไม่ throw *(check: unit-test: trigger agent_end → existsSync('.pi/zense/session.lock') === false (หรือถูกเขียนใหม่โดย session อื่น))*
+- [ ] widget-branch: widget ZENSE แสดงชื่อ branch ปัจจุบัน (git branch --show-current) หรือ marker 'worktree' เมื่ออยู่ใน linked worktree (git rev-parse --git-dir ไม่ใช่ .git ตรงๆ) *(check: grep 'branch' ในบรรทัด setWidget ของ updateWidget ใน index.ts; unit-test: stub git → คืน 'feature/x' → widget string มี 'feature/x')*
+- [ ] worktree-create: /zense worktree <name> รัน git worktree add ../<name> -b work/<name> แล้ว symlink node_modules จาก cwd ปัจจุบันเข้า worktree ใหม่ แล้ว notify บอก path + คำสั่งถัดไป (cd + pi) *(check: integration ใน temp git repo: รัน handler 'worktree foo' → existsSync('../foo/.git') หรือ isDirectory('../foo') && เป็น worktree (git worktree list มี foo) && readlink('../foo/node_modules') === <cwd>/node_modules; notify text มี 'cd' และ 'pi')*
+- [ ] worktree-memory-copy: /zense worktree <name> ถ้า .pi/zense/memory.jsonl มีอยู่ → copy ไป worktree ใหม่ (เพื่อ sub-agent ใน worktree เริ่มต้นเท่ากับ main); ถ้าไม่มีข้ามไปไม่ error *(check: integration: สร้าง memory.jsonl ก่อน → รัน worktree foo → existsSync('../foo/.pi/zense/memory.jsonl') === true และเนื้อหาเหมือน; ลบ memory.jsonl แล้วรันอีกครั้ง → ไม่ throw)*
+- [ ] worktree-dup-error: /zense worktree <name> เมื่อ <name> มีอยู่แล้ว (dir หรือ worktree) → notify error และไม่สร้าง/ไม่ทำลายอะไร *(check: integration: สร้าง ../foo ไว้ก่อน → รัน 'worktree foo' → notify เป็น 'warning'/'error', git worktree list ไม่เพิ่ม, ไม่มี symlink ใหม่)*
+- [ ] worktree-no-arg: /zense worktree ไม่มี arg → notify usage พร้อมตัวอย่าง *(check: unit-test: handler 'worktree' (empty) → notify ถูกเรียก, text มี 'usage' หรือตัวอย่าง '/zense worktree <name>')*
+- [ ] worktree-non-git: /zense worktree ใน dir ที่ไม่ใช่ git repo → notify error สื่อว่าต้องเป็น git repo ไม่ throw/crash *(check: integration: ใน temp dir ไม่มี .git → รัน 'worktree foo' → notify warning/error, ไม่มี crash (handler resolve ปกติ))*
+- [ ] command-completion: /zense worktree ปรากฏใน getArgumentCompletions ของ /zense (พิมพ์ 'work' ต้องเสนอ 'worktree') *(check: grep 'worktree' ใน getArgumentCompletions array ของ registerCommand zense ใน index.ts)*
+- [ ] readme-doc: README.md และ docs/HUMAN-ACTIONS.md มีส่วนอธิบาย worktree-per-session workflow: collision warning, widget branch, /zense worktree วิธีใช้, merge-back กลับ main *(check: grep -l 'worktree' README.md docs/HUMAN-ACTIONS.md ครบทั้งสองไฟล์)*
+
+## Spec debt (human-verified only)
+- warning จาก collision guard โดดเด่นพอให้ user สังเห็จริงไหม — ต้องมีคนเปิด 2 session จริงเพื่อยืนยัน (manual review)
+- widget branch label อ่านง่าย/ไม่รบกวนเมื่ออยู่บน main — ต้องดูจริงใน TUI (manual)
+- /zense worktree scaffold สั่งง่ายพอและ error message ชัดพอในสภาพจริง (manual)
+- การ merge branch work/<name> กลับ main มี conflict จัดการได้ตาม workflow ปกติหรือไม่ — ไม่อยู่ใน scope ฟีเจอร์นี้ แต่ต้องเช็ค manual ว่า flow รวมเนียน

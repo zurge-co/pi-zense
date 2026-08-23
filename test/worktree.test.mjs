@@ -3,7 +3,7 @@ import test from "node:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
 	rewritePathForWorktree,
 	buildWorktreeCommand,
@@ -75,10 +75,28 @@ test("createWorktree: สร้าง worktree + branch zense/impl/* + copy spec
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt, "worktree should be created");
 	assert.ok(wt.branch.startsWith("zense/impl/v1-"), `branch=${wt.branch}`);
+	// worktree ต้องอยู่ nested ใต้ <repo>/.pi/zense/worktree/ (ไม่ใช่ sibling dir ข้าง repo)
+	assert.equal(
+		join(cwd, ".pi", "zense", "worktree"),
+		dirname(wt.root),
+		`worktree parent should be .pi/zense/worktree, got ${wt.root}`,
+	);
+	assert.ok(basename(wt.root).startsWith("repo-wt-"), `wt name keeps repo basename: ${wt.root}`);
 	assert.ok(existsSync(join(wt.root, "README.md")), "worktree has checked-out file");
 	assert.ok(existsSync(join(wt.root, ".pi", "zense", "spec.json")), "spec.json copied into worktree");
 	const list = git(["worktree", "list"]);
 	assert.ok(list.includes(wt.root), "worktree listed by git");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("createWorktree: main repo git status สะอาดหลังสร้าง (nested worktree ถูก exclude ใน .git/info/exclude)", () => {
+	const { cwd, base, git } = makeRepo();
+	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt);
+	assert.equal(git(["status", "--porcelain"]).trim(), "", "main git status should be clean");
+	// exclude ไปอยู่ใน local .git/info/exclude ไม่แตะไฟล์ tracked
+	const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
+	assert.ok(exclude.includes("/.pi/zense/worktree/"), `exclude has worktree path: ${exclude}`);
 	rmSync(base, { recursive: true, force: true });
 });
 

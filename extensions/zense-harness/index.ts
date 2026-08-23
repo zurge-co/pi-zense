@@ -85,6 +85,51 @@ const freshState = (): State => ({
 export const fmtTok = (n: number): string =>
 	n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`;
 
+// ----------------------------------------------------------------------------- ADR deny rules
+
+export interface AdrDenyRule {
+	constraint: string;
+	reason?: string;
+	raw: string;
+}
+
+const DENY_PREFIX = "DENY:";
+const DENY_REASON_SEPARATOR = "→";
+
+/**
+ * Parse one canonical ADR line without any ambiguous regex capture.
+ * Grammar: `DENY: <constraint>` optionally followed by `→ <reason>`.
+ * The old optional-arrow regex could match only the first character as the
+ * constraint and treat the rest as a reason, so this parser intentionally
+ * uses one explicit `indexOf("→")` split instead.
+ */
+export const parseAdrDenyLine = (line: string): AdrDenyRule | undefined => {
+	const trimmed = line.trim();
+	if (trimmed.slice(0, DENY_PREFIX.length).toUpperCase() !== DENY_PREFIX) return undefined;
+
+	const body = trimmed.slice(DENY_PREFIX.length).trim();
+	if (!body) return undefined; // Never let an empty constraint match every path.
+
+	const reasonAt = body.indexOf(DENY_REASON_SEPARATOR);
+	const constraint = (reasonAt === -1 ? body : body.slice(0, reasonAt)).trim();
+	if (!constraint) return undefined;
+	const reason = reasonAt === -1 ? undefined : body.slice(reasonAt + DENY_REASON_SEPARATOR.length).trim();
+	return { constraint, ...(reason ? { reason } : {}), raw: trimmed };
+};
+
+export const parseAdrDenyRules = (adr: string): AdrDenyRule[] =>
+	adr.split(/\r?\n/)
+		.map(parseAdrDenyLine)
+		.filter((rule): rule is AdrDenyRule => rule !== undefined);
+
+export const firstAdrDenyViolation = (target: string | undefined, adr: string): string | undefined => {
+	if (!target) return undefined;
+	for (const rule of parseAdrDenyRules(adr))
+		if (target.includes(rule.constraint))
+			return `ADR constraint: ${rule.constraint} denied (${rule.reason ?? "see ADR"})`;
+	return undefined;
+};
+
 const subagentLogPath = (cwd: string, role: string): string => {
 	const dir = join(zenseDir(cwd), "subagents");
 	mkdirSync(dir, { recursive: true });
@@ -483,13 +528,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		// Design-constraint checker: ADR "DENY:" rules block matching writes/commands.
-		const adr = adrText(ctx.cwd);
-		for (const line of adr.split("\n")) {
-			const m = line.match(/^DENY:\s*(.+?)\s*→?\s*(.*)$/i);
-			if (m && (target ?? "").includes(m[1]))
-				return { block: true, reason: `ADR constraint: ${m[1]} denied (${m[2] || "see ADR"})` };
-		}
+		// Design-constraint checker: complete ADR "DENY:" constraints block matching write targets.
+		const adrViolation = firstAdrDenyViolation(target, adrText(ctx.cwd));
+		if (adrViolation) return { block: true, reason: adrViolation };
 	});
 
 	// ----- Phase 3: turn/token usage meter

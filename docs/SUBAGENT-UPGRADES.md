@@ -4,6 +4,13 @@
 > เอกสารนี้คือ input สำหรับ compile spec รอบถัดไป — หยิบ "Wave" ที่ต้องการไปทำ spec ได้เลย
 > ตำแหน่งโค้ดอ้างอิง: `extensions/zense-harness/index.ts`
 
+## Status log
+
+- **v1 (merged)** — requirements pipeline A–H (parse/retry, commitSpec one-step, read-only requirements, explore-first prompt, clarify, quality gate, telemetry)
+- **v2 (นี้)** — Wave 2 ครบ: grader/reviewer read-only · `parseGraderOutput` (evidence-anchored, coverage, OVERALL) + retry×3 · inconclusive→escalate แทน silent-PASS · `runCheckProbes` ฝั่ง harness + probe primacy (probe fail = FAIL ทับ grader) · grader prompt ได้ diff + reward-hacking checklist · reviewer ได้ evidence pack (`state.lastEval` + git) + packet schema validate+retry · Wave 3 บางส่วน: context priming (`gatherRepoFacts`), few-shot exemplar (`loadSpecExemplar`), scope-missing ใน quality gate, reviewer prompt contract (exception-first + rollback เชิงกล) · บังคับใช้: grader prompt แจ้ง read-only + temp fixture ใน tmp
+- **Bug ที่เจอระหว่าง v2 (fixed)**: regex per-criteria เดิมมี backspace byte จาก `\b` ใน template literal → parse ไม่เคยเจอ verdict ราย criterion มาก่อน (ระบบเคยพึ่ง OVERALL บรรทัดเดียว — รูรั่วจริงที่ wave 2 ปิด)
+- **Defer ไว้ตาม spec v2 (พร้อมเหตุผล)**: dual-draft compile (ต้อง merge strategy) · dual-grader agreement (เพิ่มเวลา/โทเคน phase 4 ~2× รอ telemetry ว่าจำเป็น) · calibration loop false-PASS→prompt (ต้องมี incident สะสมก่อน) · prompts-as-files `.pi/zense/prompts/<role>.md` (ดีแต่รอ prompt นิ่งกว่านี้) · per-role thinking defaults (models.json ทำเองได้แล้ววันนี้) · generic launchUntilValid (rule of three — ตอนนี้ parser มี 2 ตัว ยังไม่ควรรวม)
+
 ## Context: สิ่งที่ทำไปแล้ว (requirements sub-agent)
 
 A) parse+validate JSON draft + retry 1 ครั้งพร้อม feedback (`parseSpecDraft`) ·

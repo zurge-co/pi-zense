@@ -55,6 +55,7 @@ interface State {
 	subagentRuns: SubagentRun[];
 	lastCompileLessons?: number;    // จำนวนบทเรียนจาก memory ที่ feed เข้า compile_spec ล่าสุด
 	specSource?: "set" | "compile"; // spec ปัจจุบันมาจาก agent เขียนเอง (set) หรือ sub-agent (compile) — ใช้ telemetry H
+	lastEval?: { verdict: string; perCriteria: Record<string, string>; failedIds: string[]; probes: ProbeResult[]; at: number }; // W2: evidence ล่าสุดจาก zense_eval → เป็น input ของ reviewer
 	specMdPath?: string;            // path ของ archive spec .md ของเวอร์ชันปัจจุบัน (zense_eval append ผลลัพธ์ที่นี่)
 	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
 	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
@@ -324,6 +325,14 @@ export const applyQualityGate = (cwd: string, draft: SpecDraft): { draft: SpecDr
 		extraDebt.push("quality-gate: scope ไม่ได้ระบุ — ทุก write จะผ่าน scope check หมด; ควรระบุ path prefix ที่ agent แก้ได้");
 		notes.push("empty-scope");
 	}
+	// W3: scope typo = gate ไร้ฟันเงียบๆ — prefix ที่ไม่มี path จริงจะไม่ match write ไหนเลย ทั้งที่คิดว่าคุมอยู่
+	for (const s of draft.scope) {
+		const prefix = s.replace(/\*+$/, "").replace(/\/+$/, "");
+		if (prefix && !existsSync(join(cwd, prefix))) {
+			extraDebt.push(`quality-gate: scope \"${s}\" ไม่ match path จริงใน repo — ตรวจการสะกด/โครงสร้างจริงก่อนเซ็น`);
+			notes.push(`scope-missing:${s.slice(0, 30)}`);
+		}
+	}
 	for (const c of draft.criteria)
 		if (!isMachineCheckable(c.check)) {
 			extraDebt.push(`quality-gate: ${c.id} มี check ที่ตรวจอัตโนมัติไม่ได้ ("${c.check.slice(0, 80)}") — ต้อง verify ด้วยมนุษย์`);
@@ -342,7 +351,13 @@ export const applyQualityGate = (cwd: string, draft: SpecDraft): { draft: SpecDr
 /** C: role ที่หน้าที่คือ "อ่าน/ร่าง" ไม่ใช่ "แก้โค้ด" — ล็อก read-only ผ่าน --exclude-tools
  *  (defense-in-depth: prompt สั่งห้ามแก้แค่ชั้นเดียวโดนละเมิดได้ แต่ tools ที่ไม่มีเรียกไม่ได้เลย)
  *  ยังเหลือ read+bash ไว้ เพราะ D ต้องการให้มันสำรวจ repo และลองรัน check command จริงก่อนดราฟต์ */
-export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = { requirements: ["write", "edit"] };
+// W2: grader/reviewer ก็ read-only — หน้าที่คือตัดสิน/รายงาน ไม่ใช่แก้โค้ด (subprocess ไม่ผ่าน gate
+// และไม่โดน agent_end heuristics ของ main agent → ปล่อย write ไว้ = grader แก้ test ให้ผ่านเองได้เงียบๆ)
+export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
+	requirements: ["write", "edit"],
+	grader: ["write", "edit"],
+	reviewer: ["write", "edit"],
+};
 
 /** argv ของ pi sub-agent ตัวเดียวที่ runSubagent ใช้ — แยกออกมาเพื่อ test ได้ว่า flag ถูกต้อง */
 export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[]): string[] => {
@@ -357,7 +372,7 @@ export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTo
 /** D: prompt ของ requirements sub-agent — บังคับ explore ก่อนดราฟต์ (grounding: criteria[].check
  *  ต้องเป็นคำสั่งที่มีอยู่และรันได้จริงใน repo นี้ ไม่ใช่เดา) + clarify contract (F) + output JSON เดียว
  *  (module scope + export: อยู่ข้าง parser ของมันเอง เวลาเปลี่ยน contract จะได้เห็นคู่กัน) */
-export const buildRequirementsPrompt = (intent: string, lessons: string[]): string =>
+export const buildRequirementsPrompt = (intent: string, lessons: string[], facts?: string[], exemplar?: string | null): string =>
 	`You are the REQUIREMENTS sub-agent for a spec-gated SDLC harness. Your single JSON output becomes the machine-checked contract for the main agent's implementation, so every criterion must be grounded in THIS repository's reality — never guess.
 
 ` +
@@ -373,10 +388,249 @@ Rules:
 
 ` +
 	`Step 3 — CLARIFY INSTEAD OF GUESSING: if the request is ambiguous enough that a wrong guess would be costly, do NOT draft yet. Output exactly {"questions": ["short question", "…max 5…"]}. A human will answer and you will be re-run with the answers.` +
+	// W3: exemplar (few-shot จาก spec ที่เคย signed) + facts (context priming ที่ harness เก็บเอง)
+	// แทรกก่อน lessons — หลักฐานจาก repo ตัวเองสำคัญกว่าบทเรียนกว้างๆ ทั้งคู่ optional เพื่อ backward compat
+	(exemplar ? `\n\nA previously SIGNED spec from this repo (style/format exemplar — do NOT copy its content):\n${exemplar}` : "") +
+	(facts?.length ? `\n\nRepository facts gathered by the harness (verified — trust these over your own assumptions):\n${facts.join("\n")}` : "") +
 	(lessons.length
 		? `\n\nPast lessons from this project's memory (reflect relevant ones in scope/constraints/criteria when they apply):\n${lessons.join("\n")}`
 		: "") +
 	`\n\nRequest: ${intent}`;
+
+// ----------------------------------------------------------------------------- eval/review evidence helpers (module scope — export เพื่อ unit-test ได้)
+
+/**
+ * W3: context priming — harness เก็บข้อเท็จจริงถูกๆ ของ repo ให้ requirements sub-agent เอง
+ * (D เดิมพึ่ง "สั่งให้ model explore" ล้วนๆ — model ขี้เกียจรอบเดียว criteria ก็ลอยทั้งชุด)
+ * ทุกส่วน best-effort: อ่านไม่ได้/ไม่มีไฟล์ → ข้ามเงียบๆ ไม่ให้ compile พังเพราะ repo หน้าตาแปลก
+ */
+export const gatherRepoFacts = (cwd: string): string[] => {
+	const facts: string[] = [];
+	try {
+		if (existsSync(join(cwd, "package.json"))) {
+			const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")) as { name?: string; scripts?: Record<string, string> };
+			if (pkg.name) facts.push(`package: ${pkg.name}`);
+			const scripts = pkg.scripts ? Object.entries(pkg.scripts).map(([k, v]) => `${k}="${v}"`).join(", ") : "";
+			if (scripts) facts.push(`scripts: ${scripts.slice(0, 600)}`);
+		}
+	} catch {
+		/* tolerate malformed package.json */
+	}
+	for (const f of ["AGENTS.md", "README.md", "README"]) {
+		try {
+			if (existsSync(join(cwd, f))) {
+				const head = readFileSync(join(cwd, f), "utf8").split("\n").slice(0, 12).join("\n").trim();
+				if (head) {
+					facts.push(`${f} (head): ${head.slice(0, 400)}`);
+					break;
+				}
+			}
+		} catch {
+			/* skip */
+		}
+	}
+	try {
+		const top = readdirSync(cwd, { withFileTypes: true })
+			.filter((e) => e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules")
+			.map((e) => e.name)
+			.slice(0, 12);
+		if (top.length) facts.push(`top-level dirs: ${top.join(", ")}`);
+	} catch {
+		/* skip */
+	}
+	const configs = ["tsconfig.json", "vitest.config.ts", "vitest.config.mts", "jest.config.js", "jest.config.ts", ".mocharc.json"].filter((f) => existsSync(join(cwd, f)));
+	if (configs.length) facts.push(`configs present: ${configs.join(", ")}`);
+	return facts.map((f) => `- ${f}`);
+};
+
+/**
+ * W3: few-shot จาก spec จริงของ repo — ดึงฉบับล่าสุดที่เคย signed (approved) จาก archive
+ * เป็นตัวอย่าง style/format ที่เคยผ่าน gate ของโปรเจกต์นี้ (ตัด criteria เหลือ 3 อัน ไม่ให้ prompt บวม)
+ * ชื่อไฟล์ archive ขึ้นต้นด้วย timestamp → sort desc แล้วไล่ไฟล์แรกที่ approved=true
+ */
+export const loadSpecExemplar = (cwd: string): string | null => {
+	const dir = join(zenseDir(cwd), "specs");
+	if (!existsSync(dir)) return null;
+	for (const f of readdirSync(dir).filter((f) => f.endsWith(".json")).sort().reverse().slice(0, 10)) {
+		try {
+			const s = JSON.parse(readFileSync(join(dir, f), "utf8")) as Spec;
+			if (!s.approved || !s.criteria?.length) continue;
+			return JSON.stringify({
+				title: s.title,
+				intent: s.intent.slice(0, 200),
+				scope: s.scope,
+				criteria: s.criteria.slice(0, 3),
+				specDebt: s.specDebt.slice(0, 2),
+			});
+		} catch {
+			/* ข้ามไฟล์เสียใน archive */
+		}
+	}
+	return null;
+};
+
+/** W2: สรุปสถานะ git ของ working dir ที่กำลัง eval/review (worktree หรือ main) — best-effort:
+ *  ไม่ใช่ repo/คำสั่งล้มเหลว → เว้นส่วนนั้นไป. grader ใช้ดู diff จับ reward hacking,
+ *  reviewer ใช้เป็น evidence pack. จำกัดความยาวทุกส่วนกัน prompt บวม */
+export const gitChangeSummary = (cwd: string): string => {
+	const parts: string[] = [];
+	const log = gitOk(["log", "--oneline", "-8"], cwd);
+	if (log.ok && log.out.trim()) parts.push(`recent commits:\n${log.out.trim()}`);
+	const status = gitOk(["status", "--porcelain"], cwd);
+	if (status.ok && status.out.trim()) parts.push(`changed/untracked files:\n${status.out.trim().split("\n").slice(0, 30).join("\n")}`);
+	const diff = gitOk(["diff", "HEAD", "--stat"], cwd);
+	if (diff.ok && diff.out.trim()) parts.push(`diffstat vs HEAD:\n${diff.out.trim().split("\n").slice(-25).join("\n")}`);
+	return parts.join("\n\n").slice(0, 4_000);
+};
+
+export interface ProbeResult {
+	id: string;
+	status: "pass" | "fail" | "skipped"; // skipped = check ไม่ runnable (manual → human review; ไม่บังคับผ่าน/ไม่ผ่าน)
+	exitCode?: number;
+	detail: string; // stdout/stderr tail หรือเหตุผลที่ skip
+}
+
+const PROBE_TIMEOUT_MS = 30_000; // กัน check ค้าง (server รอ port ฯลฯ) ลาก eval ไปด้วย
+
+/**
+ * W3 (probe-first grading): harness รัน criteria[].check ด้วยตัวเองก่อนส่ง grader —
+ * grader ไม่ต้องเดาว่าคำสั่งรันแล้วได้อะไร และ probe เป็นหลักฐานแข็งที่ทับ verdict ของ grader ได้
+ * (probe fail ⇒ criterion FAIL ไม่ว่า grader จะว่าอย่างไร — ดู zense_eval)
+ * รองรับ 2 รูปแบบ: "path exists: <p>" resolve ใน process เลย / อื่นๆ ที่ isMachineCheckable → sh -c
+ */
+export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = PROBE_TIMEOUT_MS): ProbeResult[] =>
+	criteria.map((c) => {
+		const m = c.check.match(/^(?:path|file)\s+exists:\s*(.+)$/i);
+		if (m) {
+			const p = m[1].trim();
+			const ok = existsSync(resolve(cwd, p));
+			return { id: c.id, status: ok ? ("pass" as const) : ("fail" as const), detail: ok ? `exists: ${p}` : `not found: ${p}` };
+		}
+		if (!isMachineCheckable(c.check)) return { id: c.id, status: "skipped" as const, detail: "not machine-runnable (→ human review)" };
+		try {
+			const out = execFileSync("sh", ["-c", c.check], { cwd, timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+			return {
+				id: c.id,
+				status: "pass" as const,
+				exitCode: 0,
+				detail: (out || "").trim().split("\n").slice(-3).join("\n").slice(-300) || "(exit 0, no output)",
+			};
+		} catch (e: unknown) {
+			const err = e as { status?: number; stdout?: string; stderr?: string };
+			const code = typeof err.status === "number" ? err.status : -1;
+			const tail = `${err.stdout ?? ""}\n${err.stderr ?? ""}`.trim().split("\n").slice(-3).join("\n").slice(-300);
+			return { id: c.id, status: "fail" as const, ...(code >= 0 ? { exitCode: code } : {}), detail: tail || `exit=${code}` };
+		}
+	});
+
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+export interface GradeParse {
+	perCriteria: Record<string, "PASS" | "FAIL">;
+	evidence: Record<string, string>;
+	failedIds: string[];
+	missingIds: string[];      // criterion ที่ grader ไม่ได้ออก verdict — coverage โปร่ง (เดิมถูกเมินเงียบๆ)
+	passNoEvidence: string[];  // PASS แต่ไม่มีหลักฐานต่อท้าย — ปิดช่อง "ตอบมั่วแบบมั่นใจ"
+	overall: "PASS" | "FAIL" | null;
+}
+
+/**
+ * W2: parse verdict ของ grader แบบเข้มกว่าเดิม — contract:
+ *   <id>: PASS: <evidence> / <id>: FAIL: <evidence> ... บรรทัดสุดท้าย OVERALL: PASS|FAIL
+ * เดิมมีรู 3 จุดที่ทำให้ "output พัง = ผ่านฟรี": id ที่ regex ไม่เจอถูกเมิน (coverage ไม่ครบ),
+ * OVERALL หาย → verdict unknown ไหลเป็น PASS, PASS ไม่ต้องมีหลักฐาน — pure เพื่อ unit-test ตรงๆ
+ */
+export const parseGraderOutput = (output: string, criteria: Criterion[]): GradeParse => {
+	const perCriteria: Record<string, "PASS" | "FAIL"> = {};
+	const evidence: Record<string, string> = {};
+	for (const c of criteria) {
+		// NB: ใช้ [ \t] ไม่ใช่ \s หลัง verdict — \s กินขึ้นบรรทัดใหม่ทำให้ evidence ลากไปเอาบรรทัดถัดไป
+		const m = output.match(new RegExp(`^\\s*${escapeRe(c.id)}[ \\t]*:[ \\t]*(PASS|FAIL)\\b[ \\t]*:?[ \\t]*([^\\r\\n]*)$`, "im"));
+		if (m) {
+			perCriteria[c.id] = m[1].toUpperCase() as "PASS" | "FAIL";
+			evidence[c.id] = (m[2] ?? "").trim();
+		}
+	}
+	const om = output.match(/^\s*OVERALL\s*:\s*(PASS|FAIL)\b/im);
+	return {
+		perCriteria,
+		evidence,
+		failedIds: criteria.filter((c) => perCriteria[c.id] === "FAIL").map((c) => c.id),
+		missingIds: criteria.filter((c) => !(c.id in perCriteria)).map((c) => c.id),
+		passNoEvidence: criteria.filter((c) => perCriteria[c.id] === "PASS" && !evidence[c.id]).map((c) => c.id),
+		overall: om ? (om[1].toUpperCase() as "PASS" | "FAIL") : null,
+	};
+};
+
+/** W2/W3: prompt ของ grader — evidence-anchored contract + probe results (harness รันเอง = ground truth)
+ *  + diff จริง + reward-hacking checklist + แจ้งชัดว่า read-only — pure builder เพื่อ test/reuse */
+export const buildGraderPrompt = (spec: Spec, probes: ProbeResult[], diffSummary: string, feedback: string): string =>
+	`You are the OUTPUT-EVAL grader. Judge each acceptance criterion from EVIDENCE ONLY — the probe results below were executed by the harness itself and are ground truth. You have NO write/edit tools; never modify the repo (if a check truly needs a fixture, create it in a tmp dir only).\n\n` +
+	`Reward-hacking checklist (auto-FAIL the related criteria if found): tests weakened/deleted/skipped, assertions removed, writes outside spec scope, placeholder or stub code claimed as done. Compare the change summary below against the spec scope.\n\n` +
+	`Criteria & probe results (harness-executed, authoritative):\n${spec.criteria
+		.map((c, i) => {
+			const p = probes[i];
+			const r = p ? `${p.status.toUpperCase()}${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""} — ${p.detail}` : "n/a";
+			return `- ${c.id}: ${c.text}\n  check: ${c.check}\n  probe: ${r}`;
+		})
+		.join("\n")}\n\n` +
+	`Spec scope (writes must stay inside): ${spec.scope.join(", ") || "(none declared)"}\n\n` +
+	(diffSummary ? `Change summary (git, at eval time):\n${diffSummary}\n\n` : "") +
+	`Output STRICTLY (one line per criterion; evidence is MANDATORY — cite the probe result or a command you ran + its output. A PASS without evidence is rejected):\n` +
+	`<id>: PASS: <evidence>\n<id>: FAIL: <evidence>\n…\nOVERALL: PASS|FAIL\n` +
+	`No extra commentary. The last line must be exactly 'OVERALL: PASS' or 'OVERALL: FAIL'.` +
+	(feedback ? `\n\nSYSTEM FEEDBACK: your previous response was rejected: ${feedback}. Return the corrected format only.` : "");
+
+const REVIEW_SECTIONS = ["TL;DR", "Intent vs Implementation", "Risks", "Rollback", "Human actions"] as const;
+
+export interface PacketParse {
+	ok: boolean;
+	missing: string[];
+	tldr: string;
+}
+
+/** W2: validate reviewer packet ตาม schema ตายตัว — ตอนเก่า slice ดิบ 900 ตัวอักษร
+ *  packet ที่ไม่มี TL;DR เลยก็ผ่านเงียบๆ. ok เมื่อครบทุก section; missing ใช้เป็น feedback ตอน retry */
+export const parseReviewerPacket = (text: string): PacketParse => {
+	const missing = REVIEW_SECTIONS.filter((s) => !new RegExp(`^##\\s*${escapeRe(s)}\\s*$`, "im").test(text));
+	let tldr = "";
+	const m = text.match(/^##\s*TL;DR\s*$/im);
+	if (m?.index !== undefined) {
+		const rest = text.slice(m.index + m[0].length);
+		const next = rest.search(/^##\s/m);
+		tldr = (next === -1 ? rest : rest.slice(0, next)).trim().split("\n").filter((l) => l.trim()).slice(0, 3).join("\n");
+	}
+	return { ok: missing.length === 0, missing, tldr };
+};
+
+/** W2: evidence pack ของ reviewer — packet ต้อง facts-grounded ไม่ใช่เดาจาก intent
+ *  (เหตุการณ์จริงก่อนอัปเกรด: packet เขียน \"To be implemented\" ทั้งที่งานเสร็จแล้ว เพราะ prompt มีแค่ intent บรรทัดเดียว) */
+export const buildReviewerPrompt = (
+	intent: string,
+	lastEval: { verdict?: string; perCriteria?: Record<string, string>; failedIds?: string[]; probes?: ProbeResult[] } | undefined,
+	flags: string[],
+	specDebt: string[],
+	escalations: { kind: string; detail: string }[],
+	gitSummary: string,
+	feedback: string,
+): string =>
+	`You are the REVIEWER sub-agent. The work is DONE and already machine-graded — ground every statement in the evidence below; never write \"to be implemented\".\n\n` +
+	`Evidence:\n- Intent: ${intent}\n- Eval verdict: ${lastEval?.verdict ?? "(no eval record)"}` +
+	(lastEval?.perCriteria && Object.keys(lastEval.perCriteria).length
+		? `\n- Per-criteria verdicts: ${Object.entries(lastEval.perCriteria).map(([id, v]) => `${id}=${v}`).join(", ")}`
+		: "") +
+	(lastEval?.probes?.length ? `\n- Probe results (harness-executed): ${lastEval.probes.map((p) => `${p.id}:${p.status}`).join(", ")}` : "") +
+	`\n- Trajectory flags: ${flags.length ? flags.join(" | ") : "(none)"}` +
+	`\n- Spec debt (human-verified): ${specDebt.length ? specDebt.join(" | ") : "(none)"}` +
+	`\n- Escalations: ${escalations.length ? escalations.map((e) => `${e.kind}: ${e.detail.slice(0, 80)}`).join(" | ") : "(none)"}` +
+	(gitSummary ? `\n- Git evidence:\n${gitSummary}` : "") +
+	`\n\nProduce an incident-report-style review packet with EXACTLY these section headers (one per line):\n` +
+	`## TL;DR\n(max 3 lines — the 90-second answer for a human deciding whether to deploy)\n` +
+	`## Intent vs Implementation\n## Risks\n(name up to 3 spots the human MUST eyeball, as file:line where possible)\n` +
+	`## Rollback\n(concrete commands, e.g. git revert <hash> / files to restore — no vague advice)\n` +
+	`## Human actions\n(follow-ups only a human can do: spec debt, unanswered questions)\n` +
+	`Do NOT dump raw diffs; summarize. No commentary outside the sections.` +
+	(feedback ? `\n\nSYSTEM FEEDBACK: previous packet was missing sections: ${feedback}. Output the full packet with all headers.` : "");
 
 // ----------------------------------------------------------------------------- sub-agent runner
 
@@ -1265,6 +1519,10 @@ export default function (pi: ExtensionAPI) {
 				// ให้ spec ใหม่สะท้อน incident เก่า เช่น scope เคยกว้างเกิน/เคย override บ่อย
 				const lessons = memorySummaryLines(ctx.cwd);
 				state.lastCompileLessons = lessons.length ? aggregateMemory(ctx.cwd).total : 0;
+				// W3: context priming + few-shot exemplar — harness เตรียมหลักฐาน/ตัวอย่างให้เลย
+				// ไม่ปล่อยให้ขึ้นกับว่า model จะexploreเองไหม (prompt สั่งได้แค่ชั้นเดียว)
+				const facts = gatherRepoFacts(ctx.cwd);
+				const exemplar = loadSpecExemplar(ctx.cwd);
 				let intent = params.intent.trim();
 				let launches = 0;
 				let clarifyRounds = 0;      // F: รอบถาม-ตอบกับมนุษย์ (max 2)
@@ -1273,7 +1531,7 @@ export default function (pi: ExtensionAPI) {
 				// ลูปเดียวจัดการทั้ง clarify (F) และ parse-retry (A) — budget รวม 4 launches กันลูปพัง
 				while (launches < 4) {
 					launches++;
-					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons));
+					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons, facts, exemplar));
 					if (!draft.ok) return { content: [{ type: "text", text: `sub-agent failed: ${draft.output}` }], details: draft };
 					const parsed = parseSpecDraft(draft.output);
 					if (parsed.kind === "clarify" && !clarifyClosed && clarifyRounds < 2 && ctx.hasUI) {
@@ -1377,7 +1635,14 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ note: Type.Optional(Type.String()) }),
 		async execute(_id, _p, _s, onUpdate, ctx) {
 			if (!state.spec) return { content: [{ type: "text", text: "No spec yet." }], details: {}, isError: true };
-			onUpdate?.({ content: [{ type: "text", text: "running grader sub-agent…" }], details: {} });
+			onUpdate?.({ content: [{ type: "text", text: "running probes + grader sub-agent…" }], details: {} });
+			// W3: probes — harness รัน criteria[].check เองก่อน (deterministic) เป็น ground truth ให้ grader
+			// และทับ verdict ทีหลัง (probe primacy). รันใน worktree ถ้ามี (โค้ดที่แก้จริง) ไม่งั้น main
+			const evalRoot = state.worktree?.root ?? ctx.cwd;
+			const probes = runCheckProbes(evalRoot, state.spec.criteria);
+			const probeSummary = probes.map((p) => `${p.id}:${p.status}`).join(",");
+			learn(ctx, `eval-probes: spec v${state.spec.version} → ${probeSummary}`);
+			const diffSummary = gitChangeSummary(evalRoot);
 			// stream output ของ grader เข้า transcript สดๆ (throttled) — user เห็นมันทำงานจริง ไม่ต้องเดาว่าค้างไหม
 			let tail = "";
 			let lastPush = 0;
@@ -1389,38 +1654,61 @@ export default function (pi: ExtensionAPI) {
 					onUpdate?.({ content: [{ type: "text", text: `🧪 grader ▶ running… (full log via /zense agents)\n${tail}` }], details: {} });
 				}
 			};
-			const grade = await launchSubagent(
-				ctx,
-				"grader",
-				`You are the OUTPUT-EVAL grader. For each acceptance criterion, judge PASS/FAIL with evidence (run checks with tools if useful). Also look for reward hacking.\n` +
-					`Criteria:\n${state.spec.criteria.map((c) => `- ${c.id}: ${c.text} (check: ${c.check})`).join("\n")}\n\n` +
-					`Output STRICTLY in this format (one line per criterion, then a final OVERALL line):\n` +
-					`<id>: PASS: <one-line evidence>\n` +
-					`<id>: FAIL: <one-line evidence>\n` +
-					`…\n` +
-					`OVERALL: PASS|FAIL\n` +
-					`Do NOT add extra commentary. Each criterion line must start with its id followed by ': PASS:' or ': FAIL:'. The last line must be exactly 'OVERALL: PASS' or 'OVERALL: FAIL'.`,
-				streamTail,
-			);
-			// parser แม่น per-criteria: iterate id ที่อยู่ใน state.spec.criteria แล้ว regex ดึง verdict ของ id นั้น
-			// (ผูกกับ id จริง → กัน false positive จากบรรทัดอื่น) + overall verdict แยก
-			const perCriteria: Record<string, "PASS" | "FAIL"> = {};
-			const failedCriteria: string[] = [];
-			for (const c of state.spec.criteria) {
-				const m = grade.output.match(new RegExp(`^\\s*${c.id}:\\s*(PASS|FAIL)`, "im"));
-				if (m) {
-					const v = m[1].toUpperCase() as "PASS" | "FAIL";
-					perCriteria[c.id] = v;
-					if (v === "FAIL") failedCriteria.push(c.id);
-				}
+			// W2: retry loop (budget 3 launches) — output ผิด contract (ครบทุก id ไหม / มี OVERALL ไหม /
+			// PASS ทุกอันมี evidence ไหม) → ส่ง feedback เจาะจงกลับให้แก้ตัว แทน parse ครั้งเดียวแล้วเมินส่วนที่หาย
+			// (bug เก่าที่เจอตอน refactor: regex per-criteria เดิมเขียน `\b` ใน template literal → ถูก materialize
+			//  เป็น backspace byte ในไฟล์เลย → parse ไม่เคยเจอ verdict รายตัวมาก่อน ระบบพึ่ง OVERALL บรรทัดเดียว!)
+			let parsed: GradeParse | null = null;
+			let grade: { ok: boolean; output: string; logPath: string } = { ok: false, output: "(not launched)", logPath: "" };
+			let feedback = "";
+			for (let launch = 0; launch < 3; launch++) {
+				grade = await launchSubagent(ctx, "grader", buildGraderPrompt(state.spec, probes, diffSummary, feedback), streamTail);
+				if (!grade.ok) break;
+				parsed = parseGraderOutput(grade.output, state.spec.criteria);
+				const problems: string[] = [];
+				if (!parsed.overall) problems.push("missing the final OVERALL line");
+				if (parsed.missingIds.length) problems.push(`no verdict given for: ${parsed.missingIds.join(", ")}`);
+				if (parsed.passNoEvidence.length) problems.push(`PASS without evidence rejected for: ${parsed.passNoEvidence.join(", ")}`);
+				if (!problems.length) break;
+				learn(ctx, `grader: output rejected (${problems.join("; ")}) — retry ${launch + 1}/3`);
+				feedback = problems.join("; ");
+				parsed = null;
 			}
-			const verdict = grade.output.match(/^\s*OVERALL:\s*(PASS|FAIL)/im)?.[1]?.toUpperCase() ?? "unknown";
-			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} failed=[${failedCriteria.join(",")}]`);
+			// W2 (G): inconclusive — เดิม "unknown ไหลเป็น PASS เงียบๆ" (= merge เข้า main ฟรี) → ตอนนี้ escalate
+			// ให้มนุษย์ตัดสินแทน พร้อม probe results (หลักฐานแข็งที่มีแน่ๆ) และทางออกที่ไม่ตัน loop (eval ซ้ำได้)
+			if (!grade.ok || !parsed || !parsed.overall) {
+				const reason = !grade.ok ? "grader sub-agent failed" : "grader output invalid after retries";
+				escalate("need-decision", `eval inconclusive: ${reason} — มนุษย์ตัดสินจาก probes เองหรือสั่ง eval ใหม่`, ctx);
+				learn(ctx, `eval: spec v${state.spec.version} → inconclusive (${reason})`);
+				persist(); updateWidget(ctx);
+				return {
+					content: [{ type: "text", text: `⚠️ Eval INCONCLUSIVE — ${reason}\nprobes (harness-executed, authoritative): ${probeSummary}\n${grade.output.slice(-3_000)}\n\nตัดสินไม่ได้อย่างน่าเชื่อถือ: ให้มนุษย์ดู probe results ข้างบนแล้วตัดสินเอง (escalation need-decision ถูกบันทึกแล้ว — /zense status) หรือสั่งเรียก zense_eval อีกครั้ง` }],
+					details: { inconclusive: true, reason, probes },
+					isError: true,
+				};
+			}
+			// W3: probe primacy — probe fail = criterion FAIL ทับ verdict ของ grader
+			// (probe คือสิ่งที่ harness รันเอง; grader ให้ PASS ทั้งที่ probe แดง = เชื่อไม่ได้/โดนหลอก)
+			const probeOverrides: string[] = [];
+			for (const p of probes)
+				if (p.status === "fail" && parsed.perCriteria[p.id] !== "FAIL") {
+					parsed.perCriteria[p.id] = "FAIL";
+					parsed.evidence[p.id] = `probe override: ${p.detail}`;
+					if (!parsed.failedIds.includes(p.id)) parsed.failedIds.push(p.id);
+					probeOverrides.push(p.id);
+				}
+			if (probeOverrides.length) learn(ctx, `grader: probe overrides → FAIL [${probeOverrides.join(",")}]`);
+			const failedCriteria = parsed.failedIds;
+			const verdict = failedCriteria.length || parsed.overall === "FAIL" ? "FAIL" : "PASS";
+			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} judged=${Object.keys(parsed.perCriteria).length}/${state.spec.criteria.length} failed=[${failedCriteria.join(",")}]${probeOverrides.length ? ` probeOverrides=[${probeOverrides.join(",")}]` : ""}`);
+			// W2: เก็บ evidence ไว้เป็น input ของ reviewer (zense_review สร้าง evidence pack จาก lastEval)
+			state.lastEval = { verdict, perCriteria: parsed.perCriteria, failedIds: failedCriteria, probes, at: Date.now() };
 			// บันทึกผล eval ลง spec .md (archive + latest copy) เป็น section ใหม่ท้ายไฟล์ (append-only, ไม่เขียนทับเนื้อเดิม)
 			const evalTs = new Date().toISOString();
 			const evalSection =
 				`\n\n## Eval ${evalTs}\nverdict: **${verdict}** (grader.ok=${grade.ok})\n` +
-				`per-criteria:\n${state.spec.criteria.map((c) => `- ${c.id}: ${perCriteria[c.id] ?? "?"}${perCriteria[c.id] === "FAIL" ? " — FAIL" : ""}`).join("\n")}\n` +
+				`probes (harness-executed): ${probeSummary}\n` +
+				`per-criteria:\n${state.spec.criteria.map((c) => `- ${c.id}: ${parsed.perCriteria[c.id] ?? "?"}${parsed.perCriteria[c.id] === "FAIL" ? " — FAIL" : ""} — ${(parsed.evidence[c.id] ?? "").split("\n")[0].slice(0, 120)}`).join("\n")}\n` +
 				(failedCriteria.length ? `failed: ${failedCriteria.join(", ")}\n` : "") +
 				`\ngrader output:\n${grade.output.slice(-4_000)}\n`;
 			if (state.specMdPath && existsSync(state.specMdPath)) appendFileSync(state.specMdPath, evalSection);
@@ -1437,7 +1725,7 @@ export default function (pi: ExtensionAPI) {
 					`${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
 				return { content: [{ type: "text", text: fixMsg }], details: { ok: grade.ok, verdict, failedCriteria, trajectory: state.trajectoryFlags }, isError: true };
 			}
-			// PASS (หรือ unknown → ปฏิบัติเหมือน PASS เพื่อไม่บล็อก เพราะไม่แน่ใจ): เดินไป review
+			// PASS: เดินไป review (unknown เป็นไปไม่ได้แล้ว — inconclusive ถูกดักไป escalate ก่อนหน้านี้)
 			// ต้องสั่งขั้นต่อไป explicit ในข้อความที่คืนให้ agent (เหมือน FAIL branch) —
 			// ถ้าไม่เขียนบอก agent จะถือว่างานจบแล้วตอบ user ทันที ทำให้ reviewer ไม่ถูกเรียกเลย
 			const report =
@@ -1475,20 +1763,30 @@ export default function (pi: ExtensionAPI) {
 					details: { phase: state.phase },
 					isError: true,
 				};
-			const reviewer = await launchSubagent(
-				ctx,
-				"reviewer",
-				`You are the REVIEWER sub-agent. Produce an incident-report-style review packet: TL;DR (3 lines max), intent vs implementation, risk areas, rollback plan. Intent: ${state.spec?.intent}. Do NOT dump raw diffs; summarize.`,
-			);
+			// W2: evidence pack — ส่ง lastEval (verdicts+probes), flags, specDebt, escalations, git summary
+			// ให้ reviewer ด้วย (เดิมมีแค่ intent บรรทัดเดียว → packet เดา/เลื่อยลอย เช่นเขียน "To be implemented" ทั้งที่งานเสร็จแล้ว)
+			const gitSummary = gitChangeSummary(ctx.cwd);
+			let packetFeedback = "";
+			const packetInput = (): string =>
+				buildReviewerPrompt(state.spec?.intent ?? "(no spec)", state.lastEval, state.trajectoryFlags, state.spec?.specDebt ?? [], state.escalations, gitSummary, packetFeedback);
+			let reviewer = await launchSubagent(ctx, "reviewer", packetInput());
+			let packetParse = parseReviewerPacket(reviewer.output);
+			// A (schema): section ไม่ครบ → retry 1 ครั้งพร้อม feedback (แทน slice ดิบ 900 ตัวอักษรที่ผ่านทุกกรณี)
+			if (reviewer.ok && !packetParse.ok) {
+				learn(ctx, `reviewer: packet missing sections [${packetParse.missing.join(",")}] — retry`);
+				packetFeedback = packetParse.missing.join(", ");
+				reviewer = await launchSubagent(ctx, "reviewer", packetInput());
+				packetParse = parseReviewerPacket(reviewer.output);
+			}
 			const packet = {
-				tlDr: reviewer.output.slice(0, 900),
+				tlDr: packetParse.ok && packetParse.tldr ? packetParse.tldr : reviewer.output.slice(0, 900),
 				trajectory: state.trajectoryFlags,
 				specDebt: state.spec?.specDebt ?? [],
 				escalations: state.escalations,
 			};
 			pi.appendEntry("zense-review-packet", packet);
-			learn(ctx, `review packet: flags=${packet.trajectory.length}, escalations=${packet.escalations.length}`);
-			return { content: [{ type: "text", text: packet.tlDr }], details: packet };
+			learn(ctx, `review packet: flags=${packet.trajectory.length}, escalations=${packet.escalations.length}, sections-ok=${packetParse.ok}${packetParse.missing.length ? ` missing=[${packetParse.missing.join(",")}]` : ""}`);
+			return { content: [{ type: "text", text: reviewer.ok ? reviewer.output.slice(0, 2_000) : `reviewer failed: ${reviewer.output}` }], details: packet };
 		},
 	});
 

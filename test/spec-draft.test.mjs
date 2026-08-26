@@ -86,11 +86,17 @@ test("applyQualityGate: empty scope and non-machine checks are forced into specD
 		});
 		assert.deepEqual(gated.notes, ["empty-scope", "manual-check:c2"]);
 		assert.equal(gated.draft.specDebt.length, 2);
+
+		// scope ที่ชี้ path ไม่มีจริง → quality gate ดัก (gate ไร้ฟันถ้า scope พิมพ์ผิด)
+		const ghost = applyQualityGate(dir, { ...gated.draft, scope: ["ghost/path-xyz"], specDebt: [] });
+		assert.ok(ghost.notes.some((n) => n.startsWith("scope-missing:ghost/path-xyz")));
+		assert.ok(ghost.draft.specDebt.some((d) => d.includes("ghost/path-xyz")));
 		assert.match(gated.draft.specDebt[0], /scope/);
 		assert.match(gated.draft.specDebt[1], /c2/);
 		assert.equal(gated.draft.criteria.length, 2); // criteria ไม่ถูกลบ แค่ flagged
 
-		// draft ดี → ไม่แตะ specDebt เพิ่ม
+		// draft ดี (scope มี path จริงใน repo ด้วย — กฎ scope-missing ของ wave 2/3) → ไม่แตะ specDebt เพิ่ม
+		mkdirSync(join(dir, "src", "auth"), { recursive: true });
 		const clean = applyQualityGate(dir, { ...GOOD_SPEC, title: "Unique title xyz", intent: "unrelated intent qrs" });
 		assert.deepEqual(clean.notes, []);
 		assert.equal(clean.draft.specDebt.length, 0);

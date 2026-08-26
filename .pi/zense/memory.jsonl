@@ -23,3 +23,23 @@
 {"at":1787474092789,"phase":"implementation","note":"signed spec v3"}
 {"at":1787474789292,"phase":"implementation","note":"eval: spec v3 → grader.ok=true verdict=PASS failed=[]"}
 {"at":1787474843724,"phase":"review","note":"review packet: flags=1, escalations=0"}
+{"at":1787493401809,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787493422978,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787493423629,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787493424074,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787493771841,"phase":"requirements","note":"flag: unsigned override: edit"}
+{"at":1787494618537,"phase":"implementation","note":"worktree created: zense/impl/v1-2026-08-23T14-16-58 @ /Users/saint/zurge/pi-zense-wt-2026-08-23T14-16-58"}
+{"at":1787494618537,"phase":"implementation","note":"signed spec v1"}
+{"at":1787494795367,"phase":"implementation","note":"eval: spec v1 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787494795500,"phase":"implementation","note":"worktree merged: merged zense/impl/v1-2026-08-23T14-16-58 → main"}
+{"at":1787494844706,"phase":"review","note":"review packet: flags=1, escalations=0"}
+{"at":1787721449974,"phase":"implementation","note":"worktree created: zense/impl/v1-2026-08-26T05-17-29 @ /Users/saint/zurge/pi-zense/.pi/zense/worktree/pi-zense-wt-2026-08-26T05-17-29"}
+{"at":1787721449974,"phase":"implementation","note":"signed spec v1"}
+{"at":1787722078180,"phase":"implementation","note":"eval: spec v1 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787722078306,"phase":"implementation","note":"worktree merged: merged zense/impl/v1-2026-08-26T05-17-29 → main"}
+{"at":1787722093138,"phase":"review","note":"review packet: flags=0, escalations=0"}
+{"at":1787723896743,"phase":"implementation","note":"worktree created: zense/impl/v2-2026-08-26T05-58-16 @ /Users/saint/zurge/pi-zense/.pi/zense/worktree/pi-zense-wt-2026-08-26T05-58-16"}
+{"at":1787723896743,"phase":"implementation","note":"signed spec v2"}
+{"at":1787724673538,"phase":"implementation","note":"eval: spec v2 → grader.ok=true verdict=PASS failed=[]"}
+{"at":1787724673662,"phase":"implementation","note":"worktree merged: merged zense/impl/v2-2026-08-26T05-58-16 → main"}
+{"at":1787724709464,"phase":"review","note":"review packet: flags=2, escalations=0"}

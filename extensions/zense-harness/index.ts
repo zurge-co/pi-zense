@@ -54,6 +54,7 @@ interface State {
 	gateEnabled: boolean;
 	subagentRuns: SubagentRun[];
 	lastCompileLessons?: number;    // จำนวนบทเรียนจาก memory ที่ feed เข้า compile_spec ล่าสุด
+	specSource?: "set" | "compile"; // spec ปัจจุบันมาจาก agent เขียนเอง (set) หรือ sub-agent (compile) — ใช้ telemetry H
 	specMdPath?: string;            // path ของ archive spec .md ของเวอร์ชันปัจจุบัน (zense_eval append ผลลัพธ์ที่นี่)
 	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
 	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
@@ -187,6 +188,196 @@ const freshState = (): State => ({
 	subagentRuns: [],
 });
 
+// ----------------------------------------------------------------------------- requirements draft parsing (module scope — export เพื่อ unit-test ได้)
+
+export interface SpecDraft {
+	title: string;
+	intent: string;
+	scope: string[];
+	constraints: string[];
+	criteria: Criterion[];
+	specDebt: string[];
+}
+
+export type DraftParse =
+	| { kind: "spec"; draft: SpecDraft }
+	| { kind: "clarify"; questions: string[] }
+	| { kind: "error"; error: string };
+
+const asStringArray = (v: unknown): string[] | undefined =>
+	Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : undefined;
+
+/**
+ * ดึง JSON object เดียวออกจาก output ของ sub-agent — ทนได้ทั้ง JSON ดิบ, ```json fence
+ * และข้อความคั่นรอบ (ลอง first-'{' ถึง last-'}') เพราะ model ชอบแถม prose ทั้งที่สั่งห้าม;
+ * ถ้า parse ตรงๆ ตัวเดียวจะพลาดบ่อยโดยไม่จำเป็น
+ */
+export const extractJsonObject = (text: string): unknown => {
+	const candidates: string[] = [text.trim()];
+	const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+	if (fence) candidates.push(fence[1].trim());
+	const first = text.indexOf("{");
+	const last = text.lastIndexOf("}");
+	if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1));
+	for (const c of candidates) {
+		try {
+			return JSON.parse(c);
+		} catch {
+			/* ลอง candidate ถัดไป */
+		}
+	}
+	return undefined;
+};
+
+/**
+ * A: parse + validate draft ของ requirements sub-agent ตาม contract:
+ *   - spec shape    → {title,intent,scope,constraints,criteria[{id,text,check}],specDebt}
+ *   - clarify shape (F) → {"questions": [...]} (ขอถามกลับแทนการเดา) — ถือเป็น clarify เฉพาะตอนที่ยังไม่มี criteria
+ *   - อื่นๆ        → error พร้อมข้อความบอกว่าพังตรงไหน (ใช้เป็น feedback ตอน retry รอบ 2)
+ * ผิดรูปเล็กน้อยจะถูก normalize (criteria id หาย → auto c1..n, array หาย → []) แต่
+ * criteria ว่าง / item ไม่มี text/check ถือว่า invalid เพราะทำให้ spec ไม่มีฟัน
+ */
+export const parseSpecDraft = (text: string): DraftParse => {
+	const raw = extractJsonObject(text);
+	if (raw === undefined || typeof raw !== "object" || raw === null || Array.isArray(raw))
+		return { kind: "error", error: "output ไม่ใช่ JSON object (หา JSON ที่ parse ได้ไม่เจอ — สั่ง output ONLY JSON ไว้)" };
+	const o = raw as Record<string, unknown>;
+	const qs = asStringArray(o.questions);
+	if (qs?.length && o.criteria === undefined) return { kind: "clarify", questions: qs.slice(0, 5) };
+	if (!Array.isArray(o.criteria) || o.criteria.length === 0)
+		return { kind: "error", error: "criteria ต้องเป็น array ที่มีอย่างน้อย 1 รายการ (แต่ละอันต้องมี check เป็นคำสั่งที่รันได้จริง)" };
+	const criteria: Criterion[] = [];
+	for (let i = 0; i < o.criteria.length; i++) {
+		const c = o.criteria[i] as Record<string, unknown> | null;
+		if (!c || typeof c !== "object") return { kind: "error", error: `criteria[${i}] ไม่ใช่ object` };
+		const ctext = typeof c.text === "string" ? c.text.trim() : "";
+		const check = typeof c.check === "string" ? c.check.trim() : "";
+		if (!ctext) return { kind: "error", error: `criteria[${i}].text ว่างหรือไม่ใช่ string` };
+		if (!check) return { kind: "error", error: `criteria[${i}].check ว่างหรือไม่ใช่ string` };
+		criteria.push({ id: typeof c.id === "string" && c.id.trim() ? c.id.trim() : `c${i + 1}`, text: ctext, check });
+	}
+	return {
+		kind: "spec",
+		draft: {
+			title: typeof o.title === "string" && o.title.trim() ? o.title.trim() : "untitled",
+			intent: typeof o.intent === "string" ? o.intent : "",
+			scope: asStringArray(o.scope) ?? [],
+			constraints: asStringArray(o.constraints) ?? [],
+			criteria,
+			specDebt: asStringArray(o.specDebt) ?? [],
+		},
+	};
+};
+
+/**
+ * heuristic "check นี้ harness/grader รันอัตโนมัติได้จริงไหม": ผ่านถ้ามี command token ที่รู้จัก,
+ * backtick-quoted command, '$'-prompt หรือ pattern path-exists; เจอคำว่า manual/ดูด้วยตา = ไม่ผ่านทันที
+ * — quality gate (G) ใช้ผลัก criterion ที่เช็คไม่ได้จริงลง specDebt (forced human review)
+ * เจตนาคือหลวมฝั่งผ่าน (false negative ดีกว่า false positive: ทุกอย่างที่ไม่แน่ใจต้องไป specDebt)
+ */
+export const isMachineCheckable = (check: string): boolean => {
+	const s = check.toLowerCase();
+	if (/\bmanual(ly)?\b|by eye|visually|eyeball|ask (the )?human|ดูด้วยตา|ตรวจด้วยมือ/.test(s)) return false;
+	if (/path exists|file exists|exists:/.test(s)) return true;
+	if (/`[^`]+`/.test(check) || /^\s*\$/.test(check)) return true;
+	return /\b(npm|pnpm|yarn|bun|npx|node|deno|pytest|python3?|pip|cargo|go|make|just|mvn|gradle|dotnet|composer|php|ruby|bundle|bash|sh|zsh|curl|wget|git|grep|rg|ls|cat|head|tail|find|test|diff|cmp|wc|jq|yq|stat|tsc|vitest|jest|mocha|uv|turbo|docker)\b/i.test(check);
+};
+
+const tokenSet = (s: string): Set<string> =>
+	new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length >= 3));
+
+export const jaccard = (a: Set<string>, b: Set<string>): number => {
+	if (!a.size || !b.size) return 0;
+	let inter = 0;
+	for (const w of a) if (b.has(w)) inter++;
+	return inter / (a.size + b.size - inter);
+};
+
+/** G: กัน spec ซ้ำ — scan archive .pi/zense/specs/*.json (ล่าสุด 20 อัน) เทียบ token ของ
+ *  title+intent; Jaccard ≥ 0.5 ถือว่า "คล้าย" (threshold หลวมพอจับ paraphrase แต่ไม่ชนงานต่างกัน) */
+export const findSimilarSpec = (cwd: string, draft: SpecDraft): { file: string; title: string; score: number } | null => {
+	const dir = join(zenseDir(cwd), "specs");
+	if (!existsSync(dir)) return null;
+	const mine = tokenSet(`${draft.title} ${draft.intent}`);
+	let best: { file: string; title: string; score: number } | null = null;
+	for (const f of readdirSync(dir).filter((f) => f.endsWith(".json")).slice(-20)) {
+		try {
+			const old = JSON.parse(readFileSync(join(dir, f), "utf8")) as { title?: string; intent?: string };
+			const score = jaccard(mine, tokenSet(`${old.title ?? ""} ${old.intent ?? ""}`));
+			if (score >= 0.5 && (!best || score > best.score)) best = { file: f, title: old.title ?? "?", score };
+		} catch {
+			/* ข้ามไฟล์เสียใน archive */
+		}
+	}
+	return best;
+};
+
+/**
+ * G: quality gate ฝั่ง harness — sub-agent เก่งเรื่องดราฟต์ แต่ harness ต้องเป็นคนสงสัยแทนมนุษย์:
+ * scope ว่าง / check ตรวจอัตโนมัติไม่ได้ / ซ้ำ spec เก่า → บังคับลง specDebt (forced human review ตอน eval/review)
+ * คืน draft ใหม่ (ไม่ mutate ของเดิม) พร้อม notes สั้นๆ ว่าเพิ่มอะไรบ้าง (ใช้ทั้ง telemetry H และแจ้งใน tool result)
+ */
+export const applyQualityGate = (cwd: string, draft: SpecDraft): { draft: SpecDraft; notes: string[] } => {
+	const notes: string[] = [];
+	const extraDebt: string[] = [];
+	if (!draft.scope.length) {
+		extraDebt.push("quality-gate: scope ไม่ได้ระบุ — ทุก write จะผ่าน scope check หมด; ควรระบุ path prefix ที่ agent แก้ได้");
+		notes.push("empty-scope");
+	}
+	for (const c of draft.criteria)
+		if (!isMachineCheckable(c.check)) {
+			extraDebt.push(`quality-gate: ${c.id} มี check ที่ตรวจอัตโนมัติไม่ได้ ("${c.check.slice(0, 80)}") — ต้อง verify ด้วยมนุษย์`);
+			notes.push(`manual-check:${c.id}`);
+		}
+	const similar = findSimilarSpec(cwd, draft);
+	if (similar) {
+		extraDebt.push(`quality-gate: intent คล้าย spec เก่า "${similar.title}" (${similar.file}, similarity=${similar.score.toFixed(2)}) — ยืนยันก่อนเซ็นว่าไม่ซ้ำซ้อน`);
+		notes.push(`similar:${similar.file}`);
+	}
+	return { draft: { ...draft, specDebt: [...draft.specDebt, ...extraDebt] }, notes };
+};
+
+// ----------------------------------------------------------------------------- sub-agent argv (module scope — export เพื่อ unit-test ได้)
+
+/** C: role ที่หน้าที่คือ "อ่าน/ร่าง" ไม่ใช่ "แก้โค้ด" — ล็อก read-only ผ่าน --exclude-tools
+ *  (defense-in-depth: prompt สั่งห้ามแก้แค่ชั้นเดียวโดนละเมิดได้ แต่ tools ที่ไม่มีเรียกไม่ได้เลย)
+ *  ยังเหลือ read+bash ไว้ เพราะ D ต้องการให้มันสำรวจ repo และลองรัน check command จริงก่อนดราฟต์ */
+export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = { requirements: ["write", "edit"] };
+
+/** argv ของ pi sub-agent ตัวเดียวที่ runSubagent ใช้ — แยกออกมาเพื่อ test ได้ว่า flag ถูกต้อง */
+export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[]): string[] => {
+	// argv: --exclude-tools ก่อน --model ก่อน task; ไม่ใส่ -- นำหน้า task (คงพฤติกรรมเดิมของไฟล์นี้)
+	const argv = ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "json", "--no-session"];
+	if (excludeTools?.length) argv.push("--exclude-tools", excludeTools.join(","));
+	if (modelPattern) argv.push("--model", modelPattern);
+	argv.push(task);
+	return argv;
+};
+
+/** D: prompt ของ requirements sub-agent — บังคับ explore ก่อนดราฟต์ (grounding: criteria[].check
+ *  ต้องเป็นคำสั่งที่มีอยู่และรันได้จริงใน repo นี้ ไม่ใช่เดา) + clarify contract (F) + output JSON เดียว
+ *  (module scope + export: อยู่ข้าง parser ของมันเอง เวลาเปลี่ยน contract จะได้เห็นคู่กัน) */
+export const buildRequirementsPrompt = (intent: string, lessons: string[]): string =>
+	`You are the REQUIREMENTS sub-agent for a spec-gated SDLC harness. Your single JSON output becomes the machine-checked contract for the main agent's implementation, so every criterion must be grounded in THIS repository's reality — never guess.
+
+` +
+	`Step 1 — EXPLORE (read-only, mandatory before drafting): read README*, package.json / other manifests, test configs, CI configs and the relevant source layout. Actually RUN the candidate test/lint/build commands you plan to reference, so every check you write is proven to work here. You have NO write/edit tools — do not attempt to modify anything.
+
+` +
+	`Step 2 — DRAFT exactly ONE JSON object:
+{"title": string, "intent": string, "scope": string[], "constraints": string[], "criteria": [{"id": string, "text": string, "check": string}], "specDebt": string[]}
+Rules:
+- scope: the minimal list of path prefixes the main agent may modify.
+- criteria: few and atomic. Each "check" MUST be an executable command verified in Step 1 (e.g. "npm test") or "path exists: <p>". Anything you cannot verify by running a command belongs in specDebt instead (it becomes forced human review).
+- Output ONLY the JSON object — no markdown fences, no commentary.
+
+` +
+	`Step 3 — CLARIFY INSTEAD OF GUESSING: if the request is ambiguous enough that a wrong guess would be costly, do NOT draft yet. Output exactly {"questions": ["short question", "…max 5…"]}. A human will answer and you will be re-run with the answers.` +
+	(lessons.length
+		? `\n\nPast lessons from this project's memory (reflect relevant ones in scope/constraints/criteria when they apply):\n${lessons.join("\n")}`
+		: "") +
+	`\n\nRequest: ${intent}`;
+
 // ----------------------------------------------------------------------------- sub-agent runner
 
 /** Humanize token counts: 999000→"999k", 1_000_000→"1.0M". */
@@ -261,14 +452,12 @@ function runSubagent(
 	onChunk?: (chunk: string) => void,
 	logPath: string = subagentLogPath(cwd, role),
 	modelPattern?: string,           // pi --model pattern (เช่น "anthropic/claude-sonnet") — undefined = ปล่อย pi ใช้ default
+	excludeTools?: string[],         // C: role read-only (requirements) → ["write","edit"] (ดู SUBAGENT_EXCLUDE_TOOLS)
 ): Promise<{ ok: boolean; output: string; logPath: string }> {
 	const relLog = relative(cwd, logPath);
 	return new Promise((res) => {
-		// argv: --model <pattern> (ถ้ามี) แทรกก่อน task เพื่อบังคับ model ของ sub-agent ตาม role
-		const argv = ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "json", "--no-session"];
-		if (modelPattern) { argv.push("--model", modelPattern); }
-		argv.push(task);
-		writeFileSync(logPath, `$ pi --mode json --no-session${modelPattern ? ` --model ${modelPattern}` : ""} <task ${task.length} chars>\n--- live output (${role}) ---\n`);
+		const argv = buildSubagentArgv(task, modelPattern, excludeTools);
+		writeFileSync(logPath, `$ pi --mode json --no-session${excludeTools?.length ? ` --exclude-tools ${excludeTools.join(",")}` : ""}${modelPattern ? ` --model ${modelPattern}` : ""} <task ${task.length} chars>\n--- live output (${role}) ---\n`);
 		const child = spawn("env", argv, {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -589,7 +778,8 @@ export default function (pi: ExtensionAPI) {
 		try {
 			// ใช้ worktree root เป็น cwd ถ้ามี worktree active → grader/reviewer รัน/เทสใน worktree (โค้ดที่แก้จริง)
 			const subCwd = state.worktree?.root ?? ctx.cwd;
-			const r = await runSubagent(role, task, subCwd, 240_000, onChunk, logPath, modelPattern);
+			// C: role ถูกล็อก read-only (SUBAGENT_EXCLUDE_TOOLS) → sub-agent ร่าง spec/อ่าน repo ได้แต่แก้โค้ดไม่ได้
+			const r = await runSubagent(role, task, subCwd, 240_000, onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role]);
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
@@ -641,6 +831,10 @@ export default function (pi: ExtensionAPI) {
 			else if (choice === "override" || choice?.startsWith("⚠️")) {
 				state.trajectoryFlags.push(`unsigned override: ${ev.toolName}`);
 				learn(ctx, `flag: unsigned override: ${ev.toolName}`);
+				// H: spec ที่ compile จาก sub-agent แล้วยังถูก override โดยไม่เซ็น = สัญญาณคุณภาพ draft
+				//    → log เด่นๆ เป็น lesson ให้ compile รอบหน้า reflect (loop H ปิดตรงนี้)
+				if (state.specSource === "compile" && state.spec)
+					learn(ctx, `flag: compiled spec v${state.spec.version} overridden unsigned (${ev.toolName})`);
 				ctx.ui.notify("⚠ override โดยไม่เซ็น spec — เพิ่ม trajectory flag", "warning");
 			} else {
 				escalate("need-permission", "write blocked: spec unsigned", ctx);
@@ -969,6 +1163,70 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	};
 
+	/** B: commit spec ในขั้นตอนเดียว — version ใหม่ + archive append-only ลง specs/ + latest copies +
+	 *  เด้ง sign dialog ทันที. helper เดียวใช้ร่วมทั้ง action=set (agent เขียนเอง) และ compile_spec
+	 *  (sub-agent ดราฟต์) — สองทาง behavior เหมือนกันเป๊ะ ไม่ diverge เวลาแก้ทีหลัง */
+	const commitSpec = async (
+		ctx: ExtensionContext,
+		fields: { title?: string; intent?: string; scope?: string[]; constraints?: string[]; criteria?: Criterion[]; specDebt?: string[] },
+		source: "set" | "compile",
+	): Promise<{ version: number; signed: boolean; mdPath: string }> => {
+		const version = (state.spec?.version ?? 0) + 1;
+		state.spec = {
+			version,
+			title: fields.title ?? "untitled",
+			intent: fields.intent ?? "",
+			scope: fields.scope ?? [],
+			constraints: fields.constraints ?? [],
+			criteria: fields.criteria ?? [],
+			specDebt: fields.specDebt ?? [],
+			approved: false,
+		};
+		state.specSource = source; // H: จำที่มาของ spec — ใช้ telemetry ตอน gate override
+		// Specs are append-only: every version gets a unique timestamped file in
+		// .pi/zense/specs/ so any past spec can be re-read. spec.{json,md} stay as
+		// always-latest convenience copies.
+		mkdirSync(zenseDir(ctx.cwd), { recursive: true });
+		const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-"); // YYYY-MM-DD-HH-mm-ss
+		const slug =
+			(state.spec.title ?? "untitled").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40) ||
+			"untitled";
+		const specDir = join(zenseDir(ctx.cwd), "specs");
+		mkdirSync(specDir, { recursive: true });
+		const jsonPath = join(specDir, `${stamp}-v${version}-${slug}.json`);
+		const mdPath = join(specDir, `${stamp}-v${version}-${slug}.md`);
+		writeFileSync(jsonPath, JSON.stringify(state.spec, null, 2));
+		writeFileSync(mdPath, renderSpecMd(state.spec));
+		copyFileSync(jsonPath, join(zenseDir(ctx.cwd), "spec.json"));
+		copyFileSync(mdPath, join(zenseDir(ctx.cwd), "spec.md"));
+		state.specMdPath = mdPath;     // zense_eval จะ append ผลการประเมินท้ายไฟล์นี้
+		state.specJsonPath = jsonPath;
+		// ช่วงเวลาเซ็น (zense/sign): ถามอนุมัติทันทีตอน spec ถูกนำเสนอ
+		// spec ถูก archive ลงไฟล์ก่อนแล้ว — dialog โชว์เนื้อ spec เต็มให้อ่านก่อนเซ็น (TUI)
+		let signed = false;
+		if (ctx.hasUI && ctx.mode === "tui") {
+			const choice = await specSignDialog(ctx, state.spec, `เซ็น Spec v${version}: ${state.spec.title}?`, [
+				{ value: "sign", label: "🔏 เซ็นอนุมัติ — เปิด implementation gate", description: "ลายเซ็นมนุษย์ = agent เริ่ม implement ได้" },
+				{ value: "later", label: "✏️ ยังไม่เซ็น (จะแก้ spec ก่อน)", description: "เซ็นทีหลังได้ด้วย /zense approve" },
+			]);
+			signed = choice === "sign";
+			if (signed) approveCurrentSpec(ctx);
+		} else if (ctx.hasUI) {
+			const choice = await ctx.ui.select(
+				`🔏 เซ็น Spec v${version}: ${state.spec.title}? (อ่านเต็มที่ .pi/zense/spec.md)`,
+				[
+					"🔏 เซ็นอนุมัติ — เปิด implementation gate",
+					"✏️ ยังไม่เซ็น (จะแก้ spec ก่อน / เซ็นทีหลังด้วย /zense approve)",
+				],
+			);
+			signed = !!choice && choice.startsWith("🔏");
+			if (signed) approveCurrentSpec(ctx);
+		}
+		persist();
+		updateWidget(ctx);
+		return { version, signed, mdPath };
+	};
+
 	// ----- tools exposed to the agent ("phase sub-agents" via pi.registerTool)
 
 	pi.registerTool({
@@ -979,7 +1237,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Compile/approve the structured spec: intent, scope, criteria, spec-debt",
 		promptGuidelines: [
 			"Use zense_spec before any implementation to write the spec; list unverifiable requirements under specDebt.",
-			"Use zense_spec with action=compile_spec to delegate drafting to the requirements sub-agent.",
+			"Prefer action=compile_spec: a read-only requirements sub-agent explores the repo, drafts machine-checkable criteria, asks the human clarifying questions if ambiguous, and commits the spec for signing in one step.",
 		],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("set"), Type.Literal("compile_spec")] as const),
@@ -1000,77 +1258,85 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _sig, _on, ctx) {
 			if (params.action === "compile_spec") {
-				// Layer 3 (learning loop): ป้อนบทเรียนสะสมจาก memory.jsonl เข้า prompt
+				if (!params.intent?.trim())
+					return { content: [{ type: "text", text: "compile_spec ต้องการ intent — ส่งสรุป request ของผู้ใช้มาใน intent แล้วเรียกใหม่" }], details: {}, isError: true };
+				const t0 = Date.now();
+				// Layer 3 (learning loop): ป้อนบทเรียนสะสมจาก memory.jsonl เข้า prompt เหมือนเดิม
 				// ให้ spec ใหม่สะท้อน incident เก่า เช่น scope เคยกว้างเกิน/เคย override บ่อย
 				const lessons = memorySummaryLines(ctx.cwd);
 				state.lastCompileLessons = lessons.length ? aggregateMemory(ctx.cwd).total : 0;
-				const draft = await launchSubagent(
-					ctx,
-					"requirements",
-					`You are the REQUIREMENTS sub-agent. Produce a JSON spec {title,intent,scope[],constraints[],criteria[{id,text,check}],specDebt[]} from this request; criteria[.check] must be machine-checkable where possible. Output ONLY JSON.` +
-						(lessons.length
-							? `\n\nPast lessons from this project's memory (reflect relevant ones in scope/constraints/criteria when they apply):\n${lessons.join("\n")}`
-							: "") +
-						`\n\nRequest: ${params.intent}`,
-				);
-				return { content: [{ type: "text", text: draft.ok ? draft.output : `sub-agent failed: ${draft.output}` }], details: draft };
+				let intent = params.intent.trim();
+				let launches = 0;
+				let clarifyRounds = 0;      // F: รอบถาม-ตอบกับมนุษย์ (max 2)
+				let parseRetried = false;   // A: retry ตอน JSON invalid ได้ 1 ครั้ง
+				let clarifyClosed = false;  // คำถามถูกโยนลง specDebt แล้ว — ห้าม clarify ซ้ำ (กันลูปไม่รู้จบ)
+				// ลูปเดียวจัดการทั้ง clarify (F) และ parse-retry (A) — budget รวม 4 launches กันลูปพัง
+				while (launches < 4) {
+					launches++;
+					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons));
+					if (!draft.ok) return { content: [{ type: "text", text: `sub-agent failed: ${draft.output}` }], details: draft };
+					const parsed = parseSpecDraft(draft.output);
+					if (parsed.kind === "clarify" && !clarifyClosed && clarifyRounds < 2 && ctx.hasUI) {
+						// F: ถามมนุษย์ทีละข้อ (Esc/เว้นว่าง = ข้าม) — คำถามที่ไม่ได้คำตอบโยนลง specDebt แล้วดราฟต์ต่อแบบ conservative
+						clarifyRounds++;
+						learn(ctx, `spec-draft: clarify round ${clarifyRounds} — ${parsed.questions.length} questions`);
+						const answers: string[] = [];
+						for (const q of parsed.questions) {
+							const a = await ctx.ui.input(`❓ requirements ถาม: ${q}`, "(ตอบสั้นๆ ได้ — Esc/ว่าง = ข้าม)");
+							if (a === undefined) break;
+							if (a.trim()) answers.push(`- Q: ${q}\n  A: ${a.trim()}`);
+						}
+						const unanswered = parsed.questions.slice(answers.length);
+						if (answers.length) intent += `\n\nHuman clarifications (authoritative — refine the request accordingly):\n${answers.join("\n")}`;
+						if (unanswered.length) {
+							clarifyClosed = true;
+							intent += `\n\nUnanswered clarifying questions — list them in specDebt and proceed with conservative, explicit assumptions:\n${unanswered.map((q) => `- ${q}`).join("\n")}`;
+						}
+						continue;
+					}
+					if (parsed.kind === "clarify") {
+						// ถามมนุษย์ไม่ได้จริงๆ (ไม่มี UI / ครบรอบ / ถูกข้าม) — โยนคำถามลง specDebt ให้ดราฟต์ต่อแบบ conservative
+						clarifyClosed = true;
+						learn(ctx, `spec-draft: clarify forfeited (${!ctx.hasUI ? "no UI" : "rounds exhausted"}) — questions → specDebt`);
+						intent += `\n\nClarifying questions that could NOT be asked — list them in specDebt and draft the spec with conservative, explicit assumptions:\n${parsed.questions.map((q) => `- ${q}`).join("\n")}`;
+						continue;
+					}
+					if (parsed.kind === "error") {
+						// A: retry 1 ครั้งพร้อม feedback ที่เจาะจง — model แก้ output ตาม error ได้แม่นกว่าสั่งซ้ำเปล่าๆ
+						if (!parseRetried) {
+							parseRetried = true;
+							learn(ctx, `spec-draft: JSON invalid — retry พร้อม feedback (${parsed.error.slice(0, 120)})`);
+							intent += `\n\nSYSTEM FEEDBACK: your previous output failed validation: ${parsed.error}. Return ONLY the corrected JSON object under the same rules — no fences, no commentary.`;
+							continue;
+						}
+						learn(ctx, `spec-draft: JSON invalid after retry — คืน raw draft ให้ agent หลักจัดการเอง (legacy path)`);
+						return { content: [{ type: "text", text: `draft validation failed (${parsed.error}) — raw output:\n${draft.output}` }], details: draft };
+					}
+					// G: quality gate ฝั่ง harness ก่อน commit (scope ว่าง / check รันไม่ได้ / ซ้ำของเก่า → specDebt)
+					const gated = applyQualityGate(ctx.cwd, parsed.draft);
+					if (gated.notes.length) learn(ctx, `spec-draft: quality-gate → ${gated.notes.join(", ")}`);
+					// B: parse ผ่าน → commit + เด้ง sign dialog ในขั้นตอนเดียว (ตัด round-trip action=set)
+					const r = await commitSpec(ctx, gated.draft, "compile");
+					// H: telemetry สรุป 1 บรรทัดต่อ compile — loop เรียนรู้เองได้ว่าช้าไหม/ถามกี่รอบ/gate เจออะไร
+					learn(ctx, `spec-compile: v${r.version} launches=${launches} clarify=${clarifyRounds} gate=[${gated.notes.join(",")}] ${Date.now() - t0}ms signed=${r.signed}`);
+					const verb = r.signed
+						? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
+						: "NOT approved — เซ็นทีหลังด้วย /zense approve";
+					return {
+						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .pi/zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` }],
+						details: { version: r.version, approved: r.signed, clarifyRounds, qualityGate: gated.notes, logPath: draft.logPath },
+					};
+				}
+				return { content: [{ type: "text", text: `compile_spec ใช้ครบ ${launches} launches แล้วยังได้แต่ clarify/error — ระบุ intent ให้ชัดขึ้นแล้วเรียกใหม่` }], details: {}, isError: true };
 			}
-			const version = (state.spec?.version ?? 0) + 1;
-			state.spec = {
-				version,
-				title: params.title ?? "untitled",
-				intent: params.intent ?? "",
-				scope: params.scope ?? [],
-				constraints: params.constraints ?? [],
-				criteria: params.criteria ?? [],
-				specDebt: params.specDebt ?? [],
-				approved: false,
-			};
-			// Specs are append-only: every version gets a unique timestamped file in
-			// .pi/zense/specs/ so any past spec can be re-read. spec.{json,md} stay as
-			// always-latest convenience copies.
-			mkdirSync(zenseDir(ctx.cwd), { recursive: true });
-			const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-"); // YYYY-MM-DD-HH-mm-ss
-			const slug =
-				(state.spec.title ?? "untitled").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40) ||
-				"untitled";
-			const specDir = join(zenseDir(ctx.cwd), "specs");
-			mkdirSync(specDir, { recursive: true });
-			const jsonPath = join(specDir, `${stamp}-v${version}-${slug}.json`);
-			const mdPath = join(specDir, `${stamp}-v${version}-${slug}.md`);
-			writeFileSync(jsonPath, JSON.stringify(state.spec, null, 2));
-			writeFileSync(mdPath, renderSpecMd(state.spec));
-			copyFileSync(jsonPath, join(zenseDir(ctx.cwd), "spec.json"));
-			copyFileSync(mdPath, join(zenseDir(ctx.cwd), "spec.md"));
-			state.specMdPath = mdPath;     // zense_eval จะ append ผลการประเมินท้ายไฟล์นี้
-			state.specJsonPath = jsonPath;
-			// ช่วงเวลาเซ็น (zense/sign): ถามอนุมัติทันทีตอน spec ถูกนำเสนอ
-			// spec ถูก archive ลงไฟล์ก่อนแล้ว — dialog โชว์เนื้อ spec เต็มให้อ่านก่อนเซ็น (TUI)
-			let signed = false;
-			if (ctx.hasUI && ctx.mode === "tui") {
-				const choice = await specSignDialog(ctx, state.spec, `เซ็น Spec v${version}: ${state.spec.title}?`, [
-					{ value: "sign", label: "🔏 เซ็นอนุมัติ — เปิด implementation gate", description: "ลายเซ็นมนุษย์ = agent เริ่ม implement ได้" },
-					{ value: "later", label: "✏️ ยังไม่เซ็น (จะแก้ spec ก่อน)", description: "เซ็นทีหลังได้ด้วย /zense approve" },
-				]);
-				signed = choice === "sign";
-				if (signed) approveCurrentSpec(ctx);
-			} else if (ctx.hasUI) {
-				const choice = await ctx.ui.select(
-					`🔏 เซ็น Spec v${version}: ${state.spec.title}? (อ่านเต็มที่ .pi/zense/spec.md)`,
-					[
-						"🔏 เซ็นอนุมัติ — เปิด implementation gate",
-						"✏️ ยังไม่เซ็น (จะแก้ spec ก่อน / เซ็นทีหลังด้วย /zense approve)",
-					],
-				);
-				signed = !!choice && choice.startsWith("🔏");
-				if (signed) approveCurrentSpec(ctx);
-			}
-			persist();
-			updateWidget(ctx);
-			const verb = signed ? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open" : "NOT approved — เซ็นทีหลังด้วย /zense approve";
+			// action=set: agent เขียน spec เองแล้ว commit — commitSpec เดียวกับ compile (B) → behavior เหมือนกันเป๊ะ
+			const r = await commitSpec(ctx, params, "set");
+			const verb = r.signed
+				? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
+				: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 			return {
-				content: [{ type: "text", text: `Spec v${version} archived at ${mdPath} (latest copies: .pi/zense/spec.{json,md}). ${verb}.` }],
-				details: { version, approved: signed },
+				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .pi/zense/spec.{json,md}). ${verb}.` }],
+				details: { version: r.version, approved: r.signed },
 			};
 		},
 	});

@@ -20,7 +20,7 @@ pi                                                # เปิด session — ext
 > สร้าง REST API สำหรับ todo list ด้วย Express, ต้องมี unit test ครบทุก endpoint
 
 ถ้า agent พยายามเขียนโค้ดทันที gate จะเด้ง dialog 3 ทางเลือกทันที (ดูด้านล่าง) — ปกติให้บอก agent ว่า
-"compile spec ก่อน" มันจะเรียก requirements sub-agent มาเขียน `.pi/zense/spec.json` ให้
+"compile spec ก่อน" มันจะเรียก requirements sub-agent มาเขียน `.pi/zense/spec.json` ให้ — sub-agent นี้ **ถูกล็อก read-only** (แก้ repo ไม่ได้), จะสำรวจ codebase + ลองรัน test command จริงก่อนดราฟต์ criteria, ถ้า requirement กำกวมมันอาจ **ถามคำถามคุณผ่าน input dialog ทีละข้อ** (ตอบ/ข้ามได้) แทนที่จะเดา, แล้ว commit spec เสร็จในจังหวะเดียวกับ sign dialog ด้านล่าง ไม่ต้องเรียกซ้ำ
 
 **📍 หน้าที่คุณ (gate #1) — ลายเซ็นของคุณอยู่ที่ dialog:**
 1. เมื่อ spec compile เสร็จ dialog จะเด้งขึ้นมา **พร้อม spec เต็มฉบับให้อ่านใน dialog นั้นเลย** (Ctrl+D/U เลื่อนครึ่งหน้า, Ctrl+F/B เต็มหน้า ถ้ายาว มีตัวเลขบอกว่าอ่านถึงบรรทัดไหน) แล้วจึงเลือก:

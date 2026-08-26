@@ -16,7 +16,7 @@ finished artifact — exactly the harness design plan.md recommends.
 
 | PLAN.md | Mechanism | Artifact |
 |---|---|---|
-| P1 Requirements — spec is the control surface | `zense_spec` tool (or `action:"compile_spec"` → requirements sub-agent) | `.pi/zense/spec.json` + `spec.md`, versioned, with machine-checkable criteria and **spec debt** |
+| P1 Requirements — spec is the control surface | `zense_spec` tool (or `action:"compile_spec"` → **read-only** requirements sub-agent that explores the repo first, drafts validated JSON, may ask the human clarifying questions, then commits the spec + signing dialog in one step; a harness-side quality gate forces empty scope / non-runnable checks / near-duplicate intents into spec debt) | `.pi/zense/spec.json` + `spec.md`, versioned, with machine-checkable criteria and **spec debt** |
 | P1 gate — no implementation on unsigned spec | `tool_call` interceptor shows a 3-choice signing dialog: 🔏 sign & continue / ⚠ one-off override (trajectory flag) / ⛔ block; `zense_spec` also prompts to sign right after compiling | hard gate |
 | P2 Design — ADRs prevent drift | `zense_adr` tool; ADRs re-read per tool call; `DENY: <path>` rules enforced live | `.pi/zense/adr/NNN-*.md` |
 | P3 Implementation — usage meter | `turn_end` counts turns/tokens, surfaced in the widget | footer widget meter |
@@ -24,7 +24,7 @@ finished artifact — exactly the harness design plan.md recommends.
 | P4 Output eval — spec→eval closed loop | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL | verdict text |
 | P4 Trajectory eval | `agent_end` heuristics: test files modified/deleted, out-of-scope writes, retry storms | `trajectoryFlags` |
 | P5 Review — exception-based, incident-report style | `zense_review` → reviewer sub-agent builds **review packet** (TL;DR first), rendered in transcript via `registerEntryRenderer` | card + entry |
-| P6 Maintenance — learn | every escalation/flag/signing/eval verdict/sub-agent failure logged to `.pi/zense/memory.jsonl`; lessons feed back into `compile_spec` prompts (closed learning loop) | `/zense memory` = grouped summary, `/zense memory json` = raw tail |
+| P6 Maintenance — learn | every escalation/flag/signing/eval verdict/sub-agent failure **and spec-draft telemetry (clarify rounds, JSON retries, quality-gate hits, unsigned overrides of compiled specs)** logged to `.pi/zense/memory.jsonl`; lessons feed back into `compile_spec` prompts (closed learning loop) | `/zense memory` = grouped summary, `/zense memory json` = raw tail |
 
 ## Human attention points (the scarce resource, per PLAN.md)
 

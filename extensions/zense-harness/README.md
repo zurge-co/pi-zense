@@ -16,15 +16,15 @@ finished artifact — exactly the harness design plan.md recommends.
 
 | PLAN.md | Mechanism | Artifact |
 |---|---|---|
-| P1 Requirements — spec is the control surface | `zense_spec` tool (or `action:"compile_spec"` → **read-only** requirements sub-agent that explores the repo first, drafts validated JSON, may ask the human clarifying questions, then commits the spec + signing dialog in one step; a harness-side quality gate forces empty scope / non-runnable checks / near-duplicate intents into spec debt) | `.pi/zense/spec.json` + `spec.md`, versioned, with machine-checkable criteria and **spec debt** |
+| P1 Requirements — spec is the control surface | `zense_spec` tool (or `action:"compile_spec"` → **read-only** requirements sub-agent that explores the repo first, drafts validated JSON, may ask the human clarifying questions, then commits the spec + signing dialog in one step; a harness-side quality gate forces empty scope / non-runnable checks / near-duplicate intents into spec debt) | `.zense/spec.json` + `spec.md`, versioned, with machine-checkable criteria and **spec debt** |
 | P1 gate — no implementation on unsigned spec | `tool_call` interceptor shows a 3-choice signing dialog: 🔏 sign & continue / ⚠ one-off override (trajectory flag) / ⛔ block; `zense_spec` also prompts to sign right after compiling | hard gate |
-| P2 Design — ADRs prevent drift | `zense_adr` tool; ADRs re-read per tool call; `DENY: <path>` rules enforced live | `.pi/zense/adr/NNN-*.md` |
+| P2 Design — ADRs prevent drift | `zense_adr` tool; ADRs re-read per tool call; `DENY: <path>` rules enforced live | `.zense/adr/NNN-*.md` |
 | P3 Implementation — usage meter | `turn_end` counts turns/tokens, surfaced in the widget | footer widget meter |
 | P3 escalation taxonomy | `escalations[]` distinguishes need-permission / need-decision / something-wrong | `/zense status` |
 | P4 Output eval — spec→eval closed loop | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL | verdict text |
 | P4 Trajectory eval | `agent_end` heuristics: test files modified/deleted, out-of-scope writes, retry storms | `trajectoryFlags` |
 | P5 Review — exception-based, incident-report style | `zense_review` → reviewer sub-agent builds **review packet** (TL;DR first), rendered in transcript via `registerEntryRenderer` | card + entry |
-| P6 Maintenance — learn | every escalation/flag/signing/eval verdict/sub-agent failure **and spec-draft telemetry (clarify rounds, JSON retries, quality-gate hits, unsigned overrides of compiled specs)** logged to `.pi/zense/memory.jsonl`; lessons feed back into `compile_spec` prompts (closed learning loop) | `/zense memory` = grouped summary, `/zense memory json` = raw tail |
+| P6 Maintenance — learn | every escalation/flag/signing/eval verdict/sub-agent failure **and spec-draft telemetry (clarify rounds, JSON retries, quality-gate hits, unsigned overrides of compiled specs)** logged to `.zense/memory.jsonl`; lessons feed back into `compile_spec` prompts (closed learning loop) | `/zense memory` = grouped summary, `/zense memory json` = raw tail |
 
 ## Human attention points (the scarce resource, per PLAN.md)
 
@@ -40,7 +40,7 @@ finished artifact — exactly the harness design plan.md recommends.
 |---|---|
 | `/zense status` | phase, spec version/approval, flags, escalations |
 | `/zense approve` | sign current spec later (usually unnecessary — dialog covers it) |
-| `alt+z` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.pi/zense/subagents/*.log` (written live while they run) |
+| `alt+z` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.zense/subagents/*.log` (written live while they run) |
 | `/zense gate off` | disable the spec gate (escape hatch) |
 | `/zense memory` | grouped lesson summary (top recurring flags, escalations by kind, eval history, sub-agent failures); `/zense memory json` for the raw JSONL tail |
 
@@ -50,12 +50,12 @@ finished artifact — exactly the harness design plan.md recommends.
 reasoning to an isolated sub-agent run of pi itself (guarded by
 `PI_ZENSE_SUBAGENT=1` so sub-agents don't recurse into the harness).
 Sub-agents spawn with stdin ignored (pi print mode blocks on stdin EOF otherwise)
-and stream stdout/stderr live to `.pi/zense/subagents/<stamp>-<role>.log`; while a
+and stream stdout/stderr live to `.zense/subagents/<stamp>-<role>.log`; while a
 grader runs, its tail is also streamed into the transcript via tool `onUpdate`.
 
 ## State
 
 Persisted in-session via `pi.appendEntry("zense-state", …)` (restored on
-resume/reload) and on disk under `.pi/zense/` (spec.md/json, adr/, memory.jsonl)
+resume/reload) and on disk under `.zense/` (spec.md/json, adr/, memory.jsonl)
 so it survives across sessions and is diffable/auditable — the "spec-as-code"
 requirement from P1.

@@ -9,7 +9,7 @@
 - **v1 (merged)** — requirements pipeline A–H (parse/retry, commitSpec one-step, read-only requirements, explore-first prompt, clarify, quality gate, telemetry)
 - **v2 (นี้)** — Wave 2 ครบ: grader/reviewer read-only · `parseGraderOutput` (evidence-anchored, coverage, OVERALL) + retry×3 · inconclusive→escalate แทน silent-PASS · `runCheckProbes` ฝั่ง harness + probe primacy (probe fail = FAIL ทับ grader) · grader prompt ได้ diff + reward-hacking checklist · reviewer ได้ evidence pack (`state.lastEval` + git) + packet schema validate+retry · Wave 3 บางส่วน: context priming (`gatherRepoFacts`), few-shot exemplar (`loadSpecExemplar`), scope-missing ใน quality gate, reviewer prompt contract (exception-first + rollback เชิงกล) · บังคับใช้: grader prompt แจ้ง read-only + temp fixture ใน tmp
 - **Bug ที่เจอระหว่าง v2 (fixed)**: regex per-criteria เดิมมี backspace byte จาก `\b` ใน template literal → parse ไม่เคยเจอ verdict ราย criterion มาก่อน (ระบบเคยพึ่ง OVERALL บรรทัดเดียว — รูรั่วจริงที่ wave 2 ปิด)
-- **Defer ไว้ตาม spec v2 (พร้อมเหตุผล)**: dual-draft compile (ต้อง merge strategy) · dual-grader agreement (เพิ่มเวลา/โทเคน phase 4 ~2× รอ telemetry ว่าจำเป็น) · calibration loop false-PASS→prompt (ต้องมี incident สะสมก่อน) · prompts-as-files `.pi/zense/prompts/<role>.md` (ดีแต่รอ prompt นิ่งกว่านี้) · per-role thinking defaults (models.json ทำเองได้แล้ววันนี้) · generic launchUntilValid (rule of three — ตอนนี้ parser มี 2 ตัว ยังไม่ควรรวม)
+- **Defer ไว้ตาม spec v2 (พร้อมเหตุผล)**: dual-draft compile (ต้อง merge strategy) · dual-grader agreement (เพิ่มเวลา/โทเคน phase 4 ~2× รอ telemetry ว่าจำเป็น) · calibration loop false-PASS→prompt (ต้องมี incident สะสมก่อน) · prompts-as-files `.zense/prompts/<role>.md` (ดีแต่รอ prompt นิ่งกว่านี้) · per-role thinking defaults (models.json ทำเองได้แล้ววันนี้) · generic launchUntilValid (rule of three — ตอนนี้ parser มี 2 ตัว ยังไม่ควรรวม)
 
 ## Context: สิ่งที่ทำไปแล้ว (requirements sub-agent)
 
@@ -61,7 +61,7 @@ H) telemetry ลง memory.jsonl ทุกจุด
 
 1. **Context priming (deterministic)** — harness gather ข้อเท็จจริงถูกๆ เองก่อน (package.json scripts, README head, top-level tree, test runner ที่เจอ, tsconfig) inject เข้า prompt · ประหยัด exploration tokens และกัน model ขี้เกียจ explore — เพราะ D ปัจจุบันพึ่ง model ทำตามสั่งล้วนๆ
 2. **Few-shot จาก spec เก่าของ repo ตัวเอง** — `findSimilarSpec` มีอยู่แล้ว ใช้ย้อนดึง spec ที่เคย signed สำเร็จ 1–2 ฉบับเป็นตัวอย่าง style (criteria ที่ผ่าน gate จริง) → format compliance + consistency สูงขึ้น
-3. **Acceptance probes เป็นไฟล์จริง** — ให้เขียน `.pi/zense/probes/<criterion-id>.sh` ที่ `zense_eval` re-run ได้ deterministically ทุกครั้ง แทนที่ grader จะ interpret `check` ใหม่ทุกรอบ → criteria เป็น executable ของจริง ไม่ใช่ข้อความ
+3. **Acceptance probes เป็นไฟล์จริง** — ให้เขียน `.zense/probes/<criterion-id>.sh` ที่ `zense_eval` re-run ได้ deterministically ทุกครั้ง แทนที่ grader จะ interpret `check` ใหม่ทุกรอบ → criteria เป็น executable ของจริง ไม่ใช่ข้อความ
 4. **Scope typo check** — quality gate เพิ่มอีก 1 กฎ: scope path ที่ไม่ match ไฟล์/โฟลเดอร์จริงเลย → specDebt (scope พิมพ์ผิด = gate ไร้ฟันเงียบๆ)
 5. (ใหญ่) **Dual-draft** — compile 2 model คู่ขนานแล้ว grader เลือก/merge — models.json per-role มีพร้อมแล้ว
 
@@ -82,7 +82,7 @@ H) telemetry ลง memory.jsonl ทุกจุด
 
 ### Infra ร่วม (รองรับทุก role)
 
-- **Role system-prompt files** — ย้ายนโยบาย role (read-only, temp-file ใน tmp, output contract) จากการต่อ string ในโค้ด ไปเป็น `.pi/zense/prompts/<role>.md` แล้ว spawn ด้วย `--append-system-prompt` · แก้ policy โดยไม่แตะโค้ด + version control ได้
+- **Role system-prompt files** — ย้ายนโยบาย role (read-only, temp-file ใน tmp, output contract) จากการต่อ string ในโค้ด ไปเป็น `.zense/prompts/<role>.md` แล้ว spawn ด้วย `--append-system-prompt` · แก้ policy โดยไม่แตะโค้ด + version control ได้
 - **Per-role thinking level** — models.json รองรับ `:high` อยู่แล้ว อาจ default grader=high (accuracy สำคัญ) requirements=medium
 - **Generic parse-retry helper** — เมื่อมี parser ตัวที่สอง (`parseGraderOutput`) ค่อยถอด retry-loop ออกเป็น `launchUntilValid()` ร่วม — อย่างeneric เร็วเกิน (rule of three)
 

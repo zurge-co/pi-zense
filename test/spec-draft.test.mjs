@@ -109,7 +109,7 @@ test("findSimilarSpec: archived spec with overlapping title+intent is flagged (J
 	const dir = mkdtempSync(join(tmpdir(), "zense-sim-"));
 	try {
 		assert.equal(findSimilarSpec(dir, { ...GOOD_SPEC }), null); // ยังไม่มี specs dir → null
-		const specsDir = join(dir, ".pi", "zense", "specs");
+		const specsDir = join(dir, ".zense", "specs");
 		mkdirSync(specsDir, { recursive: true });
 		writeFileSync(
 			join(specsDir, "2026-01-01-00-00-00-v1-fix-login-redirect.json"),

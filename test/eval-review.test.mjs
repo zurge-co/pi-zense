@@ -94,7 +94,7 @@ test("loadSpecExemplar: picks the newest APPROVED spec with criteria, skips unap
 	const dir = mkdtempSync(join(tmpdir(), "zense-exemplar-"));
 	try {
 		assert.equal(loadSpecExemplar(dir), null); // ยังไม่มี archive
-		const specsDir = join(dir, ".pi", "zense", "specs");
+		const specsDir = join(dir, ".zense", "specs");
 		mkdirSync(specsDir, { recursive: true });
 		writeFileSync(
 			join(specsDir, "2026-01-01-00-00-00-v1-old-signed.json"),

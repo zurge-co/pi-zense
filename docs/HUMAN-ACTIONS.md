@@ -20,13 +20,13 @@ pi                                                # เปิด session — ext
 > สร้าง REST API สำหรับ todo list ด้วย Express, ต้องมี unit test ครบทุก endpoint
 
 ถ้า agent พยายามเขียนโค้ดทันที gate จะเด้ง dialog 3 ทางเลือกทันที (ดูด้านล่าง) — ปกติให้บอก agent ว่า
-"compile spec ก่อน" มันจะเรียก requirements sub-agent มาเขียน `.pi/zense/spec.json` ให้ — sub-agent นี้ **ถูกล็อก read-only** (แก้ repo ไม่ได้), จะสำรวจ codebase + ลองรัน test command จริงก่อนดราฟต์ criteria, ถ้า requirement กำกวมมันอาจ **ถามคำถามคุณผ่าน input dialog ทีละข้อ** (ตอบ/ข้ามได้) แทนที่จะเดา, แล้ว commit spec เสร็จในจังหวะเดียวกับ sign dialog ด้านล่าง ไม่ต้องเรียกซ้ำ
+"compile spec ก่อน" มันจะเรียก requirements sub-agent มาเขียน `.zense/spec.json` ให้ — sub-agent นี้ **ถูกล็อก read-only** (แก้ repo ไม่ได้), จะสำรวจ codebase + ลองรัน test command จริงก่อนดราฟต์ criteria, ถ้า requirement กำกวมมันอาจ **ถามคำถามคุณผ่าน input dialog ทีละข้อ** (ตอบ/ข้ามได้) แทนที่จะเดา, แล้ว commit spec เสร็จในจังหวะเดียวกับ sign dialog ด้านล่าง ไม่ต้องเรียกซ้ำ
 
 **📍 หน้าที่คุณ (gate #1) — ลายเซ็นของคุณอยู่ที่ dialog:**
 1. เมื่อ spec compile เสร็จ dialog จะเด้งขึ้นมา **พร้อม spec เต็มฉบับให้อ่านใน dialog นั้นเลย** (Ctrl+D/U เลื่อนครึ่งหน้า, Ctrl+F/B เต็มหน้า ถ้ายาว มีตัวเลขบอกว่าอ่านถึงบรรทัดไหน) แล้วจึงเลือก:
    - **🔏 เซ็นอนุมัติ** — spec.approved + เปิด implementation gate ทันที จบในจังหวะเดียว
-   - **✏️ ยังไม่เซ็น** — ออกไปแก้ spec ก่อน: `Esc` ปิด dialog, เปิด `.pi/zense/spec.md` แก้เอง, สั่ง agent ปรับ criteria
-2. dialog เซ็นทุกจุด (ตอน compile เสร็จ / gate เด้งตอน write / `/zense approve`) โชว์เนื้อ spec แบบเดียวกัน — อ่านครบก่อนเซ็นเสมอ ไม่ต้องเปิดไฟล์แยก (แต่ทุก version ยังถูกเก็บถาวรไม่ทับกันใน `.pi/zense/specs/…-<slug>.md`)
+   - **✏️ ยังไม่เซ็น** — ออกไปแก้ spec ก่อน: `Esc` ปิด dialog, เปิด `.zense/spec.md` แก้เอง, สั่ง agent ปรับ criteria
+2. dialog เซ็นทุกจุด (ตอน compile เสร็จ / gate เด้งตอน write / `/zense approve`) โชว์เนื้อ spec แบบเดียวกัน — อ่านครบก่อนเซ็นเสมอ ไม่ต้องเปิดไฟล์แยก (แต่ทุก version ยังถูกเก็บถาวรไม่ทับกันใน `.zense/specs/…-<slug>.md`)
 3. ถ้าเลือก "ยังไม่เซ็น" ไว้ก่อน ค่อยเซ็นทีหลังได้ที่ `/zense approve`
 
 ถ้า dialog เด้งตอน agent กำลังจะเขียนโค้ดทั้งที่ยังไม่เซ็น มันจะโชว์ spec เต็มให้อ่านก่อน (Ctrl+D/U เลื่อนครึ่งหน้า, Ctrl+F/B เต็มหน้า) แล้วมี 3 ทางเลือก:
@@ -40,7 +40,7 @@ pi                                                # เปิด session — ext
 
 ## 2. Design — เข้ามาเฉพาะ "one-way door"
 
-Agent เขียน ADR ลง `.pi/zense/adr/` เองรายการที่ `status: proposed (NEEDS HUMAN APPROVAL)`
+Agent เขียน ADR ลง `.zense/adr/` เองรายการที่ `status: proposed (NEEDS HUMAN APPROVAL)`
 (ตัดสินใจย้อนไม่ได้ เช่น เลือก database / API contract) คือจุดที่คุณต้องอ่านและเปลี่ยนเป็น
 `accepted` หรือสั่งแก้ — ส่วน `DENY: <path>` rules ใน ADR จะถูก enforce กับ agent อัตโนมัติ
 
@@ -48,11 +48,11 @@ Agent เขียน ADR ลง `.pi/zense/adr/` เองรายการท
 
 เฝ้า widget: `ZENSE ▸ IMPLEMENTATION · spec: ✅v1 · 🌳 pi-zense-wt-… · turns 12 · tok 1.2M` (token ≥ 1 ล้านแสดงเป็น M)
 
-**🌳 ทันทีที่คุณเซ็น spec** harness สร้าง `git worktree` ของ session นี้ให้เอง (branch `zense/impl/v1-…` worktree อยู่ใต้ `<repo>/.pi/zense/worktree/` ใน workspace เดียวกัน — main repo สะอาดเพราะ harness เพิ่ม path เข้า `.git/info/exclude` ให้เอง) แล้ว redirect ทุก `write`/`edit`/`read`/`bash` ของ agent เข้าไปทำงานในนั้นโดย agent ไม่รู้ตัว — ดังนั้น**เปิด pi 2 session ใน repo เดียวกันได้โดยไม่เขียนทับกัน** แต่ละ session มี worktree ของตัวเอง grader/reviewer ก็รันใน worktree ด้วยเลยเทสโค้ดที่แก้จริง ไม่ต้องจัดการอะไรเอง
+**🌳 ทันทีที่คุณเซ็น spec** harness สร้าง `git worktree` ของ session นี้ให้เอง (branch `zense/impl/v1-…` worktree อยู่ใต้ `<repo>/.zense/worktree/` ใน workspace เดียวกัน — main repo สะอาดเพราะ harness เพิ่ม path เข้า `.git/info/exclude` ให้เอง) แล้ว redirect ทุก `write`/`edit`/`read`/`bash` ของ agent เข้าไปทำงานในนั้นโดย agent ไม่รู้ตัว — ดังนั้น**เปิด pi 2 session ใน repo เดียวกันได้โดยไม่เขียนทับกัน** แต่ละ session มี worktree ของตัวเอง grader/reviewer ก็รันใน worktree ด้วยเลยเทสโค้ดที่แก้จริง ไม่ต้องจัดการอะไรเอง
 
 ตอน agent spawn sub-agent (grader/reviewer) widget จะขึ้น `🧪 grader ▶ 12s` — อยากดูสดว่ามันทำอะไรอยู่
 (ไม่ค้าง?) กด **alt+z** หรือพิมพ์ `/zense agents` แล้วเลือก run → live tail อัปเดตเองทุก 1 วิ
-(grep ไฟล์ .pi/zense/subagents/*.log เองก็ได้ — เขียน live ระหว่างรัน) กด Esc ปิด viewer งานยังรันต่อ
+(grep ไฟล์ .zense/subagents/*.log เองก็ได้ — เขียน live ระหว่างรัน) กด Esc ปิด viewer งานยังรันต่อ
 
 **📍 คุณจะถูกเรียกกลับมาเมื่อ:**
 - ⚠ trajectory flag เด้ง (out-of-scope write / แก้ไฟล์ test) → ตรวจนัดเดียว
@@ -75,7 +75,7 @@ grader sub-agent เช็คผลงานเทียบทุก criterion �
 
 ## 6. Maintenance — memory เรียนรู้อัตโนมัติ
 
-- ทุก escalation / trajectory flag / การเซ็น/override spec / eval verdict / sub-agent fail ถูกเขียนลง `.pi/zense/memory.jsonl` เอง — ไม่ต้องทำอะไร
+- ทุก escalation / trajectory flag / การเซ็น/override spec / eval verdict / sub-agent fail ถูกเขียนลง `.zense/memory.jsonl` เอง — ไม่ต้องทำอะไร
 - `/zense memory` — ดูสรุปเป็นกลุ่ม (top flags, escalations by kind, eval history, sub-agent failures); อยากดู raw ใช้ `/zense memory json`
 - บทเรียนสะสมจะถูก **feed เข้า compile_spec อัตโนมัติ** — spec ถัดไปจะ reflect incident เก่า เช่น scope เคยกว้างเกิน, override บ่อย (sign dialog จะมี hint `📚 fed N lessons` บอกด้วย)
 - production incident → บอก agent แปลงเป็น criterion ใหม่ใน spec รอบหน้า (หรือมันถูก memory ดูดเข้าไปเองถ้าเกิด flag/escalation)

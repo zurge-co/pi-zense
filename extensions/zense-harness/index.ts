@@ -14,10 +14,10 @@
  *   - Gates are enforced with pi's tool_call interception + human confirms.
  *
  * Phases:
- *   P1 Requirements : zense_spec tool → append-only archive .pi/zense/specs/
+ *   P1 Requirements : zense_spec tool → append-only archive .zense/specs/
  *                     <timestamp>-v{n}-<slug>.{json,md} (never overwritten) +
- *                     .pi/zense/spec.{json,md} as always-latest copies
- *   P2 Design       : zense_adr tool → .pi/zense/adr/NNN-*.md (deny rules checked live)
+ *                     .zense/spec.{json,md} as always-latest copies
+ *   P2 Design       : zense_adr tool → .zense/adr/NNN-*.md (deny rules checked live)
  *   P3 Implementation: specification gate + escalation
  *   P4 Dual eval    : zense_eval (output eval vs criteria) + trajectory heuristics
  *   P5 Review/Deploy: zense_review builds a review-packet card (exception-based)
@@ -67,18 +67,18 @@ interface SubagentRun {
 	summary: string;
 	at: number;
 	startedAt?: number;
-	logPath?: string;            // .pi/zense/subagents/<stamp>-<role>.log — เขียน live ระหว่างรัน
+	logPath?: string;            // .zense/subagents/<stamp>-<role>.log — เขียน live ระหว่างรัน
 	status?: "running" | "done" | "failed";
 }
 /** Active per-session worktree: redirect ทุก tool call ของ main agent เข้าไปทำงานในนี้
  *  (ผ่านการ mutate event.input) จนกว่า eval PASS จะ merge กลับเข้า main; กัน 2 session เขียนทับกัน */
 interface Worktree {
-	root: string;               // absolute path ของ worktree (nested ใต้ <repo>/.pi/zense/worktree/)
+	root: string;               // absolute path ของ worktree (nested ใต้ <repo>/.zense/worktree/)
 	branch: string;             // zense/impl/v<N>-<stamp>
 	dir: string;                // === root (เก็บซ้ำเพื่อ semantic clarity ตอน worktree remove)
 }
 
-const zenseDir = (cwd: string) => join(cwd, ".pi", "zense");
+const zenseDir = (cwd: string) => join(cwd, ".zense");
 
 /** shell-quote แบบ single-quote สำหรับ path ที่อาจมี space/special char */
 const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -86,7 +86,7 @@ const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 /**
  * Remap path ที่ agent ขอ (relative ต่อ session cwd = main repo) ไปเป็น path ใต้ worktree root
  * โดย relative structure เดิม. path นอก repo (เช่น pi docs ใน node_modules) และ path ใต้
- * .pi/zense/ (harness state ที่ต้องอยู่ใน main) คืนค่าเดิม — ไม่ redirect.
+ * .zense/ (harness state ที่ต้องอยู่ใน main) คืนค่าเดิม — ไม่ redirect.
  * Pure function → unit-test ได้ (export เผื่อ test ใช้โดยตรง).
  */
 export const rewritePathForWorktree = (cwd: string, wtRoot: string, path: string): string => {
@@ -94,7 +94,7 @@ export const rewritePathForWorktree = (cwd: string, wtRoot: string, path: string
 	const abs = resolve(cwd, path);
 	const rel = relative(cwd, abs).split(sep).join("/");
 	if (!rel || rel.startsWith("..")) return path;           // นอก repo → ไม่ redirect
-	if (rel === ".pi/zense" || rel.startsWith(".pi/zense/")) return path; // harness state อยู่ main
+	if (rel === ".zense" || rel.startsWith(".zense/")) return path; // harness state อยู่ main
 	return join(wtRoot, rel);
 };
 
@@ -116,7 +116,7 @@ export const gitOk = (args: string[], cwd: string): { ok: boolean; out: string; 
 };
 
 /** สร้าง git worktree ของ session นี้ที่ spec approval (phase → implementation).
- *  worktree อยู่ใต้ <repo>/.pi/zense/worktree/ (nested ใน main working tree — git รองรับ)
+ *  worktree อยู่ใต้ <repo>/.zense/worktree/ (nested ใน main working tree — git รองรับ)
  *  เพื่อให้ state ของ zense รวมอยู่ใน workspace ที่เดียว ไม่รก parent dir. best-effort:
  *  ล้มเหลว (ไม่ใช่ git repo / ชื่อซ้ำ) → คืน null (caller degrade กลับทำงานใน main ตามปกติ ไม่พัง). */
 export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
@@ -128,7 +128,7 @@ export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	if (gitOk(["worktree", "add", wtRoot, "-b", branch], cwd).ok !== true) return null;
 	excludeFromGitStatus(cwd, wtParent);
 	// copy current spec + memory เข้า worktree ให้ bash-based read ในนั่นเห็น state ปัจจุบัน (ไม่ใช่ตอน checkout)
-	const wtZense = join(wtRoot, ".pi", "zense");
+	const wtZense = join(wtRoot, ".zense");
 	mkdirSync(wtZense, { recursive: true });
 	for (const f of ["spec.json", "spec.md", "memory.jsonl"]) {
 		const src = join(zenseDir(cwd), f);
@@ -137,7 +137,7 @@ export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	return { root: wtRoot, branch, dir: wtRoot };
 };
 
-/** cursor ใต้ repo ที่ zense สร้าง (เช่น .pi/zense/worktree/) ไม่ควรโผล่ใน git status ของ main —
+/** cursor ใต้ repo ที่ zense สร้าง (เช่น .zense/worktree/) ไม่ควรโผล่ใน git status ของ main —
  *  best-effort append ลง .git/info/exclude (local-only ไม่แตะไฟล์ tracked ของผู้ใช้). ล้มเหลว → ข้ามเงียบๆ */
 const excludeFromGitStatus = (cwd: string, absPath: string): void => {
 	try {
@@ -162,13 +162,13 @@ const excludeFromGitStatus = (cwd: string, absPath: string): void => {
  *  conflict (เช่นอีก session merge ชน) → ไม่ force, คืน {ok:false,conflict:true} ให้ caller escalate.
  *  success → cleanup worktree + branch ด้วย */
 export const mergeWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): { ok: boolean; conflict?: boolean; msg: string } => {
-	// 1. stage changes ใน worktree (ยกเว้น .pi/zense) แล้ว commit ถ้ามี — รวม untracked files ด้วย
+	// 1. stage changes ใน worktree (ยกเว้น .zense) แล้ว commit ถ้ามี — รวม untracked files ด้วย
 	//    (git diff --quiet HEAD ไม่เห็น untracked → ต้อง add ก่อนแล้วเช็ค --cached)
-	gitOk(["add", "-A", "--", ".", ":!.pi/zense"], wt.root);
+	gitOk(["add", "-A", "--", ".", ":!.zense"], wt.root);
 	if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
 		gitOk(["commit", "-m", `zense: impl v${spec.version} (eval PASS)`, "--no-verify"], wt.root);
 	}
-	// 2. merge เข้า main (main อาจมี uncommitted .pi/zense/ — disjoint กับ source changes → git อนุญาต)
+	// 2. merge เข้า main (main อาจมี uncommitted .zense/ — disjoint กับ source changes → git อนุญาต)
 	if (!gitOk(["merge", "--no-ff", wt.branch, "-m", `zense: merge impl v${spec.version} (eval PASS)`], cwd).ok) {
 		gitOk(["merge", "--abort"], cwd);
 		return { ok: false, conflict: true, msg: `merge conflict — แก้ด้วยมือ: cd ${wt.root} แล้ว resolve/commit ใน branch ${wt.branch}; จากนั้น git merge ${wt.branch}` };
@@ -294,7 +294,7 @@ export const jaccard = (a: Set<string>, b: Set<string>): number => {
 	return inter / (a.size + b.size - inter);
 };
 
-/** G: กัน spec ซ้ำ — scan archive .pi/zense/specs/*.json (ล่าสุด 20 อัน) เทียบ token ของ
+/** G: กัน spec ซ้ำ — scan archive .zense/specs/*.json (ล่าสุด 20 อัน) เทียบ token ของ
  *  title+intent; Jaccard ≥ 0.5 ถือว่า "คล้าย" (threshold หลวมพอจับ paraphrase แต่ไม่ชนงานต่างกัน) */
 export const findSimilarSpec = (cwd: string, draft: SpecDraft): { file: string; title: string; score: number } | null => {
 	const dir = join(zenseDir(cwd), "specs");
@@ -867,7 +867,7 @@ export const memorySummaryLines = (cwd: string): string[] => {
 // ----------------------------------------------------------------------------- sub-agent model config (per-role)
 
 /**
- * อ่าน .pi/zense/models.json — map role → pi --model pattern (เช่น "anthropic/claude-sonnet",
+ * อ่าน .zense/models.json — map role → pi --model pattern (เช่น "anthropic/claude-sonnet",
  * "openai/gpt-4o-mini", "sonnet:high"). ไม่มีไฟล์/parse ไม่ได้ → {} (ใช้ model ของ agent หลักแทน).
  */
 export const readModelsConfig = (cwd: string): Record<string, string> => {
@@ -887,7 +887,7 @@ export const readModelsConfig = (cwd: string): Record<string, string> => {
 };
 
 /**
- * Resolve model pattern สำหรับ role ตามลำดับ: .pi/zense/models.json[role] →
+ * Resolve model pattern สำหรับ role ตามลำดับ: .zense/models.json[role] →
  * ctx.model (provider/id ของ agent หลัก) → undefined (ปล่อย pi ใช้ default).
  * undefined จะทำให้ runSubagent ไม่ส่ง --model ไป
  */
@@ -900,7 +900,7 @@ export const resolveModelPattern = (cwd: string, role: string, mainModel?: { pro
 };
 
 /**
- * เขียน/ลบ model override ของ role หนึ่งใน .pi/zense/models.json — สร้าง dir ให้ถ้ายังไม่มี,
+ * เขียน/ลบ model override ของ role หนึ่งใน .zense/models.json — สร้าง dir ให้ถ้ายังไม่มี,
  * คง key อื่นของไฟล์เดิมไว้ (อ่าน raw เอง เพราะ readModelsConfig ตัดค่าที่ไม่ใช่ string ทิ้ง)
  */
 export const writeModelsConfig = (cwd: string, role: string, pattern: string | null): void => {
@@ -977,6 +977,7 @@ export default function (pi: ExtensionAPI) {
 		for (const e of ctx.sessionManager.getEntries())
 			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
+		lastWidget = undefined; // pi ล้าง widget ตอน session switch/reload → ต้องส่งใหม่แม้ข้อความเดิม
 		updateWidget(ctx);
 	});
 
@@ -985,18 +986,26 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
+	/** cache ข้อความ widget ล่าสุดที่ส่งจริง — setWidget สร้าง Text/Container ใหม่ทุกครั้ง
+	 *  แม้เนื้อหาเหมือนเดิม ทำให้ dock ใต้ transcript relayout ซ้ำๆ ตอน sub-agent รัน (tick 2s
+	 *  + hook ต่างๆ เรียก updateWidget ถี่) → view กระตุก/เด้ง. dedupe ที่ระดับ string:
+	 *  ส่ง setWidget เฉพาะตอนข้อความเปลี่ยนจริงเท่านั้น (fields ยังครบเหมือนเดิม ไม่ truncate). */
+	let lastWidget: string | undefined;
+
 	const updateWidget = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
 		const s = state.spec;
 		const run = activeRun();
-		ctx.ui.setWidget("zense", [
+		const line =
 			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
-				` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
-				(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (alt+z ดูสด)` : "") +
-				(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
-				(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
-				(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : ""),
-		]);
+			` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
+			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (alt+z ดูสด)` : "") +
+			(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
+			(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
+			(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : "");
+		if (line === lastWidget) return; // เนื้อหาเดิม → ไม่ rebuild component (กัน dock relayout)
+		lastWidget = line;
+		ctx.ui.setWidget("zense", [line]);
 	};
 
 	/** redirect tool call ของ main agent เข้า worktree (mutate event.input) — ทำให้ agent
@@ -1014,7 +1023,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** launch wrapper: ลงทะเบียน run (widget แสดงสด) + เขียน log live ทุก chunk
-	 *  model ของ sub-agent: resolve ตาม role จาก .pi/zense/models.json, ถ้าไม่มี entry ใช้ model
+	 *  model ของ sub-agent: resolve ตาม role จาก .zense/models.json, ถ้าไม่มี entry ใช้ model
 	 *  ปัจจุบันของ agent หลัก (ctx.model), ถ้าไม่มีอีก ปล่อย pi ใช้ default (ไม่ส่ง --model) */
 	const launchSubagent = async (
 		ctx: ExtensionContext,
@@ -1073,7 +1082,7 @@ export default function (pi: ExtensionAPI) {
 				]);
 			} else {
 				choice = await ctx.ui.select(
-					`Zense gate: ${ev.toolName} จะเขียนโค้ดทั้งที่ spec ยังไม่ได้เซ็น${s ? ` (v${s.version}: ${s.title} — อ่านเต็มที่ .pi/zense/spec.md)` : " (ยังไม่มี spec)"}`,
+					`Zense gate: ${ev.toolName} จะเขียนโค้ดทั้งที่ spec ยังไม่ได้เซ็น${s ? ` (v${s.version}: ${s.title} — อ่านเต็มที่ .zense/spec.md)` : " (ยังไม่มี spec)"}`,
 					[
 						...(s ? ["🔏 เซ็นอนุมัติ spec แล้วทำงานต่อ"] : []),
 						"⚠️ อนุญาตรอบนี้รอบเดียว (override โดยไม่เซ็น)",
@@ -1438,7 +1447,7 @@ export default function (pi: ExtensionAPI) {
 		};
 		state.specSource = source; // H: จำที่มาของ spec — ใช้ telemetry ตอน gate override
 		// Specs are append-only: every version gets a unique timestamped file in
-		// .pi/zense/specs/ so any past spec can be re-read. spec.{json,md} stay as
+		// .zense/specs/ so any past spec can be re-read. spec.{json,md} stay as
 		// always-latest convenience copies.
 		mkdirSync(zenseDir(ctx.cwd), { recursive: true });
 		const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-"); // YYYY-MM-DD-HH-mm-ss
@@ -1467,7 +1476,7 @@ export default function (pi: ExtensionAPI) {
 			if (signed) approveCurrentSpec(ctx);
 		} else if (ctx.hasUI) {
 			const choice = await ctx.ui.select(
-				`🔏 เซ็น Spec v${version}: ${state.spec.title}? (อ่านเต็มที่ .pi/zense/spec.md)`,
+				`🔏 เซ็น Spec v${version}: ${state.spec.title}? (อ่านเต็มที่ .zense/spec.md)`,
 				[
 					"🔏 เซ็นอนุมัติ — เปิด implementation gate",
 					"✏️ ยังไม่เซ็น (จะแก้ spec ก่อน / เซ็นทีหลังด้วย /zense approve)",
@@ -1581,7 +1590,7 @@ export default function (pi: ExtensionAPI) {
 						? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
 						: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 					return {
-						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .pi/zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` }],
+						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` }],
 						details: { version: r.version, approved: r.signed, clarifyRounds, qualityGate: gated.notes, logPath: draft.logPath },
 					};
 				}
@@ -1593,7 +1602,7 @@ export default function (pi: ExtensionAPI) {
 				? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
 				: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 			return {
-				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .pi/zense/spec.{json,md}). ${verb}.` }],
+				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.` }],
 				details: { version: r.version, approved: r.signed },
 			};
 		},
@@ -1842,7 +1851,7 @@ export default function (pi: ExtensionAPI) {
 					]);
 					if (choice === "sign") approveCurrentSpec(ctx);
 				} else {
-					const ok = await ctx.ui.confirm("🔏 เซ็น approve spec?", `${state.spec.title} v${state.spec.version}\nIntent: ${state.spec.intent.slice(0, 300)}\n(อ่านเต็มที่ .pi/zense/spec.md)`);
+					const ok = await ctx.ui.confirm("🔏 เซ็น approve spec?", `${state.spec.title} v${state.spec.version}\nIntent: ${state.spec.intent.slice(0, 300)}\n(อ่านเต็มที่ .zense/spec.md)`);
 					if (ok) approveCurrentSpec(ctx);
 				}
 			} else if (sub === "gate") {
@@ -1864,7 +1873,7 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 			} else if (sub === "models") {
-				// ดู/ตั้ง model ของ sub-agent แยกตาม role (.pi/zense/models.json)
+				// ดู/ตั้ง model ของ sub-agent แยกตาม role (.zense/models.json)
 				const cfgPath = join(zenseDir(ctx.cwd), "models.json");
 				const cfg = readModelsConfig(ctx.cwd);
 				const mainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no active model)";
@@ -1872,10 +1881,10 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.mode !== "tui") {
 					// non-TUI (rpc/print): แสดง summary ให้แก้เองเหมือนเดิม
 					const lines = [
-						`🧪 sub-agent models — config: ${existsSync(cfgPath) ? relative(ctx.cwd, cfgPath) : "(no .pi/zense/models.json — ทุก role ใช้ model หลัก)"}`,
+						`🧪 sub-agent models — config: ${existsSync(cfgPath) ? relative(ctx.cwd, cfgPath) : "(no .zense/models.json — ทุก role ใช้ model หลัก)"}`,
 						`agent หลัก: ${mainModel}`,
 						...roles.map((r) => `  ${r}: ${cfg[r] ? cfg[r] + " (จาก config)" : mainModel + " (fallback)"}`),
-						"แก้ไขโดยสร้าง .pi/zense/models.json เช่น { \"grader\": \"openai/gpt-4o-mini\" } — หรือเปิด TUI แล้ว /zense models เพื่อเลือกแบบ interactive",
+						"แก้ไขโดยสร้าง .zense/models.json เช่น { \"grader\": \"openai/gpt-4o-mini\" } — หรือเปิด TUI แล้ว /zense models เพื่อเลือกแบบ interactive",
 					];
 					ctx.ui.notify(lines.join("\n"), "info");
 					return;

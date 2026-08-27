@@ -31,9 +31,9 @@ test("rewritePathForWorktree: relative ออกนอก repo (../) → ไม�
 	assert.ok(!out.startsWith("/r/sub-wt"), `expected not under wtRoot, got ${out}`);
 });
 
-test("rewritePathForWorktree: path ใต้ .pi/zense/ → คืนเดิม (harness state อยู่ main)", () => {
-	assert.equal(rewritePathForWorktree("/r", "/r-wt", ".pi/zense/spec.md"), ".pi/zense/spec.md");
-	assert.equal(rewritePathForWorktree("/r", "/r-wt", "/r/.pi/zense/memory.jsonl"), "/r/.pi/zense/memory.jsonl");
+test("rewritePathForWorktree: path ใต้ .zense/ → คืนเดิม (harness state อยู่ main)", () => {
+	assert.equal(rewritePathForWorktree("/r", "/r-wt", ".zense/spec.md"), ".zense/spec.md");
+	assert.equal(rewritePathForWorktree("/r", "/r-wt", "/r/.zense/memory.jsonl"), "/r/.zense/memory.jsonl");
 });
 
 test("buildWorktreeCommand: นำหน้าด้วย cd <wtRoot> && (path มี space ก็ quote ด้วย single-quote)", () => {
@@ -55,8 +55,8 @@ const makeRepo = () => {
 	git(["config", "user.email", "t@t"]);
 	git(["config", "user.name", "t"]);
 	writeFileSync(join(cwd, "README.md"), "# init\n");
-	mkdirSync(join(cwd, ".pi", "zense"), { recursive: true });
-	writeFileSync(join(cwd, ".pi", "zense", "x"), "x"); // placeholder
+	mkdirSync(join(cwd, ".zense"), { recursive: true });
+	writeFileSync(join(cwd, ".zense", "x"), "x"); // placeholder
 	git(["add", "-A"]);
 	git(["commit", "-q", "-m", "init"]);
 	return { cwd, base, git };
@@ -71,19 +71,19 @@ test("gitOk: returns ok=false ใน dir ที่ไม่ใช่ git repo", 
 
 test("createWorktree: สร้าง worktree + branch zense/impl/* + copy spec.json เข้าไป", () => {
 	const { cwd, base, git } = makeRepo();
-	writeFileSync(join(cwd, ".pi", "zense", "spec.json"), '{"version":1}');
+	writeFileSync(join(cwd, ".zense", "spec.json"), '{"version":1}');
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt, "worktree should be created");
 	assert.ok(wt.branch.startsWith("zense/impl/v1-"), `branch=${wt.branch}`);
-	// worktree ต้องอยู่ nested ใต้ <repo>/.pi/zense/worktree/ (ไม่ใช่ sibling dir ข้าง repo)
+	// worktree ต้องอยู่ nested ใต้ <repo>/.zense/worktree/ (ไม่ใช่ sibling dir ข้าง repo)
 	assert.equal(
-		join(cwd, ".pi", "zense", "worktree"),
+		join(cwd, ".zense", "worktree"),
 		dirname(wt.root),
-		`worktree parent should be .pi/zense/worktree, got ${wt.root}`,
+		`worktree parent should be .zense/worktree, got ${wt.root}`,
 	);
 	assert.ok(basename(wt.root).startsWith("repo-wt-"), `wt name keeps repo basename: ${wt.root}`);
 	assert.ok(existsSync(join(wt.root, "README.md")), "worktree has checked-out file");
-	assert.ok(existsSync(join(wt.root, ".pi", "zense", "spec.json")), "spec.json copied into worktree");
+	assert.ok(existsSync(join(wt.root, ".zense", "spec.json")), "spec.json copied into worktree");
 	const list = git(["worktree", "list"]);
 	assert.ok(list.includes(wt.root), "worktree listed by git");
 	rmSync(base, { recursive: true, force: true });
@@ -96,7 +96,7 @@ test("createWorktree: main repo git status สะอาดหลังสร้�
 	assert.equal(git(["status", "--porcelain"]).trim(), "", "main git status should be clean");
 	// exclude ไปอยู่ใน local .git/info/exclude ไม่แตะไฟล์ tracked
 	const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
-	assert.ok(exclude.includes("/.pi/zense/worktree/"), `exclude has worktree path: ${exclude}`);
+	assert.ok(exclude.includes("/.zense/worktree/"), `exclude has worktree path: ${exclude}`);
 	rmSync(base, { recursive: true, force: true });
 });
 
@@ -146,20 +146,20 @@ test("mergeWorktreeBack: conflict (อีก session แก้ไฟล์เด
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: ไม่มี .pi/zense changes ใน merge (harness state ไม่ตามเข้า main)", () => {
+test("mergeWorktreeBack: ไม่มี .zense changes ใน merge (harness state ไม่ตามเข้า main)", () => {
 	const { cwd, base, git } = makeRepo();
-	// สร้าง .pi/zense/spec.md tracked ใน main ก่อน (commit)
-	mkdirSync(join(cwd, ".pi", "zense"), { recursive: true });
-	writeFileSync(join(cwd, ".pi", "zense", "spec.md"), "# old\n");
+	// สร้าง .zense/spec.md tracked ใน main ก่อน (commit)
+	mkdirSync(join(cwd, ".zense"), { recursive: true });
+	writeFileSync(join(cwd, ".zense", "spec.md"), "# old\n");
 	git(["add", "-A"]);
 	git(["commit", "-q", "-m", "add spec"]);
 	const wt = createWorktree(cwd, SPEC);
-	// แก้ source ใน worktree + แก้ .pi/zense ใน worktree (จะถูก exclude จาก commit)
+	// แก้ source ใน worktree + แก้ .zense ใน worktree (จะถูก exclude จาก commit)
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
-	writeFileSync(join(wt.root, ".pi", "zense", "spec.md"), "# new\n");
+	writeFileSync(join(wt.root, ".zense", "spec.md"), "# new\n");
 	const mr = mergeWorktreeBack(cwd, SPEC, wt);
 	assert.equal(mr.ok, true);
 	// main spec.md ยังเป็นของเดิม (ไม่ถูกลาก)
-	assert.equal(readFileSync(join(cwd, ".pi", "zense", "spec.md"), "utf8"), "# old\n");
+	assert.equal(readFileSync(join(cwd, ".zense", "spec.md"), "utf8"), "# old\n");
 	rmSync(base, { recursive: true, force: true });
 });

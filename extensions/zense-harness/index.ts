@@ -140,6 +140,12 @@ export const gitOk = (args: string[], cwd: string): { ok: boolean; out: string; 
  *  worktree อยู่ใต้ <repo>/.zense/worktree/ (nested ใน main working tree — git รองรับ)
  *  เพื่อให้ state ของ zense รวมอยู่ใน workspace ที่เดียว ไม่รก parent dir. best-effort:
  *  ล้มเหลว (ไม่ใช่ git repo / ชื่อซ้ำ) → คืน null (caller degrade กลับทำงานใน main ตามปกติ ไม่พัง). */
+/** worktree เดิมเอามาใช้ต่อได้ไหม: มี record และ root ยังอยู่บนดิสก์ (user อาจลบ worktree ทิ้งเอง
+ *  ระหว่าง session → false = สร้างใหม่). กันเคส bump spec version แล้วเซ็นใหม่กลาง implement:
+ *  เดิมสร้าง worktree เปล่าจาก main ทุกครั้ง → งานที่ implement ค้างไว้ใน worktree เก่ากลายเป็น orphan
+ *  (eval รอบถัดไปรันกับ worktree เปล่าแล้ว FAIL ทั้งที่ทำเสร็จแล้ว — เจอจริงรอบ v3→v4) */
+export const canReuseWorktree = (wt: Worktree | null | undefined): boolean => !!wt && existsSync(wt.root);
+
 export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 	const branch = `zense/impl/v${spec.version}-${stamp}`;
@@ -1564,13 +1570,19 @@ export default function (pi: ExtensionAPI) {
 		state.phase = "implementation";
 		// auto worktree-per-session: สร้าง worktree ของ session นี้ตอนเริ่ม implementation
 		// (ก่อนหน้านี้ไม่มี source write เพราะ gate กั้น) → redirect ทุก tool call เข้า worktree จนกว่า eval PASS
-		const wt = createWorktree(ctx.cwd, state.spec);
-		if (wt) {
-			state.worktree = wt;
-			state.worktreeLeaveNotified = false;
-			learn(ctx, `worktree created: ${wt.branch} @ ${wt.root}`);
+		// reuse ของเดิมถ้ายังอยู่: เซ็น spec version ใหม่กลาง implement ต้องไม่ทำให้งานค้างใน worktree เก่าหลุด
+		// (branch name จะติดเลข version เก่า — cosmetic เท่านั้น merge message ใช้ spec.version ปัจจุบันอยู่แล้ว)
+		if (canReuseWorktree(state.worktree)) {
+			learn(ctx, `worktree reused: ${state.worktree!.branch} สำหรับ spec v${state.spec.version}`);
 		} else {
-			ctx.ui.notify(`🌳 worktree สร้างไม่ได้ — ทำงานใน main ตามปกติ (ไม่มี isolation ระหว่าง session)`, "warning");
+			const wt = createWorktree(ctx.cwd, state.spec);
+			if (wt) {
+				state.worktree = wt;
+				state.worktreeLeaveNotified = false;
+				learn(ctx, `worktree created: ${wt.branch} @ ${wt.root}`);
+			} else {
+				ctx.ui.notify(`🌳 worktree สร้างไม่ได้ — ทำงานใน main ตามปกติ (ไม่มี isolation ระหว่าง session)`, "warning");
+			}
 		}
 		learn(ctx, `signed spec v${state.spec.version}`);
 		persist();

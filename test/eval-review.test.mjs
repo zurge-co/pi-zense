@@ -242,3 +242,17 @@ test("applyQualityGate: scope pointing at a non-existent path is caught (gate wo
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("canReuseWorktree: null/missing-dir → false, existing dir → true (กัน spec bump ทำงานค้างหลุดเป็น orphan)", async () => {
+	const { canReuseWorktree } = await import("../extensions/zense-harness/index.ts");
+	assert.equal(canReuseWorktree(null), false);
+	assert.equal(canReuseWorktree(undefined), false);
+	assert.equal(canReuseWorktree({ root: "/nonexistent-zense-wt-xyz-123", branch: "zense/impl/v1-x", dir: "/nonexistent-zense-wt-xyz-123" }), false);
+	const dir = mkdtempSync(join(tmpdir(), "zense-reuse-"));
+	try {
+		// reuse = เงื่อนไขเดียวที่เปลี่ยนคือ dir อยู่จริง — branch/dir metadata เดิมต้องไม่ถูกแตะ
+		assert.equal(canReuseWorktree({ root: dir, branch: "zense/impl/v3-old", dir }), true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

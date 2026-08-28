@@ -100,6 +100,15 @@ test("createWorktree: main repo git status สะอาดหลังสร้�
 	rmSync(base, { recursive: true, force: true });
 });
 
+test("createWorktree: captures baseline ref (main HEAD before branch)", () => {
+	const { cwd, base, git } = makeRepo();
+	const headBefore = git(["rev-parse", "HEAD"]).trim();
+	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt, "worktree should be created");
+	assert.equal(wt.baseline, headBefore, "baseline = main HEAD ณ ตอนก่อนสร้าง branch");
+	rmSync(base, { recursive: true, force: true });
+});
+
 test("createWorktree: ใน dir ที่ไม่ใช่ git repo → คืน null ไม่ throw", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-nogit2-"));
 	const wt = createWorktree(base, SPEC);

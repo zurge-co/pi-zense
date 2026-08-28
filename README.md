@@ -29,9 +29,19 @@ Enable the theme: `/settings` → theme → `zense`, or set
 | **Gate** — never implement on unsigned spec | `tool_call` interceptor stops `write`/`edit` with a **3-choice signing dialog that renders the full spec inline** (Ctrl+D/U/F/B to read before deciding: 🔏 sign & continue / ⚠ one-off override / ⛔ block) | hard gate + dialog signature |
 | **2. Design** — ADRs prevent architectural drift | `zense_adr` tool; `DENY: <path>` rules enforced live on every write; irreversible ADRs flagged for human approval | `.zense/adr/NNN-*.md` |
 | **3. Implementation** — escalation taxonomy | turn/token usage meter; escalation taxonomy: need-permission / need-decision / something-wrong; **auto worktree-per-session**: on spec approval the harness creates a dedicated `git worktree` for this session and transparently redirects every tool call (`write`/`edit`/`read`/`bash`) into it — so two pi sessions opened in the same repo never clobber each other's working tree | live widget meter (shows `🌳 <worktree>` when active) |
-| **4. Dual eval** — output *and* trajectory | `zense_eval` → grader sub-agent judges each criterion PASS/FAIL (closes spec→eval loop); grader/reviewer **run inside the active worktree** so they test the real changes; **sub-agent output streams live into the transcript while it runs** — watch it anytime via `alt+z` / `/zense agents` (live tail of `.zense/subagents/*.log`); on **eval PASS** the worktree is auto-committed and merged back into `main` (`git merge --no-ff`) and cleaned up — if another session already merged conflicting changes, the merge escalates instead of clobbering; `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
+| **4. Dual eval** — output *and* trajectory | `zense_eval` → the harness first runs each criterion's `check` itself as a **deterministic probe** (see *Spec criteria check forms* below), then the grader sub-agent judges each criterion PASS/FAIL against that evidence — a failing probe overrides the grader (**probe primacy**); grader/reviewer **run inside the active worktree** so they test the real changes; **sub-agent output streams live into the transcript while it runs** — watch it anytime via `alt+z` / `/zense agents` (live tail of `.zense/subagents/*.log`); on **eval PASS** the worktree is auto-committed and merged back into `main` (`git merge --no-ff`) and cleaned up — if another session already merged conflicting changes, the merge escalates instead of clobbering; `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
 | **5. Review** — exception-based, not wall-of-diff | `zense_review` → reviewer sub-agent builds an incident-report-style **review packet** rendered as a transcript card (TL;DR first) | review packet card |
 | **6. Maintenance** — learn every run | every escalation/flag/signing/eval-verdict/sub-agent-failure appended to `.zense/memory.jsonl`; lessons are **fed back into `compile_spec`** so new specs reflect past incidents | `/zense memory` (grouped summary; `/zense memory json` = raw) |
+
+### Spec criteria check forms (what the harness probe can run itself)
+
+Each `criteria[].check` is executed by the harness **before** grading, and a failing probe marks that criterion FAIL no matter what the grader says. Supported forms:
+
+- **`path exists: <p>`** (or `file exists: <p>`) — resolved in-process against the repo/worktree
+- **any shell command** — run verbatim via `sh -c` (e.g. `npm test`, `node --test test/x.mjs`)
+- **compounds joined with `&&`** mixing both — e.g. `path exists: src/a.ts && path exists: src/b.ts && npm test`; every segment must pass (path segments resolve in-process, the rest run via `sh -c`)
+
+Anything that isn't machine-runnable (e.g. "manual visual QA") is **skipped**, not guessed — the criterion becomes forced human review (spec debt). Tip: shell-only checks are run verbatim, so a literal `"&&"` inside quotes is *not* split.
 
 ### Human actions (by design: minimal)
 

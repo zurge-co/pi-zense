@@ -62,6 +62,41 @@ test("runCheckProbes: path-exists resolved in-process, runnable checks execute, 
 	}
 });
 
+test("runCheckProbes: compound checks (path exists && shell / && path exists) are evaluated per segment, all must pass", () => {
+	const dir = mkdtempSync(join(tmpdir(), "zense-probe-compound-"));
+	try {
+		writeFileSync(join(dir, "here.txt"), "x");
+		writeFileSync(join(dir, "two.txt"), "y");
+		const probes = runCheckProbes(dir, [
+			// exists ล้วน (หลาย path) — pass ได้ทุก an / fail ถ้าขาดสักตัว เดิมหน้า regex anchored ไม่จับ compound นี้เลย
+			{ id: "c1", text: "two files", check: "path exists: here.txt && path exists: two.txt" },
+			{ id: "c2", text: "missing one", check: "path exists: here.txt && path exists: nope.txt" },
+			// ปน shell — เดิมหลุดไป sh -c ทั้งก้อน → "path" ไม่ใช่คำสั่ง → exit 127 false-FAIL
+			{ id: "c3", text: "exists + shell pass", check: "path exists: here.txt && node --version" },
+			{ id: "c4", text: "exists missing + shell pass", check: "path exists: nope.txt && node --version" },
+			{ id: "c5", text: "exists ok + shell fail", check: 'node --version && path exists: here.txt && node -e "process.exit(3)"' },
+			// shell segment ที่เครื่องมือตัดสินไม่ได้ปนอยู่ใน compound → skipped ทั้ง criterion (ไม่เดา)
+			{ id: "c6", text: "unrunnable segment", check: "path exists: here.txt && manual visual QA" },
+		]);
+		assert.deepEqual(probes.map((p) => p.status), ["pass", "fail", "pass", "fail", "fail", "skipped"]);
+		assert.match(probes[1].detail, /not found: nope\.txt/);
+		assert.match(probes[2].detail, /exists: here\.txt/);
+		assert.match(probes[3].detail, /not found: nope\.txt/);
+		assert.equal(probes[4].exitCode, 3);
+		assert.match(probes[5].detail, /not machine-runnable/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("runCheckProbes: shell-only check containing quoted '&&' is NOT split (runs verbatim)", () => {
+	const probes = runCheckProbes(tmpdir(), [
+		{ id: "q1", text: "quoted && literal", check: 'test "$(echo \'a && b\')" = "a && b"' },
+		{ id: "q2", text: "normal && chain", check: "node --version && echo ok" },
+	]);
+	assert.deepEqual(probes.map((p) => p.status), ["pass", "pass"]);
+});
+
 test("SUBAGENT_EXCLUDE_TOOLS: grader and reviewer are read-only like requirements", () => {
 	for (const role of ["requirements", "grader", "reviewer"]) assert.deepEqual(SUBAGENT_EXCLUDE_TOOLS[role], ["write", "edit"]);
 	assert.equal(SUBAGENT_EXCLUDE_TOOLS["unknown-role"], undefined);

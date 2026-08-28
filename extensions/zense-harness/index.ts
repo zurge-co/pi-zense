@@ -404,7 +404,7 @@ export const buildRequirementsPrompt = (intent: string, lessons: string[], facts
 {"title": string, "intent": string, "scope": string[], "constraints": string[], "criteria": [{"id": string, "text": string, "check": string}], "specDebt": string[]}
 Rules:
 - scope: the minimal list of path prefixes the main agent may modify.
-- criteria: few and atomic. Each "check" MUST be an executable command verified in Step 1 (e.g. "npm test") or "path exists: <p>". Anything you cannot verify by running a command belongs in specDebt instead (it becomes forced human review).
+- criteria: few and atomic. Each "check" MUST be an executable command verified in Step 1 (e.g. "npm test"), "path exists: <p>", or a compound of those joined with "&&" (e.g. "path exists: src/a.ts && npm test"). Anything you cannot verify by running a command belongs in specDebt instead (it becomes forced human review).
 - Output ONLY the JSON object — no markdown fences, no commentary.
 
 ` +
@@ -513,35 +513,90 @@ export interface ProbeResult {
 
 const PROBE_TIMEOUT_MS = 30_000; // กัน check ค้าง (server รอ port ฯลฯ) ลาก eval ไปด้วย
 
+type CheckSegment = { kind: "exists"; path: string } | { kind: "shell"; command: string };
+
+const PATH_EXISTS_SEG_RE = /^\s*(?:path|file)\s+exists:\s*(.+?)\s*$/i;
+
+/** แยก compound check ("path exists: a && npm test") ที่หัว "&&" ออกเป็น segment — คืน null ถ้า
+ *  ไม่มี segment แบบ path-exists เลย (check ล้วน shell อาจมี "&&" ใน string literal เช่น
+ *  grep -q "a && b" → split มั่วแล้วคำสั่งพัง เลยคงพฤติกรรม sh -c ทั้งก้อนไว้เหมือนเดิม) */
+const splitCompoundCheck = (check: string): CheckSegment[] | null => {
+	const parsed: CheckSegment[] = check.split(/\s*&&\s*/).map((seg) => {
+		const m = seg.match(PATH_EXISTS_SEG_RE);
+		return m ? { kind: "exists", path: m[1] } : { kind: "shell", command: seg.trim() };
+	});
+	return parsed.some((s) => s.kind === "exists") ? parsed : null;
+};
+
+/** รัน shell command เดียวใน cwd — คืน pass/exitCode/detail(stdout|stderr tail); exitCode undefined เมื่อ timeout/สัญญาณฆ่า */
+const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pass: boolean; exitCode?: number; detail: string } => {
+	try {
+		const out = execFileSync("sh", ["-c", command], { cwd, timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		return { pass: true, exitCode: 0, detail: (out || "").trim().split("\n").slice(-3).join("\n").slice(-300) || "(exit 0, no output)" };
+	} catch (e: unknown) {
+		const err = e as { status?: number; stdout?: string; stderr?: string };
+		const code = typeof err.status === "number" ? err.status : -1;
+		const tail = `${err.stdout ?? ""}\n${err.stderr ?? ""}`.trim().split("\n").slice(-3).join("\n").slice(-300);
+		return { pass: false, ...(code >= 0 ? { exitCode: code } : {}), detail: tail || `exit=${code}` };
+	}
+};
+
 /**
  * W3 (probe-first grading): harness รัน criteria[].check ด้วยตัวเองก่อนส่ง grader —
  * grader ไม่ต้องเดาว่าคำสั่งรันแล้วได้อะไร และ probe เป็นหลักฐานแข็งที่ทับ verdict ของ grader ได้
  * (probe fail ⇒ criterion FAIL ไม่ว่า grader จะว่าอย่างไร — ดู zense_eval)
- * รองรับ 2 รูปแบบ: "path exists: <p>" resolve ใน process เลย / อื่นๆ ที่ isMachineCheckable → sh -c
+ * รองรับ 3 รูปแบบ: "path exists: <p>" resolve ใน process เลย / เช่นเดียวกันกับ segment ของ compound
+ * ("path exists: a && npm test" — ทุก segment ต้องผ่าน) / check ล้วน shell ที่ isMachineCheckable → sh -c ทั้งก้อน
  */
 export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = PROBE_TIMEOUT_MS): ProbeResult[] =>
 	criteria.map((c) => {
-		const m = c.check.match(/^(?:path|file)\s+exists:\s*(.+)$/i);
-		if (m) {
-			const p = m[1].trim();
-			const ok = existsSync(resolve(cwd, p));
-			return { id: c.id, status: ok ? ("pass" as const) : ("fail" as const), detail: ok ? `exists: ${p}` : `not found: ${p}` };
-		}
-		if (!isMachineCheckable(c.check)) return { id: c.id, status: "skipped" as const, detail: "not machine-runnable (→ human review)" };
-		try {
-			const out = execFileSync("sh", ["-c", c.check], { cwd, timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		const segs = splitCompoundCheck(c.check);
+		if (segs?.every((s) => s.kind === "exists")) {
+			// path-exists ล้วน — resolve ใน process (single-path คงพฤติกรรมเดิมเป๊ะทั้ง status และ detail)
+			const missing: string[] = [];
+			for (const s of segs) if (s.kind === "exists" && !existsSync(resolve(cwd, s.path))) missing.push(s.path);
+			const ok = !missing.length;
 			return {
 				id: c.id,
-				status: "pass" as const,
-				exitCode: 0,
-				detail: (out || "").trim().split("\n").slice(-3).join("\n").slice(-300) || "(exit 0, no output)",
+				status: ok ? ("pass" as const) : ("fail" as const),
+				detail: ok ? `exists: ${segs.map((s) => s.path).join(", ")}` : `not found: ${missing.join(", ")}`,
 			};
-		} catch (e: unknown) {
-			const err = e as { status?: number; stdout?: string; stderr?: string };
-			const code = typeof err.status === "number" ? err.status : -1;
-			const tail = `${err.stdout ?? ""}\n${err.stderr ?? ""}`.trim().split("\n").slice(-3).join("\n").slice(-300);
-			return { id: c.id, status: "fail" as const, ...(code >= 0 ? { exitCode: code } : {}), detail: tail || `exit=${code}` };
 		}
+		if (segs) {
+			// compound ปน shell: ทุก segment ต้องรันได้จริง — มี shell segment ที่เครื่องมือตัดสินไม่ได้แม้แต่อันเดียว
+			// ก็ไม่เดารัน (อาจพังหรือ dangerous เพราะ split ผิด semantics) → skipped ให้มนุษย์ตรวจเองทั้ง criterion
+			const unrunnable = segs.find((s) => s.kind === "shell" && !isMachineCheckable(s.command));
+			if (unrunnable && unrunnable.kind === "shell")
+				return { id: c.id, status: "skipped" as const, detail: `segment not machine-runnable: ${unrunnable.command.slice(0, 80)} (→ human review)` };
+			const details: string[] = [];
+			for (const s of segs) {
+				if (s.kind === "exists") {
+					if (!existsSync(resolve(cwd, s.path)))
+						return { id: c.id, status: "fail" as const, detail: [...details, `not found: ${s.path}`].join("; ").slice(-600) };
+					details.push(`exists: ${s.path}`);
+				} else {
+					const r = runShellSegment(s.command, cwd, timeoutMs);
+					details.push(r.detail);
+					if (!r.pass)
+						return {
+							id: c.id,
+							status: "fail" as const,
+							...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
+							detail: details.join("; ").slice(-600),
+						};
+				}
+			}
+			return { id: c.id, status: "pass" as const, exitCode: 0, detail: details.join("; ").slice(-600) };
+		}
+		// shell-only check (อาจมี "&&" ใน literal) — พฤติกรรมเดิม: sh -c ทั้งก้อน / skip ถ้ารันอัตโนมัติไม่ได้
+		if (!isMachineCheckable(c.check)) return { id: c.id, status: "skipped" as const, detail: "not machine-runnable (→ human review)" };
+		const r = runShellSegment(c.check, cwd, timeoutMs);
+		return {
+			id: c.id,
+			status: r.pass ? ("pass" as const) : ("fail" as const),
+			...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
+			detail: r.detail,
+		};
 	});
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

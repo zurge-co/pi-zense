@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import {
 	buildRequirementsPrompt,
 	buildReviewerPrompt,
 	gatherRepoFacts,
+	gitChangeSummary,
 	loadSpecExemplar,
 	parseGraderOutput,
 	parseReviewerPacket,
@@ -209,6 +211,64 @@ test("buildReviewerPrompt: carries eval evidence + git + flags/debt, defines str
 	assert.match(p, /never write "to be implemented"/);
 	assert.match(p, /## Human actions/);
 	assert.match(buildReviewerPrompt("i", undefined, [], [], [], "", "Rollback"), /missing sections: Rollback/);
+});
+
+test("buildReviewerPrompt: stale lastEval (version/tree) is dropped and warned", () => {
+	const ev = {
+		verdict: "PASS",
+		perCriteria: { C1: "PASS" },
+		probes: [{ id: "C1", status: "pass", detail: "ok" }],
+		specVersion: 1,
+		head: "tree-aaa",
+	};
+	// spec version ไม่ตรง → stale: ตัด verdict/per-criteria/probe ทิ้ง + เตือน
+	const staleV = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 2, head: "tree-aaa" });
+	assert.doesNotMatch(staleV, /Eval verdict: PASS/);
+	assert.doesNotMatch(staleV, /C1=PASS/);
+	assert.doesNotMatch(staleV, /C1:pass/);
+	assert.match(staleV, /STALE eval evidence/);
+	// tree ไม่ตรง (แก้โค้ดหลัง eval) → stale เช่นกัน
+	const staleT = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 1, head: "tree-bbb" });
+	assert.doesNotMatch(staleT, /Eval verdict: PASS/);
+	assert.match(staleT, /STALE eval evidence/);
+	// fresh (version+tree ตรง) → render เหมือนเดิมทุกบรรทัด
+	const fresh = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 1, head: "tree-aaa" });
+	assert.match(fresh, /Eval verdict: PASS/);
+	assert.match(fresh, /C1=PASS/);
+	assert.match(fresh, /C1:pass/);
+	assert.doesNotMatch(fresh, /STALE/);
+});
+
+test("gitChangeSummary: baseline scopes log+diff to baseline..HEAD", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "zense-gitbase-"));
+	try {
+		const git = (args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		git(["init", "-q"]);
+		git(["config", "user.email", "t@t"]);
+		git(["config", "user.name", "t"]);
+		writeFileSync(join(cwd, "old-round-file.txt"), "old\n");
+		git(["add", "-A"]);
+		git(["commit", "-q", "-m", "old-round commit"]);
+		const baseline = git(["rev-parse", "HEAD"]).trim();
+		writeFileSync(join(cwd, "new-round-file.txt"), "new\n");
+		git(["add", "-A"]);
+		git(["commit", "-q", "-m", "current-round commit"]);
+		const scoped = gitChangeSummary(cwd, baseline);
+		assert.match(scoped, /current-round commit/); // เห็นเฉพาะ commit ของรอบนี้
+		assert.doesNotMatch(scoped, /old-round commit/); // commit ก่อน baseline ต้องไม่ปน
+		assert.match(scoped, /new-round-file\.txt/); // diffstat เทียบ baseline เห็นไฟล์ใหม่
+		assert.doesNotMatch(scoped, /old-round-file\.txt/);
+		// degrade: ไม่ส่ง baseline → behavior เดิม (log ทั้งประวัติ); baseline ใน dir ที่ไม่ใช่ repo → ไม่ throw
+		assert.match(gitChangeSummary(cwd), /old-round commit/);
+		const nonGit = mkdtempSync(join(tmpdir(), "zense-nogit-base-"));
+		try {
+			assert.equal(gitChangeSummary(nonGit, "deadbeef"), "");
+		} finally {
+			rmSync(nonGit, { recursive: true, force: true });
+		}
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
 });
 
 test("buildRequirementsPrompt: facts + exemplar spliced in, request stays last (backward compatible)", () => {

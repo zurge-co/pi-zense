@@ -56,7 +56,8 @@ interface State {
 	subagentRuns: SubagentRun[];
 	lastCompileLessons?: number;    // จำนวนบทเรียนจาก memory ที่ feed เข้า compile_spec ล่าสุด
 	specSource?: "set" | "compile"; // spec ปัจจุบันมาจาก agent เขียนเอง (set) หรือ sub-agent (compile) — ใช้ telemetry H
-	lastEval?: { verdict: string; perCriteria: Record<string, string>; failedIds: string[]; probes: ProbeResult[]; at: number }; // W2: evidence ล่าสุดจาก zense_eval → เป็น input ของ reviewer
+	lastEval?: { verdict: string; perCriteria: Record<string, string>; failedIds: string[]; probes: ProbeResult[]; at: number; specVersion?: number; head?: string }; // W2: evidence ล่าสุดจาก zense_eval → เป็น input ของ reviewer (specVersion+head ผูกกับรอบปัจจุบัน กัน evidence เก่าหลุดไปถึง reviewer)
+	baselineHead?: string;      // HEAD ของ main repo ตอน spec approval — ใช้ scope git evidence (log/diff เฉพาะตั้งแต่ baseline ของรอบนี้ ไม่ใช่ทั้งประวัติ)
 	specMdPath?: string;            // path ของ archive spec .md ของเวอร์ชันปัจจุบัน (zense_eval append ผลลัพธ์ที่นี่)
 	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
 	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
@@ -77,6 +78,7 @@ interface Worktree {
 	root: string;               // absolute path ของ worktree (nested ใต้ <repo>/.zense/worktree/)
 	branch: string;             // zense/impl/v<N>-<stamp>
 	dir: string;                // === root (เก็บซ้ำเพื่อ semantic clarity ตอน worktree remove)
+	baseline?: string;          // HEAD ของ main ก่อนสร้าง branch — กลายเป็น git-evidence baseline ของรอบนี้
 }
 
 const zenseDir = (cwd: string) => join(cwd, ".zense");
@@ -152,6 +154,7 @@ export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	const wtParent = join(zenseDir(cwd), "worktree");
 	const wtRoot = join(wtParent, `${basename(cwd)}-wt-${stamp}`);
 	mkdirSync(wtParent, { recursive: true });
+	const head = gitOk(["rev-parse", "HEAD"], cwd); // baseline ของรอบ = main HEAD ก่อน branch (ก่อน worktree add เสมอ)
 	if (gitOk(["worktree", "add", wtRoot, "-b", branch], cwd).ok !== true) return null;
 	excludeFromGitStatus(cwd, wtParent);
 	// copy current spec + memory เข้า worktree ให้ bash-based read ในนั่นเห็น state ปัจจุบัน (ไม่ใช่ตอน checkout)
@@ -161,7 +164,7 @@ export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 		const src = join(zenseDir(cwd), f);
 		if (existsSync(src)) copyFileSync(src, join(wtZense, f));
 	}
-	return { root: wtRoot, branch, dir: wtRoot };
+	return { root: wtRoot, branch, dir: wtRoot, ...(head.ok ? { baseline: head.out.trim() } : {}) };
 };
 
 /** cursor ใต้ repo ที่ zense สร้าง (เช่น .zense/worktree/) ไม่ควรโผล่ใน git status ของ main —
@@ -499,14 +502,20 @@ export const loadSpecExemplar = (cwd: string): string | null => {
 /** W2: สรุปสถานะ git ของ working dir ที่กำลัง eval/review (worktree หรือ main) — best-effort:
  *  ไม่ใช่ repo/คำสั่งล้มเหลว → เว้นส่วนนั้นไป. grader ใช้ดู diff จับ reward hacking,
  *  reviewer ใช้เป็น evidence pack. จำกัดความยาวทุกส่วนกัน prompt บวม */
-export const gitChangeSummary = (cwd: string): string => {
+export const gitChangeSummary = (cwd: string, baseline?: string): string => {
 	const parts: string[] = [];
-	const log = gitOk(["log", "--oneline", "-8"], cwd);
-	if (log.ok && log.out.trim()) parts.push(`recent commits:\n${log.out.trim()}`);
+	if (baseline) {
+		// ground เฉพาะรอบปัจจุบัน: log/diff เทียบ baseline ตอน spec approval — commit เก่าก่อนรอบนี้ไม่ปนเข้า evidence
+		const log = gitOk(["log", "--oneline", `${baseline}..HEAD`], cwd);
+		if (log.ok && log.out.trim()) parts.push(`commits since baseline ${baseline.slice(0, 8)}:\n${log.out.trim()}`);
+	} else {
+		const log = gitOk(["log", "--oneline", "-8"], cwd);
+		if (log.ok && log.out.trim()) parts.push(`recent commits:\n${log.out.trim()}`);
+	}
 	const status = gitOk(["status", "--porcelain"], cwd);
 	if (status.ok && status.out.trim()) parts.push(`changed/untracked files:\n${status.out.trim().split("\n").slice(0, 30).join("\n")}`);
-	const diff = gitOk(["diff", "HEAD", "--stat"], cwd);
-	if (diff.ok && diff.out.trim()) parts.push(`diffstat vs HEAD:\n${diff.out.trim().split("\n").slice(-25).join("\n")}`);
+	const diff = gitOk(baseline ? ["diff", baseline, "--stat"] : ["diff", "HEAD", "--stat"], cwd);
+	if (diff.ok && diff.out.trim()) parts.push(`diffstat vs ${baseline ? `baseline ${baseline.slice(0, 8)}` : "HEAD"}:\n${diff.out.trim().split("\n").slice(-25).join("\n")}`);
 	return parts.join("\n\n").slice(0, 4_000);
 };
 
@@ -685,23 +694,42 @@ export const parseReviewerPacket = (text: string): PacketParse => {
 	return { ok: missing.length === 0, missing, tldr };
 };
 
+/** eval evidence นี้เป็นของรอบปัจจุบันหรือไม่ — stale เมื่อ spec version เปลี่ยน หรือ tree ที่ eval ไม่ตรง tree ที่กำลัง review
+ *  (ใช้ tree SHA ไม่ใช่ commit SHA โดยตั้งใจ: merge-back --no-ff หลัง eval PASS ให้ tree เดิมเป๊ะ → ไม่ทำให้รอบปกติ stale ปลอม)
+ *  current ไม่ส่งมา (legacy callsite) → ไม่เช็ค เพื่อ backward compat */
+export const isLastEvalStale = (
+	lastEval: { specVersion?: number; head?: string } | undefined,
+	current: { specVersion?: number; head?: string } | undefined,
+): boolean => {
+	if (!lastEval || !current) return false;
+	if (current.specVersion !== undefined && lastEval.specVersion !== current.specVersion) return true;
+	if (current.head !== undefined && lastEval.head !== current.head) return true;
+	return false;
+};
+
 /** W2: evidence pack ของ reviewer — packet ต้อง facts-grounded ไม่ใช่เดาจาก intent
- *  (เหตุการณ์จริงก่อนอัปเกรด: packet เขียน \"To be implemented\" ทั้งที่งานเสร็จแล้ว เพราะ prompt มีแค่ intent บรรทัดเดียว) */
+ *  (เหตุการณ์จริงก่อนอัปเกรด: packet เขียน \"To be implemented\" ทั้งที่งานเสร็จแล้ว เพราะ prompt มีแค่ intent บรรทัดเดียว)
+ *  evidence ต้องเป็นของรอบปัจจุบันเท่านั้น: git summary ถูก scope ด้วย baseline ที่ caller + lastEval ที่ไม่ตรง
+ *  spec version/tree ตอน review (freshness) ถูกตัดทิ้งพร้อมคำเตือน — reviewer ห้ามตัดสินจาก evidence เก่า */
 export const buildReviewerPrompt = (
 	intent: string,
-	lastEval: { verdict?: string; perCriteria?: Record<string, string>; failedIds?: string[]; probes?: ProbeResult[] } | undefined,
+	lastEval: { verdict?: string; perCriteria?: Record<string, string>; failedIds?: string[]; probes?: ProbeResult[]; specVersion?: number; head?: string } | undefined,
 	flags: string[],
 	specDebt: string[],
 	escalations: { kind: string; detail: string }[],
 	gitSummary: string,
 	feedback: string,
-): string =>
-	`You are the REVIEWER sub-agent. The work is DONE and already machine-graded — ground every statement in the evidence below; never write \"to be implemented\".\n\n` +
-	`Evidence:\n- Intent: ${intent}\n- Eval verdict: ${lastEval?.verdict ?? "(no eval record)"}` +
-	(lastEval?.perCriteria && Object.keys(lastEval.perCriteria).length
-		? `\n- Per-criteria verdicts: ${Object.entries(lastEval.perCriteria).map(([id, v]) => `${id}=${v}`).join(", ")}`
+	freshness?: { specVersion?: number; head?: string }, // spec version + tree SHA (HEAD^{tree}) ของ tree ที่กำลัง review
+): string => {
+	const stale = isLastEvalStale(lastEval, freshness);
+	const ev = stale ? undefined : lastEval;
+	return `You are the REVIEWER sub-agent. The work is DONE and already machine-graded — ground every statement in the evidence below; never write \"to be implemented\".\n\n` +
+	`Evidence:\n- Intent: ${intent}\n- Eval verdict: ${ev?.verdict ?? "(no eval record)"}` +
+	(stale ? `\n- ⚠️ STALE eval evidence withheld: the stored zense_eval result belongs to an older spec version (v${lastEval?.specVersion ?? "?"}) or tree (${lastEval?.head?.slice(0, 8) ?? "?"}) — re-run zense_eval before trusting any eval verdict.` : "") +
+	(ev?.perCriteria && Object.keys(ev.perCriteria).length
+		? `\n- Per-criteria verdicts: ${Object.entries(ev.perCriteria).map(([id, v]) => `${id}=${v}`).join(", ")}`
 		: "") +
-	(lastEval?.probes?.length ? `\n- Probe results (harness-executed): ${lastEval.probes.map((p) => `${p.id}:${p.status}`).join(", ")}` : "") +
+	(ev?.probes?.length ? `\n- Probe results (harness-executed): ${ev.probes.map((p) => `${p.id}:${p.status}`).join(", ")}` : "") +
 	`\n- Trajectory flags: ${flags.length ? flags.join(" | ") : "(none)"}` +
 	`\n- Spec debt (human-verified): ${specDebt.length ? specDebt.join(" | ") : "(none)"}` +
 	`\n- Escalations: ${escalations.length ? escalations.map((e) => `${e.kind}: ${e.detail.slice(0, 80)}`).join(" | ") : "(none)"}` +
@@ -713,6 +741,7 @@ export const buildReviewerPrompt = (
 	`## Human actions\n(follow-ups only a human can do: spec debt, unanswered questions)\n` +
 	`Do NOT dump raw diffs; summarize. No commentary outside the sections.` +
 	(feedback ? `\n\nSYSTEM FEEDBACK: previous packet was missing sections: ${feedback}. Output the full packet with all headers.` : "");
+};
 
 // ----------------------------------------------------------------------------- sub-agent runner
 
@@ -1568,6 +1597,11 @@ export default function (pi: ExtensionAPI) {
 		state.spec.approved = true;
 		state.spec.approvedAt = Date.now();
 		state.phase = "implementation";
+		// git-evidence baseline ของรอบนี้: HEAD ของ main repo ก่อนสร้าง worktree (best-effort — ไม่ใช่ repo ก็ปล่อย undefined)
+		{
+			const baseRef = gitOk(["rev-parse", "HEAD"], ctx.cwd);
+			state.baselineHead = baseRef.ok ? baseRef.out.trim() : undefined;
+		}
 		// auto worktree-per-session: สร้าง worktree ของ session นี้ตอนเริ่ม implementation
 		// (ก่อนหน้านี้ไม่มี source write เพราะ gate กั้น) → redirect ทุก tool call เข้า worktree จนกว่า eval PASS
 		// reuse ของเดิมถ้ายังอยู่: เซ็น spec version ใหม่กลาง implement ต้องไม่ทำให้งานค้างใน worktree เก่าหลุด
@@ -1817,7 +1851,7 @@ export default function (pi: ExtensionAPI) {
 			const probes = runCheckProbes(evalRoot, state.spec.criteria);
 			const probeSummary = probes.map((p) => `${p.id}:${p.status}`).join(",");
 			learn(ctx, `eval-probes: spec v${state.spec.version} → ${probeSummary}`);
-			const diffSummary = gitChangeSummary(evalRoot);
+			const diffSummary = gitChangeSummary(evalRoot, state.baselineHead);
 			// stream output ของ grader เข้า transcript สดๆ (throttled) — user เห็นมันทำงานจริง ไม่ต้องเดาว่าค้างไหม
 			let tail = "";
 			let lastPush = 0;
@@ -1877,7 +1911,14 @@ export default function (pi: ExtensionAPI) {
 			const verdict = failedCriteria.length || parsed.overall === "FAIL" ? "FAIL" : "PASS";
 			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} judged=${Object.keys(parsed.perCriteria).length}/${state.spec.criteria.length} failed=[${failedCriteria.join(",")}]${probeOverrides.length ? ` probeOverrides=[${probeOverrides.join(",")}]` : ""}`);
 			// W2: เก็บ evidence ไว้เป็น input ของ reviewer (zense_review สร้าง evidence pack จาก lastEval)
-			state.lastEval = { verdict, perCriteria: parsed.perCriteria, failedIds: failedCriteria, probes, at: Date.now() };
+			// ผูก evidence กับรอบปัจจุบัน: specVersion + tree SHA ของ tree ที่ eval (HEAD^{tree} — ตั้งใจใช้ tree ไม่ใช่ commit SHA
+		// เพราะ merge-back --no-ff ให้ tree เดิมเป๊ะ ไม่ควรทำให้รอบปกติกลายเป็น stale; reviewer จะเช็คซ้ำตอน review)
+		const evalTree = gitOk(["rev-parse", "HEAD^{tree}"], evalRoot);
+		state.lastEval = {
+			verdict, perCriteria: parsed.perCriteria, failedIds: failedCriteria, probes, at: Date.now(),
+			specVersion: state.spec.version,
+			...(evalTree.ok ? { head: evalTree.out.trim() } : {}),
+		};
 			// บันทึกผล eval ลง spec .md (archive + latest copy) เป็น section ใหม่ท้ายไฟล์ (append-only, ไม่เขียนทับเนื้อเดิม)
 			const evalTs = new Date().toISOString();
 			const evalSection =
@@ -1916,6 +1957,9 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					learn(ctx, `worktree merged: ${mr.msg}`);
 					state.worktree = null;
+					// reviewer จะอ่าน main หลัง merge — repin lastEval.head เป็น tree ของ merge commit (เนื้อ tree เหมือนที่ eval)
+					const mergedTree = gitOk(["rev-parse", "HEAD^{tree}"], ctx.cwd);
+					if (mergedTree.ok && state.lastEval) state.lastEval.head = mergedTree.out.trim();
 					ctx.ui.notify(`🌳 worktree merged → main`, "info");
 				}
 			}
@@ -1940,10 +1984,17 @@ export default function (pi: ExtensionAPI) {
 				};
 			// W2: evidence pack — ส่ง lastEval (verdicts+probes), flags, specDebt, escalations, git summary
 			// ให้ reviewer ด้วย (เดิมมีแค่ intent บรรทัดเดียว → packet เดา/เลื่อยลอย เช่นเขียน "To be implemented" ทั้งที่งานเสร็จแล้ว)
-			const gitSummary = gitChangeSummary(ctx.cwd);
+			// evidence ต้องเป็นของรอบปัจจุบันเท่านั้น: git summary scope ด้วย baseline ตอน spec approval + lastEval ที่ไม่ตรง
+			// spec version/tree ปัจจุบันถูกตัดออกจาก prompt (ดู isLastEvalStale ใน buildReviewerPrompt) แทนที่จะหลุดไปให้ตัดสินจากของเก่า
+			const reviewRoot = state.worktree?.root ?? ctx.cwd;
+			const headNow = gitOk(["rev-parse", "HEAD^{tree}"], reviewRoot);
+			const freshness = { specVersion: state.spec?.version, ...(headNow.ok ? { head: headNow.out.trim() } : {}) };
+			if (isLastEvalStale(state.lastEval, freshness))
+				learn(ctx, `review: lastEval stale (spec v${state.lastEval?.specVersion ?? "?"} ≠ v${freshness.specVersion ?? "?"} หรือ tree เปลี่ยนหลัง eval) — ตัด eval evidence เก่าออกจาก reviewer prompt`);
 			let packetFeedback = "";
 			const packetInput = (): string =>
-				buildReviewerPrompt(state.spec?.intent ?? "(no spec)", state.lastEval, state.trajectoryFlags, state.spec?.specDebt ?? [], state.escalations, gitSummary, packetFeedback);
+				buildReviewerPrompt(state.spec?.intent ?? "(no spec)", state.lastEval, state.trajectoryFlags, state.spec?.specDebt ?? [], state.escalations,
+					gitChangeSummary(reviewRoot, state.baselineHead), packetFeedback, freshness);
 			let reviewer = await launchSubagent(ctx, "reviewer", packetInput());
 			let packetParse = parseReviewerPacket(reviewer.output);
 			// A (schema): section ไม่ครบ → retry 1 ครั้งพร้อม feedback (แทน slice ดิบ 900 ตัวอักษรที่ผ่านทุกกรณี)

@@ -25,6 +25,7 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, type SelectItem } from "@earendil-works/pi-tui";
@@ -79,6 +80,26 @@ interface Worktree {
 }
 
 const zenseDir = (cwd: string) => join(cwd, ".zense");
+
+/**
+ * merge "tuiMode": "fullscreen" เข้า settings.json — เฉพาะตอนที่ key ยังไม่มีเท่านั้น (ผู้ใช้ยังไม่เคยเลือก)
+ * public extension API ของ pi ไม่มี tuiMode setter (SettingsManager.setTuiMode ไม่ถูก expose ให้ extension)
+ * เลยต้องเขียนไฟล์ตรงๆ — pure function แยกออกจาก fs เพื่อ unit-test ได้โดยไม่แตะไฟล์จริงของผู้ใช้
+ * คืน null = ไฟล์เดิม parse ไม่ได้/ไม่ใช่ object → ห้ามเขียนทับเด็ดขาด (กัน clobber การตั้งค่าของผู้ใช้)
+ * changed=false = user ตั้ง tuiMode เองแล้ว (แม้แต่ "regular") → respect ทันที ไม่แตะต้อง
+ */
+export const applyFullscreenDefault = (raw: string | undefined): { text: string; changed: boolean } | null => {
+	if (raw === undefined || !raw.trim()) return { text: `${JSON.stringify({ tuiMode: "fullscreen" }, null, 2)}\n`, changed: true };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+	if ("tuiMode" in (parsed as Record<string, unknown>)) return { text: raw, changed: false };
+	return { text: `${JSON.stringify({ ...(parsed as Record<string, unknown>), tuiMode: "fullscreen" }, null, 2)}\n`, changed: true };
+};
 
 /** shell-quote แบบ single-quote สำหรับ path ที่อาจมี space/special char */
 const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -973,7 +994,30 @@ export default function (pi: ExtensionAPI) {
 	//       agent เข้า worktree จนกว่า eval PASS จะ merge กลับ — กัน 2 session เขียนทับกัน)
 	// (git helpers gitOk/createWorktree/mergeWorktreeBack อยู่ที่ module scope เพื่อ export ให้ test ได้)
 
+	/** fullscreen default ให้คนติดตั้ง pi-zense โดยไม่ต้อง setup เอง: ตั้งครั้งเดียวต่อ file-ตอน key ยังว่าง
+	 *  interactive TUI เท่านั้น (sub-agent bail ตั้งแต่ต้น factory ด้วย PI_ZENSE_SUBAGENT แล้ว) — best-effort,
+	 *  ห้ามให้ startup ของ harness พังเพราะเขียน settings ไม่ได้ */
+	const ensureFullscreenDefault = (ctx: ExtensionContext): void => {
+		if (ctx.mode !== "tui") return;
+		try {
+			const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+			const raw = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : undefined;
+			const merged = applyFullscreenDefault(raw);
+			if (!merged || !merged.changed) return; // null=ไฟล์เดิมเสีย (ข้าม), !changed=user เลือกเองแล้ว (respect)
+			mkdirSync(dirname(settingsPath), { recursive: true });
+			writeFileSync(settingsPath, merged.text);
+			learn(ctx, "fullscreen default: tuiMode=fullscreen (install default — มีผล pi ครั้งถัดไป)");
+			ctx.ui.notify(
+				"🖥 zense: ตั้ง fullscreen TUI mode เป็น default ใน ~/.pi/agent/settings.json แล้ว — มีผล pi ครั้งถัดไป (สลับ session นี้ทันที: /settings → TUI mode; ไม่ต้องการ: เปลี่ยนค่า tuiMode ในไฟล์เดียวกัน)",
+				"info",
+			);
+		} catch {
+			/* best-effort */
+		}
+	};
+
 	pi.on("session_start", async (_ev, ctx) => {
+		ensureFullscreenDefault(ctx);
 		for (const e of ctx.sessionManager.getEntries())
 			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
@@ -1183,6 +1227,12 @@ export default function (pi: ExtensionAPI) {
 	// ----- spec presentation: dialog ต้องโชว์ spec เต็มๆ ให้อ่านก่อนตัดสินใจเซ็น
 	// (ScrollView ของ pi-tui ต้องการ layout integration เลย scroll เองด้วย offset + slice)
 
+	// dialogs ของ zense render เป็น overlay ลอยทับ transcript แทนการ render inline ก่อเต็มจอ —
+	// ปิดแล้วกลับไปเห็น context เดิมทันที (กไก่ pi: ctx.ui.custom({ overlay: true, overlayOptions }))
+	const OVERLAY_LG = { overlay: true, overlayOptions: { width: "92%", minWidth: 60, maxHeight: "85%" } } as const; // spec sign dialog (ต้องอ่าน spec ยาว)
+	const OVERLAY_MD = { overlay: true, overlayOptions: { width: "80%", minWidth: 56, maxHeight: "80%" } } as const; // pickers กลาง
+	const OVERLAY_XL = { overlay: true, overlayOptions: { width: "95%", minWidth: 60, maxHeight: "90%" } } as const; // live tail
+
 	const specSignDialog = (ctx: ExtensionContext, spec: Spec, question: string, items: SelectItem[]): Promise<string | null> =>
 		ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
@@ -1225,9 +1275,10 @@ export default function (pi: ExtensionAPI) {
 			let lines: string[] = [];
 			let cachedWidth = -1;
 			let offset = 0;
-			// ความสูงเนื้อ spec: ยกเลิก cap ที่ 24 ให้ใช้พื้นที่ terminal ได้เต็มที่ (reserve 12 บรรทัด
-			// สำหรับ border/title/hint/range/selectList/bottomHint) — อ่าน spec ได้ยาวขึ้นโดยไม่ต้องเลื่อนบ่อย
-			const bodyRows = () => Math.max(4, tui.terminal.rows - 12);
+			// ความสูงเนื้อ spec: ใช้พื้นที่ terminal ได้เต็ม overlay (85% ของ rows ตาม OVERLAY_LG)
+			// reserve 11 บรรทัดสำหรับ border/title/hint/range/selectList/bottomHint — ถ้าเกิน maxHeight
+			// ของ overlay จะถุก clip ทำ select list หาย (จูน reserve กับ maxHeight คู่กันเสมอ)
+			const bodyRows = () => Math.max(4, Math.floor(tui.terminal.rows * 0.85) - 11);
 			const maxOffset = () => Math.max(0, lines.length - bodyRows());
 
 			return {
@@ -1271,7 +1322,7 @@ export default function (pi: ExtensionAPI) {
 					tui.requestRender();
 				},
 			};
-		});
+		}, OVERLAY_LG);
 
 	// ----- picker กลางของ zense: title + search filter + SelectList (ใช้ซ้ำได้ทั้งเลือก role/model)
 
@@ -1314,7 +1365,7 @@ export default function (pi: ExtensionAPI) {
 					tui.requestRender();
 				},
 			};
-		});
+		}, OVERLAY_MD);
 
 	// ----- live sub-agent observability: ดู output สดระหว่างรัน (กันลังเลว่าค้างหรือเปล่า)
 
@@ -1324,7 +1375,8 @@ export default function (pi: ExtensionAPI) {
 			const tick = setInterval(() => tui.requestRender(), 1_000); // auto-refresh ทุก 1s
 			return {
 				render: (w: number) => {
-					const rows = Math.max(4, tui.terminal.rows - 9);
+					// 90% ของ rows ตาม OVERLAY_XL − 6 บรรทัดหัว/tail/border — กัน clip ตอน render เป็น overlay
+					const rows = Math.max(4, Math.floor(tui.terminal.rows * 0.9) - 6);
 					const lines =
 						run.logPath && existsSync(run.logPath)
 							? readFileSync(run.logPath, "utf8").split("\n").slice(-rows)
@@ -1350,7 +1402,7 @@ export default function (pi: ExtensionAPI) {
 				},
 				dispose: () => clearInterval(tick),
 			};
-		});
+		}, OVERLAY_XL);
 
 	const runLabel = (r: SubagentRun) =>
 		`${r.status === "running" ? "▶" : r.ok ? "✅" : "❌"} ${r.role} @ ${new Date(r.startedAt ?? r.at).toLocaleTimeString()}`;
@@ -1402,7 +1454,7 @@ export default function (pi: ExtensionAPI) {
 					tui.requestRender();
 				},
 			};
-		});
+		}, OVERLAY_MD);
 		const runIdx = picked == null ? -1 : Number(picked);
 		if (runIdx < 0 || !state.subagentRuns[runIdx]) return;
 		await tailViewer(ctx, state.subagentRuns[runIdx]);

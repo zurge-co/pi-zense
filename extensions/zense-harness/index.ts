@@ -24,11 +24,11 @@
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
  */
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
-import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, type SelectItem } from "@earendil-works/pi-tui";
+import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, wrapTextWithAnsi, type SelectItem } from "@earendil-works/pi-tui";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ----------------------------------------------------------------------------- types
@@ -1288,6 +1288,20 @@ export default function (pi: ExtensionAPI) {
 	const OVERLAY_MD = { overlay: true, overlayOptions: { width: "80%", minWidth: 56, maxHeight: "80%" } } as const; // pickers กลาง
 	const OVERLAY_XL = { overlay: true, overlayOptions: { width: "95%", minWidth: 60, maxHeight: "90%" } } as const; // live tail
 
+	/** scroll key-map เดียวใช้ร่วมทุก dialog (spec sign / live tail) — ห้าม duplicate ไปคนละชุดเดี๋ยว drift:
+	 *  ↑/↓ ทีละบรรทัด, ←/→ ทีละหน้า, g = บนสุด, G = ล่างสุด (printable เดี่ยว กดได้แน่ทุก terminal ไม่ชน fn-key ของ Mac)
+	 *  ไม่มี Ctrl chord ตาม spec v3 — เลือกชุดสั้นสุดที่ทำงานตรงกันทั้งสอง dialog */
+	type ScrollAction = { dir: 1 | -1; page: boolean } | "top" | "bottom" | null;
+	const scrollKeyAction = (data: string): ScrollAction => {
+		if (matchesKey(data, Key.up)) return { dir: -1, page: false };
+		if (matchesKey(data, Key.down)) return { dir: 1, page: false };
+		if (matchesKey(data, Key.left)) return { dir: -1, page: true };
+		if (matchesKey(data, Key.right)) return { dir: 1, page: true };
+		if (data === "g") return "top";
+		if (data === "G") return "bottom";
+		return null;
+	};
+
 	const specSignDialog = (ctx: ExtensionContext, spec: Spec, question: string, items: SelectItem[]): Promise<string | null> =>
 		ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
@@ -1317,23 +1331,13 @@ export default function (pi: ExtensionAPI) {
 				strikethrough: (t) => t,
 				underline: (t) => theme.underline(t),
 			});
-			const selectList = new SelectList(items, items.length, {
-				selectedPrefix: (t) => theme.fg("accent", t),
-				selectedText: (t) => theme.fg("accent", t),
-				description: (t) => theme.fg("muted", t),
-				scrollInfo: (t) => theme.fg("dim", t),
-				noMatch: (t) => theme.fg("warning", t),
-			});
-			selectList.onSelect = (item) => done(item.value);
-			selectList.onCancel = () => done(null);
-
 			let lines: string[] = [];
 			let cachedWidth = -1;
 			let offset = 0;
 			// ความสูงเนื้อ spec: ใช้พื้นที่ terminal ได้เต็ม overlay (85% ของ rows ตาม OVERLAY_LG)
-			// reserve 11 บรรทัดสำหรับ border/title/hint/range/selectList/bottomHint — ถ้าเกิน maxHeight
-			// ของ overlay จะถุก clip ทำ select list หาย (จูน reserve กับ maxHeight คู่กันเสมอ)
-			const bodyRows = () => Math.max(4, Math.floor(tui.terminal.rows * 0.85) - 11);
+			// reserve 9 บรรทัดสำหรับ border/title/hint/range/option ≤3 บรรทัด/bottomHint — ถ้าเกิน maxHeight
+			// ของ overlay จะถูก clip (จูน reserve กับ maxHeight คู่กันเสมอ)
+			const bodyRows = () => Math.max(4, Math.floor(tui.terminal.rows * 0.85) - 9);
 			const maxOffset = () => Math.max(0, lines.length - bodyRows());
 
 			return {
@@ -1351,11 +1355,16 @@ export default function (pi: ExtensionAPI) {
 					for (let i = slice.length; i < h; i++) out.push(""); // รักษาความสูง dialog ให้นิ่ง
 					const range =
 						lines.length > h
-							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — เลื่อน: Ctrl+D/U (ครึ่งหน้า), Ctrl+F/B (เต็มหน้า) —`
+							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} —`
 							: `— spec ครบทุกบรรทัด (${lines.length} lines) —`;
 					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
-					out.push(...selectList.render(w));
-					out.push(...new Text(theme.fg("dim", "↑↓ เลือก • Enter ยืนยัน • Esc ตัดสินใจทีหลัง"), 1, 0).render(w));
+					// action เป็น hotkey ตรง (ไม่ใช่ SelectList) — arrows เลยว่างไว้เลื่อนอ่าน spec:
+					//   y = item แรก (🔏 เซ็น) / o = item กลาง (⚠️ override — มีเฉพาะ gate dialog 3 ตัวเลือก) / n,Esc = ตัวสุดท้ายหรือยกเลิก
+					out.push(`  ${theme.fg("accent", theme.bold(`[y] ${items[0].label}`))}`);
+					if (items.length > 2) out.push(`  ${theme.fg("muted", `[o] ${items[1].label}`)}`);
+					const nLabel = (items.length > 2 ? items[2] : items[1])?.label ?? "ตัดสินใจทีหลัง";
+					out.push(`  ${theme.fg("muted", `[n] ${nLabel}`)}`);
+					out.push(...new Text(theme.fg("dim", "↑↓ เลื่อนทีละบรรทัด • ←→ ทีละหน้า • g บนสุด • G ล่างสุด"), 1, 0).render(w));
 					out.push(...border.render(w));
 					return out;
 				},
@@ -1363,17 +1372,17 @@ export default function (pi: ExtensionAPI) {
 					cachedWidth = -1;
 				},
 				handleInput: (data: string) => {
-					// ใช้เฉพาะ ctrl+letter แบบ less/vim — control char ตัวเดียว กดได้แน่ๆ ทุก terminal ทั้ง mac/windows
-					// (shift+↑/↓ โดน terminal ยึดไป scroll เอง, ctrl+↑/↓ ชน Mission Control บน mac,
-					//  PgUp/PgDn บน mac ต้องกด fn — เลยตัดทิ้งหมด)
-					//   Ctrl+D/U = ครึ่งหน้า, Ctrl+F/B = เต็มหน้า (forward/back) — ↑/↓ ปล่อยให้ SelectList เลือกตัวเลือก
-					if (matchesKey(data, Key.ctrl("d")))
-						offset = Math.min(maxOffset(), offset + Math.max(1, bodyRows() >> 1));
-					else if (matchesKey(data, Key.ctrl("u")))
-						offset = Math.max(0, offset - Math.max(1, bodyRows() >> 1));
-					else if (matchesKey(data, Key.ctrl("f"))) offset = Math.min(maxOffset(), offset + bodyRows());
-					else if (matchesKey(data, Key.ctrl("b"))) offset = Math.max(0, offset - bodyRows());
-					else selectList.handleInput(data);
+					// hotkey ตรงแทน ↑↓+Enter: y เซ็น / o override (gate dialog เท่านั้น) / n,Esc ทีหลัง —
+					// ค่าที่ done() ต้องเหมือนเดิมทุก callsite (gate/approve flow อ่าน 'sign'/'override'/null)
+					if (data === "y") done(items[0].value);
+					else if (data === "o" && items.length > 2) done(items[1].value);
+					else if (data === "n" || matchesKey(data, Key.escape)) done(null);
+					else {
+						const act = scrollKeyAction(data);
+						if (act === "top") offset = 0;
+						else if (act === "bottom") offset = maxOffset();
+						else if (act) offset = Math.max(0, Math.min(maxOffset(), offset + act.dir * (act.page ? bodyRows() : 1)));
+					}
 					tui.requestRender();
 				},
 			};
@@ -1428,14 +1437,31 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.custom<null>((tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 			const tick = setInterval(() => tui.requestRender(), 1_000); // auto-refresh ทุก 1s
+			// wrap log เต็มไฟล์ด้วย wrapTextWithAnsi (รักษา ANSI) แทน truncate — บรรทัดยาวอ่านครบ ไม่โดนตัดเป็น "…"
+			// cache ตาม (width,size,mtime) — log ใหญ่จะได้ไม่ wrap ใหม่ทุก frame (refresh 1s)
+			let cacheKey = "";
+			let wrapped: string[] = [];
+			let offset = 0;
+			let follow = true; // default ติดท้าย log เหมือนพฤติกรรมเดิม — scroll ขึ้น = pause, ถึงล่างสุด = ตามต่อ
+			const rows = () => Math.max(4, Math.floor(tui.terminal.rows * 0.9) - 6);
+			const maxOffset = () => Math.max(0, wrapped.length - rows());
+			const readWrapped = (wWrap: number): string[] => {
+				const st = run.logPath && existsSync(run.logPath) ? statSync(run.logPath) : null;
+				const key = `${wWrap}:${st ? `${st.size}:${Math.round(st.mtimeMs)}` : "none"}`;
+				if (key !== cacheKey) {
+					cacheKey = key;
+					const raw = st ? readFileSync(run.logPath!, "utf8").split("\n") : ["(waiting for output…)"];
+					wrapped = raw.flatMap((ln) => wrapTextWithAnsi(ln, wWrap));
+				}
+				return wrapped;
+			};
 			return {
 				render: (w: number) => {
+					const lines = readWrapped(Math.max(20, w - 4));
 					// 90% ของ rows ตาม OVERLAY_XL − 6 บรรทัดหัว/tail/border — กัน clip ตอน render เป็น overlay
-					const rows = Math.max(4, Math.floor(tui.terminal.rows * 0.9) - 6);
-					const lines =
-						run.logPath && existsSync(run.logPath)
-							? readFileSync(run.logPath, "utf8").split("\n").slice(-rows)
-							: ["(waiting for output…)"];
+					const h = rows();
+					if (follow) offset = maxOffset(); // ติดท้ายเสมอจนกว่า user จะเลื่อนขึ้น
+					offset = Math.max(0, Math.min(offset, maxOffset()));
 					const status =
 						run.status === "running"
 							? `▶ running ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s`
@@ -1446,14 +1472,29 @@ export default function (pi: ExtensionAPI) {
 					out.push(...border.render(w));
 					out.push(...new Text(theme.fg("accent", theme.bold(`🧪 sub-agent: ${run.role} — ${status}`)), 1, 0).render(w));
 					out.push(...new Text(theme.fg("dim", run.logPath ? relative(ctx.cwd, run.logPath) : "(no log)"), 1, 0).render(w));
-					for (const ln of lines) out.push("  " + truncateToWidth(ln, Math.max(1, w - 4)));
-					out.push(...new Text(theme.fg("dim", "auto refresh 1s • Esc ปิด (sub-agent ยังรันต่อ)"), 1, 0).render(w));
+					const slice = lines.slice(offset, offset + h);
+					for (const ln of slice) out.push("  " + ln);
+					for (let i = slice.length; i < h; i++) out.push(""); // ความสูงนิ่งเหมือน spec sign dialog
+					const range = follow
+						? "▶ tail (ติดตามท้าย log)"
+						: `⏸ lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — กด G กลับไปติดตาม`;
+					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
+					out.push(...new Text(theme.fg("dim", "auto refresh 1s • ↑↓ เลื่อน • ←→ หน้า • g/G บนสุด/ล่างสุด • Esc ปิด (sub-agent ยังรันต่อ)"), 1, 0).render(w));
 					out.push(...border.render(w));
 					return out;
 				},
 				invalidate: () => {},
 				handleInput: (data: string) => {
-					if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter)) done(null);
+					if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter)) { done(null); return; }
+					const act = scrollKeyAction(data);
+					if (act === "top") { offset = 0; follow = false; }
+					else if (act === "bottom") { follow = true; offset = maxOffset(); }
+					else if (act) {
+						if (act.dir < 0) follow = false; // เลื่อนขึ้น = หยุดติดตาม
+						offset = Math.max(0, Math.min(maxOffset(), offset + act.dir * (act.page ? rows() : 1)));
+						if (offset >= maxOffset()) follow = true; // เลื่อนลงถึงล่างสุด = ติดตามต่อ
+					}
+					tui.requestRender();
 				},
 				dispose: () => clearInterval(tick),
 			};

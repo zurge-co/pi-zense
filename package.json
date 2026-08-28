@@ -1,6 +1,6 @@
 {
   "name": "pi-zense",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "description": "Spec-gated, human-signed (zense/เซ็น) SDLC harness for pi — sub-agents, dual eval, escalation gates — plus the Zense dark theme.",
   "keywords": [
     "pi-package",
@@ -14,7 +14,7 @@
   "license": "MIT",
   "author": "",
   "scripts": {
-    "test": "node --no-warnings --test test/index.test.mjs test/adr-deny.test.mjs test/worktree.test.mjs test/spec-draft.test.mjs test/eval-review.test.mjs"
+    "test": "node --no-warnings --test test/index.test.mjs test/adr-deny.test.mjs test/worktree.test.mjs test/spec-draft.test.mjs test/eval-review.test.mjs test/fullscreen-default.test.mjs"
   },
   "repository": {
     "type": "git",

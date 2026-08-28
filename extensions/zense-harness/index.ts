@@ -1068,7 +1068,10 @@ export default function (pi: ExtensionAPI) {
 		if (state.phase === "requirements" || !state.spec?.approved) {
 			if (!ctx.hasUI) {
 				escalate("need-permission", "write blocked: spec unsigned (no UI)", ctx);
-				return { block: true, reason: "Zense gate: spec ยังไม่ได้เซ็น — ให้ user เซ็นผ่าน dialog ครั้งต่อไปหรือ /zense approve ก่อน" };
+				// no-spec = approve ใช้ไม่ได้ตั้งแต่ต้น → สั่ง agent commit spec ก่อน อย่าชี้ไป /zense approve
+				return { block: true, reason: state.spec
+					? "Zense gate: spec ยังไม่ได้เซ็น — ให้ user เซ็นผ่าน dialog ครั้งต่อไปหรือ /zense approve ก่อน"
+					: "Zense gate: ยังไม่มี spec ในระบบเลย — เรียก zense_spec (แนะนำ action=compile_spec) เพื่อ commit spec ก่อน แล้ว user จะเซ็นจาก dialog ทันที; spec ในแชทไม่ถือว่ามี spec" };
 			}
 			// ลายเซ็นอยู่ที่ dialog นี่เอง — เลือกเซ็นแล้วทำงานต่อได้ทันที ไม่ต้อง /zense approve ย้ำ
 			// (TUI: โชว์ spec เต็มใน dialog ก่อนเซ็น; RPC: fallback เป็น select ธรรมดา)
@@ -1101,7 +1104,9 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("⚠ override โดยไม่เซ็น spec — เพิ่ม trajectory flag", "warning");
 			} else {
 				escalate("need-permission", "write blocked: spec unsigned", ctx);
-				return { block: true, reason: "Zense gate: spec ยังไม่ได้เซ็น — เลือก 🔏 เซ็นจาก dialog ครั้งหน้า หรือให้ user รัน /zense approve" };
+				return { block: true, reason: state.spec
+					? "Zense gate: spec ยังไม่ได้เซ็น — เลือก 🔏 เซ็นจาก dialog ครั้งหน้า หรือให้ user รัน /zense approve"
+					: "Zense gate: ยังไม่มี spec ในระบบเลย — เรียก zense_spec (แนะนำ action=compile_spec) เพื่อ commit spec ก่อน แล้ว user จะเซ็นจาก dialog ทันที; การวาง spec ในแชทไม่ทำให้ approve อะไรได้" };
 			}
 		}
 
@@ -1501,6 +1506,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use zense_spec before any implementation to write the spec; list unverifiable requirements under specDebt.",
 			"Prefer action=compile_spec: a read-only requirements sub-agent explores the repo, drafts machine-checkable criteria, asks the human clarifying questions if ambiguous, and commits the spec for signing in one step.",
+			"A spec exists ONLY when committed via this tool — presenting it as chat text (pasting JSON/prose into the conversation) registers nothing, and /zense approve will then find 'No spec to approve'.",
 		],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("set"), Type.Literal("compile_spec")] as const),
@@ -1843,7 +1849,11 @@ export default function (pi: ExtensionAPI) {
 					"info",
 				);
 			} else if (sub === "approve") {
-				if (!state.spec) return ctx.ui.notify("No spec to approve.", "warning");
+				if (!state.spec)
+				return ctx.ui.notify(
+					"No spec to approve: ยังไม่มี spec ที่ commit เข้าระบบ — approve ใช้ได้เฉพาะ spec ที่ agent เรียก zense_spec (tool) ในเซสชันนี้เท่านั้น; spec ที่ถูก present เป็น chat text registers nothing. ขั้นถัดไป: ให้ agent เรียก zense_spec (แนะนำ action=compile_spec) แล้ว sign จาก dialog ที่เด้งขึ้น", 
+					"warning",
+				);
 				if (ctx.mode === "tui") {
 					const choice = await specSignDialog(ctx, state.spec, `เซ็น approve spec v${state.spec.version}: ${state.spec.title}?`, [
 						{ value: "sign", label: "🔏 เซ็นอนุมัติ — เปิด implementation gate", description: "ลายเซ็นมนุษย์ = agent เริ่ม implement ได้" },

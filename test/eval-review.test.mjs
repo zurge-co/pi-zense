@@ -11,7 +11,9 @@ import {
 	buildReviewerPrompt,
 	gatherRepoFacts,
 	gitChangeSummary,
+	hasUnsubstitutedPlaceholder,
 	loadSpecExemplar,
+	modelMatchesPattern,
 	parseGraderOutput,
 	parseReviewerPacket,
 	runCheckProbes,
@@ -333,4 +335,35 @@ test("canReuseWorktree: null/missing-dir → false, existing dir → true (ก�
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("hasUnsubstitutedPlaceholder: returns offending token for angle/brace templates, null for clean checks", () => {
+	assert.equal(hasUnsubstitutedPlaceholder("path exists: <path>"), "<path>");
+	assert.equal(hasUnsubstitutedPlaceholder("path exists: src/<module>/x.ts"), "<module>");
+	assert.equal(hasUnsubstitutedPlaceholder("{name} gate"), "{name}");
+	assert.equal(hasUnsubstitutedPlaceholder("npm test"), null);
+	assert.equal(hasUnsubstitutedPlaceholder('node -e "process.exit(1)"'), null);
+	// shell จริง: redirection/grep ไม่ใช่ placeholder; ${VAR} ถูกยกเว้น (lookbehind)
+	assert.equal(hasUnsubstitutedPlaceholder("cat nofile 2>&1 | grep -q ok"), null);
+	assert.equal(hasUnsubstitutedPlaceholder('grep -q "${HOME}" README.md'), null);
+});
+
+test("runCheckProbes: unsubstituted placeholder in check → skipped (NOT fail), detail points to re-spec", () => {
+	const probes = runCheckProbes(tmpdir(), [
+		{ id: "ph1", text: "angle placeholder path", check: "path exists: src/<module>/index.ts" },
+		{ id: "ph2", text: "brace placeholder shell", check: 'grep -q "ok" {file}' },
+		{ id: "ph3", text: "clean shell", check: "node --version" },
+	]);
+	assert.deepEqual(probes.map((p) => p.status), ["skipped", "skipped", "pass"]);
+	assert.match(probes[0].detail, /unsubstituted placeholder "<module>"/);
+	assert.match(probes[0].detail, /fix spec via zense_spec/);
+	assert.match(probes[1].detail, /unsubstituted placeholder "\{file\}"/);
+});
+
+test("modelMatchesPattern: exact / thinking-suffix / case-insensitive match, rejects other providers and prefixes", () => {
+	assert.ok(modelMatchesPattern("openai/gpt-4.1", "openai/gpt-4.1"));
+	assert.ok(modelMatchesPattern("openai/gpt-4.1", "openai/gpt-4.1:high"));
+	assert.ok(modelMatchesPattern("OpenAI/GPT-4.1", "openai/gpt-4.1"));
+	assert.ok(!modelMatchesPattern("openai/gpt-4.1", "anthropic/claude"));
+	assert.ok(!modelMatchesPattern("synthetic/syn:large:text", "synthetic/syn:large")); // prefix ไม่ใช่ suffix pair
 });

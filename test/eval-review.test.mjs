@@ -99,6 +99,24 @@ test("runCheckProbes: shell-only check containing quoted '&&' is NOT split (runs
 	assert.deepEqual(probes.map((p) => p.status), ["pass", "pass"]);
 });
 
+test("runCheckProbes: malformed/usage-error check commands classify as skipped (NOT fail) — no false probe-primacy FAIL loop", () => {
+	const probes = runCheckProbes(tmpdir(), [
+		// เคสเจอจริงจาก eval ที่ FAIL เทียม: helm arg error / test usage error — คำสั่งเสียเอง ไม่ใช่ artifact ผิด
+		{ id: "u1", text: "helm arg error", check: `node -e "console.error('Error: expected at most two arguments, unexpected: +, grep'); process.exit(1)"` },
+		{ id: "u2", text: "test usage error", check: `node -e "console.error('sh: test: too many arguments'); process.exit(2)"` },
+		{ id: "u3", text: "command not found", check: "this-command-does-not-exist-xyz --version jq" },
+		// เช็คที่รันได้แต่ artifact ไม่ผ่าน = ยัง fail เต็มตัว (probe primacy ยังทับ grader ได้)
+		{ id: "u4", text: "silent exit 1", check: 'node -e "process.exit(1)"' },
+		{ id: "u5", text: "grep no match", check: "echo hello | grep -q goodbye" },
+		// compound: shell segment คำสั่งเสีย → skipped ทั้ง criterion (ตัดสินไม่ได้ ไม่เดา)
+		{ id: "u6", text: "compound with broken segment", check: `node --version && node -e "console.error('usage: x [opts]'); process.exit(2)"` },
+	]);
+	assert.deepEqual(probes.map((p) => p.status), ["skipped", "skipped", "skipped", "fail", "fail", "skipped"]);
+	assert.match(probes[0].detail, /probe command error/);
+	assert.match(probes[2].detail, /probe command error/);
+	assert.equal(probes[3].exitCode, 1);
+});
+
 test("SUBAGENT_EXCLUDE_TOOLS: grader and reviewer are read-only like requirements", () => {
 	for (const role of ["requirements", "grader", "reviewer"]) assert.deepEqual(SUBAGENT_EXCLUDE_TOOLS[role], ["write", "edit"]);
 	assert.equal(SUBAGENT_EXCLUDE_TOOLS["unknown-role"], undefined);

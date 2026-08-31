@@ -528,6 +528,19 @@ export interface ProbeResult {
 
 const PROBE_TIMEOUT_MS = 30_000; // กัน check ค้าง (server รอ port ฯลฯ) ลาก eval ไปด้วย
 
+/** usage/syntax/environment errors = เครื่องมือรันคำสั่งเช็คไม่ได้เพราะตัวคำสั่งเองเสีย (arg เกิน /
+ *  flag ไม่รู้จัก / parse พัง) — ไม่ใช่หลักฐานว่า artifact ผิด. เช็คที่ "รันแล้วไม่ตรง" จริง
+ *  (grep ไม่เจอ, test false, diff แตกต่าง) ล้วน exit 1 แบบเงียบๆ หรือพิมพ์ diff ออก stdout
+ *  → ไม่โดน regex นี้ ยังเป็น fail เต็มตัว. ตั้งใจไม่ใส่ "No such file": `cat missing-file`
+ *  = artifact หายของจริง ต้อง fail. เคสเจอจริง: "expected at most two arguments… unexpected: +, grep",
+ *  "test: too many arguments" → probe ตายทั้งที่ artifact ถูก → ถูก probe-primacy ทับ FAIL เงียบๆ ลูปไม่จบ */
+const PROBE_USAGE_ERROR_RE =
+	/too many arguments|usage:|unexpected (argument|token|operator|flag)|expected (exactly|at (most|least)) \w+ argument|accepts \d+ arg|unrecognized |unknown (flag|command|shorthand|option)|invalid (option|argument|flag)|illegal option|bad option|syntax error/i;
+
+/** ตัดสินว่า shell probe ที่พังคือ "คำสั่งเสียฝั่งเครื่องมือ" (ตัดสิน artifact ไม่ได้) หรือ fail จริง */
+const isProbeCommandError = (exitCode: number | undefined, detail: string): boolean =>
+	exitCode === 126 || exitCode === 127 || PROBE_USAGE_ERROR_RE.test(detail);
+
 type CheckSegment = { kind: "exists"; path: string } | { kind: "shell"; command: string };
 
 const PATH_EXISTS_SEG_RE = /^\s*(?:path|file)\s+exists:\s*(.+?)\s*$/i;
@@ -543,8 +556,9 @@ const splitCompoundCheck = (check: string): CheckSegment[] | null => {
 	return parsed.some((s) => s.kind === "exists") ? parsed : null;
 };
 
-/** รัน shell command เดียวใน cwd — คืน pass/exitCode/detail(stdout|stderr tail); exitCode undefined เมื่อ timeout/สัญญาณฆ่า */
-const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pass: boolean; exitCode?: number; detail: string } => {
+/** รัน shell command เดียวใน cwd — คืน pass/exitCode/detail(stdout|stderr tail); exitCode undefined เมื่อ timeout/สัญญาณฆ่า
+ *  cmdErr=true เมื่อตัวคำสั่งเองเสีย (usage/syntax/command-not-found) — caller ต้องไม่นับเป็น artifact fail */
+const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pass: boolean; exitCode?: number; detail: string; cmdErr?: boolean } => {
 	try {
 		const out = execFileSync("sh", ["-c", command], { cwd, timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 		return { pass: true, exitCode: 0, detail: (out || "").trim().split("\n").slice(-3).join("\n").slice(-300) || "(exit 0, no output)" };
@@ -552,7 +566,9 @@ const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pas
 		const err = e as { status?: number; stdout?: string; stderr?: string };
 		const code = typeof err.status === "number" ? err.status : -1;
 		const tail = `${err.stdout ?? ""}\n${err.stderr ?? ""}`.trim().split("\n").slice(-3).join("\n").slice(-300);
-		return { pass: false, ...(code >= 0 ? { exitCode: code } : {}), detail: tail || `exit=${code}` };
+		const exitCode = code >= 0 ? code : undefined;
+		const detail = tail || `exit=${code}`;
+		return { pass: false, ...(exitCode !== undefined ? { exitCode } : {}), detail, ...(isProbeCommandError(exitCode, detail) ? { cmdErr: true } : {}) };
 	}
 };
 
@@ -560,6 +576,8 @@ const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pas
  * W3 (probe-first grading): harness รัน criteria[].check ด้วยตัวเองก่อนส่ง grader —
  * grader ไม่ต้องเดาว่าคำสั่งรันแล้วได้อะไร และ probe เป็นหลักฐานแข็งที่ทับ verdict ของ grader ได้
  * (probe fail ⇒ criterion FAIL ไม่ว่า grader จะว่าอย่างไร — ดู zense_eval)
+ * ยกเว้นคำสั่งเช็คเสียฝั่งเครื่องมือเอง (usage/syntax error — ดู isProbeCommandError) → skipped:
+ * ไม่ใช่หลักฐานว่า artifact ผิด ปล่อย grader ตัดสินจากหลักฐานอื่น + ฝากมนุษย์ตรวจ ไม่บังคับ FAIL ลูปไม่จบ
  * รองรับ 3 รูปแบบ: "path exists: <p>" resolve ใน process เลย / เช่นเดียวกันกับ segment ของ compound
  * ("path exists: a && npm test" — ทุก segment ต้องผ่าน) / check ล้วน shell ที่ isMachineCheckable → sh -c ทั้งก้อน
  */
@@ -595,9 +613,10 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 					if (!r.pass)
 						return {
 							id: c.id,
-							status: "fail" as const,
+							// segment นี้คำสั่งเสีย → ตัดสิน artifact ไม่ได้ทั้ง criterion (แม้ segment ก่อนหน้าจะผ่าน)
+							status: (r.cmdErr ? "skipped" : "fail") as "skipped" | "fail",
 							...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
-							detail: details.join("; ").slice(-600),
+							detail: (r.cmdErr ? `probe command error (not artifact failure, → human review): ` : "") + details.join("; ").slice(-600),
 						};
 				}
 			}
@@ -608,9 +627,9 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 		const r = runShellSegment(c.check, cwd, timeoutMs);
 		return {
 			id: c.id,
-			status: r.pass ? ("pass" as const) : ("fail" as const),
+			status: r.pass ? ("pass" as const) : r.cmdErr ? ("skipped" as const) : ("fail" as const),
 			...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
-			detail: r.detail,
+			detail: r.cmdErr ? `probe command error (not artifact failure, → human review): ${r.detail}` : r.detail,
 		};
 	});
 
@@ -658,6 +677,7 @@ export const parseGraderOutput = (output: string, criteria: Criterion[]): GradeP
 export const buildGraderPrompt = (spec: Spec, probes: ProbeResult[], diffSummary: string, feedback: string): string =>
 	`You are the OUTPUT-EVAL grader. Judge each acceptance criterion from EVIDENCE ONLY — the probe results below were executed by the harness itself and are ground truth. You have NO write/edit tools; never modify the repo (if a check truly needs a fixture, create it in a tmp dir only).\n\n` +
 	`Reward-hacking checklist (auto-FAIL the related criteria if found): tests weakened/deleted/skipped, assertions removed, writes outside spec scope, placeholder or stub code claimed as done. Compare the change summary below against the spec scope.\n\n` +
+	`Probe status guide: FAIL = the harness ran the check and the artifact does NOT satisfy it (authoritative — do not PASS that criterion). SKIPPED = the harness could not judge (manual check, or the check command itself is malformed/errored) — SKIPPED is NOT evidence of artifact failure; verify that criterion yourself with read-only commands and judge on the evidence you gather.\n\n` +
 	`Criteria & probe results (harness-executed, authoritative):\n${spec.criteria
 		.map((c, i) => {
 			const p = probes[i];

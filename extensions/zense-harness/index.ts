@@ -583,7 +583,14 @@ const splitCompoundCheck = (check: string): CheckSegment[] | null => {
 
 /** รัน shell command เดียวใน cwd — คืน pass/exitCode/detail(stdout|stderr tail); exitCode undefined เมื่อ timeout/สัญญาณฆ่า
  *  cmdErr=true เมื่อตัวคำสั่งเองเสีย (usage/syntax/command-not-found) — caller ต้องไม่นับเป็น artifact fail */
+/** strip leading shell-runner prefix ("bash: "/"sh:"/"shell:"/"zsh:", case-insensitive) จาก check —
+ *  มนุษย์/LLM มักเขียน check เป็น "bash: npm test" ซึ่ง sh -c ทั้งก้อนแล้วพัง (sh: bash:: command not found,
+ *  exit 127 → skipped เสีย machine verification ทุกรอบ); strip เฉพาะต้น command ครั้งเดียว ไม่แตะกลางสตริง */
+export const normalizeShellCommand = (check: string): string => check.replace(/^\s*(?:bash|sh|shell|zsh):\s*/i, "");
+
 const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pass: boolean; exitCode?: number; detail: string; cmdErr?: boolean } => {
+	// normalize ก่อนรัน — detail ต้องสะท้อนคำสั่งที่ execute จริง (ตัวถัดไปนับจากนี้คือ stripped command)
+	command = normalizeShellCommand(command);
 	try {
 		const out = execFileSync("sh", ["-c", command], { cwd, timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 		return { pass: true, exitCode: 0, detail: (out || "").trim().split("\n").slice(-3).join("\n").slice(-300) || "(exit 0, no output)" };

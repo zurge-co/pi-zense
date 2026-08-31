@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	normalizeShellCommand,
 	applyQualityGate,
 	buildGraderPrompt,
 	buildRequirementsPrompt,
@@ -366,4 +367,29 @@ test("modelMatchesPattern: exact / thinking-suffix / case-insensitive match, rej
 	assert.ok(modelMatchesPattern("OpenAI/GPT-4.1", "openai/gpt-4.1"));
 	assert.ok(!modelMatchesPattern("openai/gpt-4.1", "anthropic/claude"));
 	assert.ok(!modelMatchesPattern("synthetic/syn:large:text", "synthetic/syn:large")); // prefix ไม่ใช่ suffix pair
+});
+
+test("normalizeShellCommand: strips leading bash:/sh:/shell:/zsh: prefix once, no-op otherwise", () => {
+	assert.equal(normalizeShellCommand("bash: node --version"), "node --version");
+	assert.equal(normalizeShellCommand("sh:npm test"), "npm test");
+	assert.equal(normalizeShellCommand("SHELL: node --version"), "node --version");
+	assert.equal(normalizeShellCommand("zsh: make build"), "make build");
+	// no-op: ไม่มี prefix / prefix อยู่กลางสตริง / ทั้งก้อนเป็น shell command จริง
+	assert.equal(normalizeShellCommand("npm test"), "npm test");
+	assert.equal(normalizeShellCommand("bash --version"), "bash --version");
+	assert.equal(normalizeShellCommand('echo "a" && bash: node --version'), 'echo "a" && bash: node --version');
+});
+
+test("runCheckProbes: leading runner prefix executes the stripped command (pass/fail/cmdErr ตามจริง)", () => {
+	const probes = runCheckProbes(tmpdir(), [
+		{ id: "n1", text: "prefixed pass", check: "bash: node --version" },
+		{ id: "n2", text: "prefixed real fail", check: 'sh: node -e "process.exit(7)"' },
+		{ id: "n3", text: "prefixed missing cmd", check: "bash: definitely-missing-command-xyz --version" },
+		{ id: "n4", text: "prefixed compound", check: "shell: node --version && path exists: definitely-missing-file-xyz" },
+	]);
+	assert.deepEqual(probes.map((p) => p.status), ["pass", "fail", "skipped", "fail"]);
+	assert.equal(probes[1].exitCode, 7); // fail จริง = execute จริง ไม่ใช่ 127
+	assert.equal(probes[2].exitCode, 127); // คำสั่งข้างในหาย → cmdErr ยัง skipped เหมือนเดิม
+	assert.match(probes[2].detail, /probe command error/);
+	assert.match(probes[3].detail, /not found: definitely-missing-file-xyz/);
 });

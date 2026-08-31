@@ -149,3 +149,25 @@ test("buildRequirementsPrompt: enforces explore-first, JSON-only output and the 
 	const withLessons = buildRequirementsPrompt("x", ["📚 lesson one"]);
 	assert.match(withLessons, /Past lessons[\s\S]*lesson one/);
 });
+
+test("applyQualityGate: unsubstituted placeholder in check → specDebt + notes (fix check before signing)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "zense-ph-"));
+	try {
+		const gated = applyQualityGate(dir, {
+			title: "T",
+			intent: "i",
+			scope: ["."],
+			constraints: [],
+			criteria: [
+				{ id: "c1", text: "ok", check: "npm test" },
+				{ id: "c2", text: "ph", check: "path exists: src/<module>/x.ts" },
+			],
+			specDebt: [],
+		});
+		assert.ok(gated.notes.includes("placeholder:c2"));
+		assert.ok(!gated.notes.some((n) => n.startsWith("placeholder:c1")));
+		assert.ok(gated.draft.specDebt.some((d) => d.includes("มี placeholder ที่ไม่ได้ substitute ใน check") && d.includes("<module>")));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

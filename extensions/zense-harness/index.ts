@@ -58,6 +58,7 @@ interface State {
 	specSource?: "set" | "compile"; // spec ปัจจุบันมาจาก agent เขียนเอง (set) หรือ sub-agent (compile) — ใช้ telemetry H
 	lastEval?: { verdict: string; perCriteria: Record<string, string>; failedIds: string[]; probes: ProbeResult[]; at: number; specVersion?: number; head?: string }; // W2: evidence ล่าสุดจาก zense_eval → เป็น input ของ reviewer (specVersion+head ผูกกับรอบปัจจุบัน กัน evidence เก่าหลุดไปถึง reviewer)
 	baselineHead?: string;      // HEAD ของ main repo ตอน spec approval — ใช้ scope git evidence (log/diff เฉพาะตั้งแต่ baseline ของรอบนี้ ไม่ใช่ทั้งประวัติ)
+	evalOverrideFails?: { specVersion: number; ids: string[]; count: number }; // anti-loop: FAIL ที่มาจาก probe override ล้วน ซ้ำ ids เดิมกับ spec เวอร์ชันเดิม → DEADLOCK escalate แทนวน "กลับไปแก้" ไม่จบ
 	specMdPath?: string;            // path ของ archive spec .md ของเวอร์ชันปัจจุบัน (zense_eval append ผลลัพธ์ที่นี่)
 	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
 	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
@@ -70,6 +71,7 @@ interface SubagentRun {
 	at: number;
 	startedAt?: number;
 	logPath?: string;            // .zense/subagents/<stamp>-<role>.log — เขียน live ระหว่างรัน
+	model?: string;              // model ที่ sub-agent รันจริง ('provider/id' จาก JSONL events) — เทียบกับ .zense/models.json เพื่อดัก pi fallback เงียบๆ
 	status?: "running" | "done" | "failed";
 }
 /** Active per-session worktree: redirect ทุก tool call ของ main agent เข้าไปทำงานในนี้
@@ -363,11 +365,16 @@ export const applyQualityGate = (cwd: string, draft: SpecDraft): { draft: SpecDr
 			notes.push(`scope-missing:${s.slice(0, 30)}`);
 		}
 	}
-	for (const c of draft.criteria)
-		if (!isMachineCheckable(c.check)) {
+	for (const c of draft.criteria) {
+		const ph = hasUnsubstitutedPlaceholder(c.check);
+		if (ph) {
+			extraDebt.push(`quality-gate: ${c.id} มี placeholder ที่ไม่ได้ substitute ใน check ("${ph}") — ต้องแก้ check ก่อนเซ็น`);
+			notes.push(`placeholder:${c.id}`);
+		} else if (!isMachineCheckable(c.check)) {
 			extraDebt.push(`quality-gate: ${c.id} มี check ที่ตรวจอัตโนมัติไม่ได้ ("${c.check.slice(0, 80)}") — ต้อง verify ด้วยมนุษย์`);
 			notes.push(`manual-check:${c.id}`);
 		}
+	}
 	const similar = findSimilarSpec(cwd, draft);
 	if (similar) {
 		extraDebt.push(`quality-gate: intent คล้าย spec เก่า "${similar.title}" (${similar.file}, similarity=${similar.score.toFixed(2)}) — ยืนยันก่อนเซ็นว่าไม่ซ้ำซ้อน`);
@@ -390,6 +397,14 @@ export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
 };
 
 /** argv ของ pi sub-agent ตัวเดียวที่ runSubagent ใช้ — แยกออกมาเพื่อ test ได้ว่า flag ถูกต้อง */
+/** model ที่ sub-agent รันจริง (จาก JSONL events, รูป 'provider/id') ตรง pattern ที่ config ไว้ใน models.json ไหม —
+ *  match กรณี: exact (case-insensitive) หรือ pattern = usedModel + ':<thinking-level>' (suffix ที่ pi ตัดออกตอน resolve) */
+export const modelMatchesPattern = (usedModel: string, pattern: string): boolean => {
+	const used = usedModel.trim().toLowerCase();
+	const pat = pattern.trim().toLowerCase();
+	return used.length > 0 && (pat === used || pat.startsWith(`${used}:`));
+};
+
 export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[]): string[] => {
 	// argv: --exclude-tools ก่อน --model ก่อน task; ไม่ใส่ -- นำหน้า task (คงพฤติกรรมเดิมของไฟล์นี้)
 	const argv = ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "json", "--no-session"];
@@ -541,6 +556,16 @@ const PROBE_USAGE_ERROR_RE =
 const isProbeCommandError = (exitCode: number | undefined, detail: string): boolean =>
 	exitCode === 126 || exitCode === 127 || PROBE_USAGE_ERROR_RE.test(detail);
 
+/** placeholder ที่ไม่ได้ substitute ใน check — token รูป <word> หรือ {word}
+ *  (spec author เผลอเขียน check เป็น template เช่น "path exists: src/<module>/x", "grep -q foo {file}"
+ *  → รันแล้ว No such file / exit 1 เงียบ → ถูก probe primacy ทับ FAIL ทั้งที่คำสั่งเสีย เจอจริง)
+ *  ยกเว้น ${VAR} (shell variable — lookbehind (?<!\$)) — ไม่ใช่ placeholder */
+const PLACEHOLDER_TOKEN_RE = /<[A-Za-z][A-Za-z0-9_-]*>|(?<!\$)\{[A-Za-z][A-Za-z0-9_-]*\}/;
+export const hasUnsubstitutedPlaceholder = (check: string): string | null => {
+	const m = check.match(PLACEHOLDER_TOKEN_RE);
+	return m ? m[0] : null;
+};
+
 type CheckSegment = { kind: "exists"; path: string } | { kind: "shell"; command: string };
 
 const PATH_EXISTS_SEG_RE = /^\s*(?:path|file)\s+exists:\s*(.+?)\s*$/i;
@@ -583,6 +608,15 @@ const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pas
  */
 export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = PROBE_TIMEOUT_MS): ProbeResult[] =>
 	criteria.map((c) => {
+		// placeholder ที่ไม่ได้ substitute → คำสั่งเสียฝั่ง spec (ครอบทุก branch: path-exists/compound/shell)
+		// ห้ามไหลเป็น fail (probe primacy จะทับ grader → ลูปไม่จบ) — skipped พร้อมบอกทางแก้
+		const ph = hasUnsubstitutedPlaceholder(c.check);
+		if (ph)
+			return {
+				id: c.id,
+				status: "skipped" as const,
+				detail: `unsubstituted placeholder "${ph}" in check (→ fix spec via zense_spec, human review)`,
+			};
 		const segs = splitCompoundCheck(c.check);
 		if (segs?.every((s) => s.kind === "exists")) {
 			// path-exists ล้วน — resolve ใน process (single-path คงพฤติกรรมเดิมเป๊ะทั้ง status และ detail)
@@ -838,7 +872,7 @@ function runSubagent(
 	logPath: string = subagentLogPath(cwd, role),
 	modelPattern?: string,           // pi --model pattern (เช่น "anthropic/claude-sonnet") — undefined = ปล่อย pi ใช้ default
 	excludeTools?: string[],         // C: role read-only (requirements) → ["write","edit"] (ดู SUBAGENT_EXCLUDE_TOOLS)
-): Promise<{ ok: boolean; output: string; logPath: string }> {
+): Promise<{ ok: boolean; output: string; logPath: string; usedModel?: string }> {
 	const relLog = relative(cwd, logPath);
 	return new Promise((res) => {
 		const argv = buildSubagentArgv(task, modelPattern, excludeTools);
@@ -848,6 +882,7 @@ function runSubagent(
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let out = "";
+		let usedModel: string | undefined; // 'provider/id' ของ assistant message แรก — ใช้เทียบ model ที่ config ไว้
 		let finalText = ""; // assistant text ล่าสุดจาก message_end — ใช้เป็น output ตอนสำเร็จ แทน tail ของ raw stdout
 		const append = (chunk: string) => {
 			out = (out + chunk).slice(-1_000_000);
@@ -896,7 +931,14 @@ function runSubagent(
 				}
 				case "message_end": {
 					// จับ final assistant text (เฉพาะ content type text — ข้าม thinking) ไว้เป็น output ตอนสำเร็จ
-					const msg = (ev as { assistantMessageEvent?: { role?: string; content?: { type?: string; text?: string }[] } }).assistantMessageEvent;
+					// json mode แนบ message บน top-level field (pi dist/modes/json-event.js — เฉพาะ update events เท่านั้น
+					// ที่ถูกห่อเป็น assistantMessageEvent; โค้ดเดิมอ่านผิด field ทำให้ finalText/usedModel ไม่เคยถูกจับ
+					// → output หล่นเป็น raw tail ที่มี tool-noise ปน = สาเหตุ compile_spec parse draft ไม่เจอบางรอบ)
+					type JsonMsg = { role?: string; provider?: string; model?: string; content?: { type?: string; text?: string }[] };
+					const boxed = ev as { message?: JsonMsg; assistantMessageEvent?: JsonMsg };
+					const msg = boxed.message ?? boxed.assistantMessageEvent;
+					if (!usedModel && msg?.role === "assistant" && typeof msg.provider === "string" && typeof msg.model === "string")
+						usedModel = `${msg.provider}/${msg.model}`;
 					if (msg?.role === "assistant" && Array.isArray(msg.content)) {
 						const text = msg.content.filter((c) => c?.type === "text" && typeof c.text === "string").map((c) => c.text).join("");
 						if (text.trim()) {
@@ -928,7 +970,9 @@ function runSubagent(
 			if (lineBuf.trim()) handleLine(lineBuf); // flush บรรทัดค้างท้าย stream
 			const timedOut = signal === "SIGTERM";
 			appendFileSync(logPath, `\n--- exited code=${code} signal=${signal} ---\n`);
-			if (code === 0 && !signal) res({ ok: true, output: (finalText || out).slice(-16_000), logPath });
+			appendFileSync(logPath, `--- used model: ${usedModel ?? "(not captured from events)"} ---\n`);
+			const modelInfo = usedModel !== undefined ? { usedModel } : {};
+			if (code === 0 && !signal) res({ ok: true, output: (finalText || out).slice(-16_000), logPath, ...modelInfo });
 			else
 				res({
 					ok: false,
@@ -936,6 +980,7 @@ function runSubagent(
 						`sub-agent exited code=${code} signal=${signal}${timedOut ? ` (TIMEOUT ${timeoutMs / 1000}s)` : ""}\n` +
 						`last output:\n${out.slice(-4_000)}\n(full log: ${relLog})`,
 					logPath,
+					...modelInfo,
 				});
 		});
 	});
@@ -1200,6 +1245,13 @@ export default function (pi: ExtensionAPI) {
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
+			if (r.usedModel) run.model = r.usedModel;
+			// verify model ที่รันจริงตรง config — pi fallback ไป default เงียบๆ ได้เมื่อ pattern resolve ไม่ได้
+			// (provider/id ไม่รู้จัก → ไม่มี error, หล่นไป saved default = มักเป็น model ของ agent หลัก)
+			if (modelPattern && r.usedModel && !modelMatchesPattern(r.usedModel, modelPattern)) {
+				learn(ctx, `sub-agent model mismatch: ${role} requested ${modelPattern} but ran ${r.usedModel}`);
+				ctx.ui.notify(`⚠ sub-agent model mismatch: ${role} — config ขอ "${modelPattern}" แต่รันจริง "${r.usedModel}" (pi fallback? ตรวจ .zense/models.json / /zense models)`, "warning");
+			}
 			if (!r.ok) learn(ctx, `sub-agent failed: ${role} — ${r.output.split("\n")[0].slice(0, 160)}`);
 			return r;
 		} finally {
@@ -1929,6 +1981,13 @@ export default function (pi: ExtensionAPI) {
 			if (probeOverrides.length) learn(ctx, `grader: probe overrides → FAIL [${probeOverrides.join(",")}]`);
 			const failedCriteria = parsed.failedIds;
 			const verdict = failedCriteria.length || parsed.overall === "FAIL" ? "FAIL" : "PASS";
+			// section เดียวใช้ร่วมทั้ง FAIL/PASS/deadlock — แสดงหลักฐานที่ harness รันเองเสมอ
+			// (เดิม tool result มีแต่ output ดิบของ grader ที่อาจโดน probe primacy ทับแล้ว → header ขัดกับ body, agent เดาสาเหตุ FAIL ผิด)
+			const probeSection =
+				`\n\n## Probes (harness-executed, authoritative)\n` +
+				probes
+					.map((p) => `- ${p.id}: ${p.status}${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""} — ${p.detail.split("\n")[0].slice(0, 200)}`)
+					.join("\n");
 			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} judged=${Object.keys(parsed.perCriteria).length}/${state.spec.criteria.length} failed=[${failedCriteria.join(",")}]${probeOverrides.length ? ` probeOverrides=[${probeOverrides.join(",")}]` : ""}`);
 			// W2: เก็บ evidence ไว้เป็น input ของ reviewer (zense_review สร้าง evidence pack จาก lastEval)
 			// ผูก evidence กับรอบปัจจุบัน: specVersion + tree SHA ของ tree ที่ eval (HEAD^{tree} — ตั้งใจใช้ tree ไม่ใช่ commit SHA
@@ -1953,19 +2012,46 @@ export default function (pi: ExtensionAPI) {
 			if (verdict === "FAIL") {
 				// วงจร FAIL → ส่งกลับแก้: phase กลับ implementation, escalation need-fix, return isError สั่งแก้+eval ใหม่
 				state.phase = "implementation";
+				// anti-loop guard: FAIL ที่เกิดจาก probe override ล้วน (grader ให้ PASS หมดแต่ harness probe แดง) ซ้ำด้วย id set
+				// เดิมบน spec เวอร์ชันเดิม — agent แก้ต่อไม่ได้แล้ว (artifact ถูกตามผู้ตัดสิน แต่ check แดงซ้ำอาจมาจาก check เสีย)
+				// → DEADLOCK escalate ให้มนุษย์ตัดสิน แทนส่ง "กลับไปแก้" วนไม่จบ (เคสจริง: c2-c6 override ซ้ำทุกรอบ)
+				const soleOverride = failedCriteria.length > 0 && probeOverrides.length === failedCriteria.length;
+				const overrideKey = [...probeOverrides].sort().join(",");
+				const prevOvf = state.evalOverrideFails;
+				const sameOvf = !!(prevOvf && prevOvf.specVersion === state.spec.version && [...prevOvf.ids].sort().join(",") === overrideKey);
+				if (soleOverride) {
+					if (sameOvf && prevOvf && prevOvf.count >= 1) {
+						escalate("need-decision", `eval deadlock: probes and grader irreconcilably disagree [${overrideKey}] (spec v${state.spec.version}) — probe fail ซ้ำแต่ grader PASS หมด`, ctx);
+						state.evalOverrideFails = { specVersion: state.spec.version, ids: [...probeOverrides], count: prevOvf.count + 1 };
+						persist(); updateWidget(ctx);
+						return {
+							content: [{ type: "text", text:
+								`⚠️ Eval DEADLOCK — probes and grader irreconcilably disagree (spec v${state.spec.version}; escalation need-decision ถูกบันทึกแล้ว — /zense status)\n` +
+								`harness probes fail [${overrideKey}] ซ้ำ แต่ grader ให้ PASS พร้อมหลักฐานทั้งหมด — วน "กลับไปแก้" ไม่ได้ผล (ถ้า artifact ถูกแล้วจะไม่มีอะไรให้แก้)${probeSection}\n\n` +
+								`มนุษย์ตัดสิน: ถ้า check command ใน spec เสีย (placeholder/path ผิด) → re-spec ด้วย zense_spec เวอร์ชันใหม่แล้วเซ็นใหม่; ถ้า artifact ผิดจริง → บอกสิ่งที่ต้องแก้โดยตรง` }],
+							details: { deadlock: true, verdict, failedCriteria, probes, trajectory: state.trajectoryFlags },
+							isError: true,
+						};
+					}
+					state.evalOverrideFails = { specVersion: state.spec.version, ids: [...probeOverrides], count: sameOvf && prevOvf ? prevOvf.count + 1 : 1 };
+				}
 				state.escalations.push({ kind: "need-fix", detail: `criteria failed: ${failedCriteria.join(",") || "grader FAIL"}`, at: Date.now() });
 				persist(); updateWidget(ctx);
 				const fixMsg =
 					`❌ Eval FAIL — กลับไปแก้แล้วเรียก zense_eval ใหม่ (ห้ามไป review จนกว่าจะ PASS)\n` +
-					`criteria ที่ไม่ผ่าน: ${failedCriteria.length ? failedCriteria.join(", ") : "(overall FAIL — ดู grader output)"}\n\n` +
-					`${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
-				return { content: [{ type: "text", text: fixMsg }], details: { ok: grade.ok, verdict, failedCriteria, trajectory: state.trajectoryFlags }, isError: true };
+					`criteria ที่ไม่ผ่าน: ${failedCriteria.length ? failedCriteria.join(", ") : "(overall FAIL — ดู grader output)"}\n` +
+					(probeOverrides.length
+						? `⚠ probe override → FAIL [${probeOverrides.join(", ")}]: harness รัน check เองแล้วไม่ผ่านทั้งที่ grader ให้ PASS — สาเหตุได้ 2 ทาง: (1) artifact ผิดจริง → อ่าน probe detail ด้านล่างแล้วแก้; (2) check command ใน spec เสีย (placeholder/path ผิด — แก้ artifact ยังไงก็ไม่ผ่าน) → เรียก zense_spec เวอร์ชันใหม่แก้ check แล้วเซ็นใหม่\n`
+						: "\n") +
+					`${grade.output}${probeSection}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
+				return { content: [{ type: "text", text: fixMsg }], details: { ok: grade.ok, verdict, failedCriteria, probes, trajectory: state.trajectoryFlags }, isError: true };
 			}
 			// PASS: เดินไป review (unknown เป็นไปไม่ได้แล้ว — inconclusive ถูกดักไป escalate ก่อนหน้านี้)
 			// ต้องสั่งขั้นต่อไป explicit ในข้อความที่คืนให้ agent (เหมือน FAIL branch) —
 			// ถ้าไม่เขียนบอก agent จะถือว่างานจบแล้วตอบ user ทันที ทำให้ reviewer ไม่ถูกเรียกเลย
+			delete state.evalOverrideFails; // anti-loop guard: รอบจบสมบูรณ์ → ล้างตัวนับ
 			const report =
-				`${grade.output}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}` +
+				`${grade.output}${probeSection}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}` +
 				`\n\n✅ Eval PASS — ขั้นต่อไป (บังคับ): เรียก \`zense_review\` ทันทีเพื่อให้ reviewer sub-agent สร้าง review packet` +
 				` — ห้ามสรุป/ตอบ user จบงานก่อนจนกว่าจะเรียก zense_review แล้ว`;
 			// auto merge-back: เมื่อ eval PASS งาน verified สมบูรณ์ → merge worktree กลับเข้า main (auto-commit + git merge --no-ff)

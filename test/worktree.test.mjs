@@ -9,6 +9,8 @@ import {
 	buildWorktreeCommand,
 	createWorktree,
 	mergeWorktreeBack,
+	composeCommitMessage,
+	sanitizeSubject,
 	gitOk,
 } from "../extensions/zense-harness/index.ts";
 
@@ -43,7 +45,19 @@ test("buildWorktreeCommand: นำหน้าด้วย cd <wtRoot> && (path 
 
 // ----- git integration (temp repo) -----
 
-const SPEC = { version: 1, title: "t", intent: "t", scope: [], constraints: [], criteria: [], specDebt: [], approved: true };
+const SPEC = {
+	version: 1,
+	title: "Add src module",
+	intent: "Implement the src module for testing merge-back.",
+	scope: [],
+	constraints: [],
+	criteria: [],
+	specDebt: [],
+	approved: true,
+};
+
+/** git runner แบบระบุ dir (ไว้ commit ใน worktree) */
+const gitIn = (dir) => (args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
 /** สร้าง temp git repo พร้อม initial commit; คืน {cwd, cleanup} */
 const makeRepo = () => {
@@ -116,7 +130,7 @@ test("createWorktree: ใน dir ที่ไม่ใช่ git repo → คื
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: eval PASS → auto-commit + merge เข้า main + cleanup worktree/branch", () => {
+test("mergeWorktreeBack: eval PASS → squash เป็น commit เดียว subject=spec title + ff merge + cleanup worktree/branch", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
@@ -125,15 +139,57 @@ test("mergeWorktreeBack: eval PASS → auto-commit + merge เข้า main + c
 	// merge กลับ
 	const mr = mergeWorktreeBack(cwd, SPEC, wt);
 	assert.equal(mr.ok, true, `merge should succeed: ${mr.msg}`);
-	// main มี merge commit
-	const log = git(["log", "--oneline"]);
-	assert.ok(/merge impl/.test(log), `main log has merge commit: ${log}`);
+	// main ได้ commit เดียว subject = spec title (ไม่ใช่ "zense: impl v... (eval PASS)")
+	const subjects = git(["log", "--format=%s"]).trim().split("\n");
+	assert.deepEqual(subjects, ["Add src module", "init"], `main log subjects: ${subjects.join(" | ")}`);
+	// body มี intent + footer spec version
+	const body = git(["log", "-1", "--format=%B"]);
+	assert.ok(body.includes("Implement the src module for testing merge-back."), `body has intent: ${body}`);
+	assert.ok(body.includes("zense spec v1"), `body has spec footer: ${body}`);
 	// ไฟล์จาก worktree อยู่ใน main แล้ว
 	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "impl\n");
 	// worktree ถูก remove แล้ว
 	assert.ok(!existsSync(wt.root), "worktree dir removed");
 	const branches = git(["branch", "--list", wt.branch]);
 	assert.equal(branches.trim(), "", "branch deleted");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("mergeWorktreeBack: interim commits หลายอันใน branch → squash เป็น commit เดียว body มีรายชื่อ interim", () => {
+	const { cwd, base, git } = makeRepo();
+	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt);
+	const gwt = gitIn(wt.root);
+	// agent commit ย่อย 2 ครั้ง + ทิ้งไฟล์ uncommitted อีก 1
+	writeFileSync(join(wt.root, "a.txt"), "a\n");
+	gwt(["add", "a.txt"]);
+	gwt(["commit", "-q", "-m", "wip: add a"]);
+	writeFileSync(join(wt.root, "b.txt"), "b\n");
+	gwt(["add", "b.txt"]);
+	gwt(["commit", "-q", "-m", "wip: add b"]);
+	writeFileSync(join(wt.root, "c.txt"), "c\n");
+	const mr = mergeWorktreeBack(cwd, SPEC, wt);
+	assert.equal(mr.ok, true, `merge should succeed: ${mr.msg}`);
+	// main ได้ commit ใหม่ตัวเดียว (squash) — interim commits ไม่ตามเข้า main
+	const subjects = git(["log", "--format=%s"]).trim().split("\n");
+	assert.deepEqual(subjects, ["Add src module", "init"], `main log subjects: ${subjects.join(" | ")}`);
+	// แต่รายชื่อ interim commits ถูกเก็บไว้ใน body เพื่อ traceability
+	const body = git(["log", "-1", "--format=%B"]);
+	assert.ok(body.includes("wip: add a"), `body lists interim a: ${body}`);
+	assert.ok(body.includes("wip: add b"), `body lists interim b: ${body}`);
+	// ไฟล์ทั้งหมด (รวม uncommitted ตัวสุดท้าย) อยู่ใน main ครบ
+	for (const f of ["a.txt", "b.txt", "c.txt"]) assert.ok(existsSync(join(cwd, f)), `${f} merged to main`);
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("mergeWorktreeBack: worktree ไม่มีการเปลี่ยนแปลง → ok แต่ไม่สร้าง commit ว่างบน main", () => {
+	const { cwd, base, git } = makeRepo();
+	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt);
+	const mr = mergeWorktreeBack(cwd, SPEC, wt);
+	assert.equal(mr.ok, true, `merge should succeed: ${mr.msg}`);
+	assert.equal(git(["log", "--format=%s"]).trim(), "init", "main log unchanged (no empty merge commit)");
+	assert.ok(!existsSync(wt.root), "worktree cleaned up");
 	rmSync(base, { recursive: true, force: true });
 });
 
@@ -155,7 +211,7 @@ test("mergeWorktreeBack: conflict (อีก session แก้ไฟล์เด
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: ไม่มี .zense changes ใน merge (harness state ไม่ตามเข้า main)", () => {
+test("mergeWorktreeBack: ไม่มี .zense changes ใน merge (harness state ไม่ตามเข้า main) — ทั้งกรณี staged และ commit ย่อย", () => {
 	const { cwd, base, git } = makeRepo();
 	// สร้าง .zense/spec.md tracked ใน main ก่อน (commit)
 	mkdirSync(join(cwd, ".zense"), { recursive: true });
@@ -163,12 +219,34 @@ test("mergeWorktreeBack: ไม่มี .zense changes ใน merge (harness st
 	git(["add", "-A"]);
 	git(["commit", "-q", "-m", "add spec"]);
 	const wt = createWorktree(cwd, SPEC);
-	// แก้ source ใน worktree + แก้ .zense ใน worktree (จะถูก exclude จาก commit)
+	const gwt = gitIn(wt.root);
+	// แก้ source ใน worktree + commit ย่อยที่แตะ .zense (interim commit มี .zense → ตอน squash ต้องหลุดออก)
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
+	gwt(["add", "src.txt"]);
+	gwt(["commit", "-q", "-m", "wip: src"]);
 	writeFileSync(join(wt.root, ".zense", "spec.md"), "# new\n");
+	gwt(["add", ".zense/spec.md"]);
+	gwt(["commit", "-q", "-m", "wip: zense state"]);
 	const mr = mergeWorktreeBack(cwd, SPEC, wt);
 	assert.equal(mr.ok, true);
 	// main spec.md ยังเป็นของเดิม (ไม่ถูกลาก)
 	assert.equal(readFileSync(join(cwd, ".zense", "spec.md"), "utf8"), "# old\n");
+	// แต่ source ยังเข้า main ปกติ
+	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "impl\n");
 	rmSync(base, { recursive: true, force: true });
+});
+
+test("composeCommitMessage: subject เป็นบรรทัดเดียว ≤72 chars + list interim + footer", () => {
+	assert.equal(sanitizeSubject("hello   world\nsecond line"), "hello world second line");
+	const long = "x".repeat(100);
+	const s = sanitizeSubject(long);
+	assert.ok(s.length <= 72, `subject ≤72: ${s.length}`);
+	assert.ok(s.endsWith("…"), "long subject truncated with ellipsis");
+	assert.equal(sanitizeSubject(""), "zense impl");
+	const msg = composeCommitMessage(SPEC, ["wip: one", "wip: two"]);
+	assert.ok(msg.startsWith("Add src module\n\n"), `subject first: ${msg}`);
+	assert.ok(msg.includes("- wip: one") && msg.includes("- wip: two"), `lists interims: ${msg}`);
+	assert.ok(msg.includes("zense spec v1"), `footer: ${msg}`);
+	const bare = composeCommitMessage({ ...SPEC, intent: "" }, []);
+	assert.ok(!bare.includes("Squashed"), "no interim section when empty");
 });

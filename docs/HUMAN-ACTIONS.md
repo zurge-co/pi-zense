@@ -61,7 +61,7 @@ Agent เขียน ADR ลง `.zense/adr/` เองรายการที
 
 grader sub-agent เช็คผลงานเทียบทุก criterion — output ของมัน stream เข้า transcript สดๆ ระหว่างรัน
 
-**🌳 พอ eval PASS** harness auto-commit งานใน worktree แล้ว `git merge --no-ff` กลับเข้า `main` ให้เอง แล้ว cleanup worktree — ไม่ต้อง merge เอง ถ้าอีก session ไป merge ของตัวเองชนก่อนจะเกิด conflict → harness **escalate** (`need-decision`) แล้วเก็บ worktree ไว้ให้คุณ resolve ด้วยมือ (ไม่ clobber เงียบ) ถ้า eval **FAIL** เก็บ worktree ไว้แก้ต่อ ถ้าคุณปิด session ก่อน eval PASS เก็บ worktree ไว้ให้ merge ด้วยมือ (`git merge zense/impl/…`) — harness ไม่ auto-merge งานที่ยังไม่ verified
+**🌳 พอ eval PASS** harness squash ทุก commit ใน worktree branch เป็น commit เดียว (subject = spec title, body = intent + รายชื่อ interim commits) แล้ว merge กลับเข้า `main` ให้เอง — fast-forward เมื่อ `main` ไม่ได้ขยับ, `--no-ff` เมื่ออีก session ขยับไปก่อน — แล้ว cleanup worktree — ไม่ต้อง merge เอง ถ้าอีก session ไป merge ของตัวเองชนก่อนจะเกิด conflict → harness **escalate** (`need-decision`) แล้วเก็บ worktree ไว้ให้คุณ resolve ด้วยมือ (ไม่ clobber เงียบ) ถ้า eval **FAIL** เก็บ worktree ไว้แก้ต่อ ถ้าคุณปิด session ก่อน eval PASS เก็บ worktree ไว้ให้ merge ด้วยมือ (`git merge zense/impl/…`) — harness ไม่ auto-merge งานที่ยังไม่ verified
 (ดูย้อนหลังได้ที่ /zense agents)
 
 **📍 หน้าที่คุณ:** โฟกัส 2 ส่วนของรายงาน — `Spec debt (needs human)` (ต้อง review ด้วยตา)

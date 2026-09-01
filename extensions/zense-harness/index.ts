@@ -191,25 +191,66 @@ const excludeFromGitStatus = (cwd: string, absPath: string): void => {
 	}
 };
 
-/** merge worktree branch กลับเข้า main (auto-commit ใน worktree ก่อน, แล้ว git merge --no-ff).
+/** เรียง subject ของ commit ให้เป็นบรรทัดเดียว (≤72 chars) — ใช้ spec title ที่มนุษย์เซ็นอนุมัติแล้ว */
+export const sanitizeSubject = (title: string): string => {
+	const oneLine = (title || "").replace(/\s+/g, " ").trim();
+	if (!oneLine) return "zense impl";
+	return oneLine.length <= 72 ? oneLine : oneLine.slice(0, 71).trimEnd() + "…";
+};
+
+/** commit message ของ squashed impl commit — deterministic จาก spec (title=intent ที่มนุษย์เซ็นแล้ว
+ *  จึงอธิบายงานได้จริง ไม่ใช่ "zense: eval pass" กากๆ) + รายชื่อ interim commits ที่โดน squash เก็บไว้ใน body */
+export const composeCommitMessage = (spec: Spec, interimSubjects: string[]): string => {
+	const subject = sanitizeSubject(spec.title || `zense impl v${spec.version}`);
+	const body: string[] = [];
+	if (spec.intent?.trim()) body.push(spec.intent.trim());
+	if (interimSubjects.length) body.push(`Squashed interim commits:\n${interimSubjects.map((s) => `- ${s}`).join("\n")}`);
+	body.push(`zense spec v${spec.version} — eval PASS`);
+	return `${subject}\n\n${body.join("\n\n")}\n`;
+};
+
+/** merge worktree branch กลับเข้า main — squash ทุก commit ใน branch (นับจาก branch point) เป็น
+ *  commit เดียวด้วย message จาก spec ก่อนเสมอ (interim commits ของ agent ไม่ควรลากเข้า main เป็นกอง),
+ *  แล้ว merge แบบ --ff-only ก่อน (main ไม่ขยับ → history สะอาด ได้ commit squashed ตัวเดียว),
+ *  main ขยับไปแล้ว → fallback --no-ff พร้อม message จาก spec เหมือนกัน.
  *  conflict (เช่นอีก session merge ชน) → ไม่ force, คืน {ok:false,conflict:true} ให้ caller escalate.
  *  success → cleanup worktree + branch ด้วย */
 export const mergeWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): { ok: boolean; conflict?: boolean; msg: string } => {
-	// 1. stage changes ใน worktree (ยกเว้น .zense) แล้ว commit ถ้ามี — รวม untracked files ด้วย
-	//    (git diff --quiet HEAD ไม่เห็น untracked → ต้อง add ก่อนแล้วเช็ค --cached)
+	// 1. squash: หา branch point แล้วรวม interim commits เป็น commit เดียว (ยกเว้น .zense ตาม policy)
+	const mb = gitOk(["merge-base", wt.branch, "HEAD"], cwd);
+	const base = mb.ok ? mb.out.trim() : "";
+	const interimSubjects = base ? gitOk(["log", "--format=%s", `${base}..HEAD`], wt.root).out.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+	// stage changes ใน worktree (ยกเว้น .zense) — รวม untracked files ด้วย (git diff --quiet HEAD ไม่เห็น untracked)
 	gitOk(["add", "-A", "--", ".", ":!.zense"], wt.root);
 	if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
-		gitOk(["commit", "-m", `zense: impl v${spec.version} (eval PASS)`, "--no-verify"], wt.root);
+		gitOk(["commit", "-m", "(interim — squashed at merge-back)", "--no-verify"], wt.root);
+	}
+	const ahead = base ? Number(gitOk(["rev-list", "--count", `${base}..HEAD`], wt.root).out.trim() || "0") : 0;
+	if (base && ahead > 0) {
+		gitOk(["reset", "--soft", base], wt.root); // index ยังอุดมด้วย diff รวมของทุก interim commit
+		gitOk(["reset", "-q", "HEAD", "--", ".zense"], wt.root); // policy: .zense ไม่ตามเข้า main (best-effort unstage)
+		if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
+			gitOk(["commit", "-m", composeCommitMessage(spec, interimSubjects), "--no-verify"], wt.root);
+		} else {
+			// ไม่เหลือ source diff เลย (interim commits แตะเฉพาะ .zense) → รีเซ็ต branch กลับ base กัน commit ว่างหลุดเข้า main
+			gitOk(["reset", "--hard", base], wt.root);
+		}
+	} else if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
+		// หา branch point ไม่ได้ → squash ไม่ได้ แต่ยัง commit สิ่งที่ staged ด้วย message จาก spec
+		gitOk(["commit", "-m", composeCommitMessage(spec, []), "--no-verify"], wt.root);
 	}
 	// 2. merge เข้า main (main อาจมี uncommitted .zense/ — disjoint กับ source changes → git อนุญาต)
-	if (!gitOk(["merge", "--no-ff", wt.branch, "-m", `zense: merge impl v${spec.version} (eval PASS)`], cwd).ok) {
-		gitOk(["merge", "--abort"], cwd);
-		return { ok: false, conflict: true, msg: `merge conflict — แก้ด้วยมือ: cd ${wt.root} แล้ว resolve/commit ใน branch ${wt.branch}; จากนั้น git merge ${wt.branch}` };
+	const subject = sanitizeSubject(spec.title || `zense impl v${spec.version}`);
+	if (!gitOk(["merge", "--ff-only", wt.branch], cwd).ok) {
+		if (!gitOk(["merge", "--no-ff", wt.branch, "-m", `${subject}\n\nzense: merge worktree ${wt.branch} (spec v${spec.version}, eval PASS)`], cwd).ok) {
+			gitOk(["merge", "--abort"], cwd);
+			return { ok: false, conflict: true, msg: `merge conflict — แก้ด้วยมือ: cd ${wt.root} แล้ว resolve/commit ใน branch ${wt.branch}; จากนั้น git merge ${wt.branch}` };
+		}
 	}
 	// 3. cleanup worktree + branch
 	gitOk(["worktree", "remove", wt.dir, "--force"], cwd);
 	gitOk(["branch", "-D", wt.branch], cwd);
-	return { ok: true, msg: `merged ${wt.branch} → main` };
+	return { ok: true, msg: `merged ${wt.branch} → main (squashed, message จาก spec v${spec.version})` };
 };
 
 const freshState = (): State => ({

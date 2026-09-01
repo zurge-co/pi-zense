@@ -28,7 +28,7 @@ import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, read
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
-import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, wrapTextWithAnsi, type SelectItem } from "@earendil-works/pi-tui";
+import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type SelectItem } from "@earendil-works/pi-tui";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ----------------------------------------------------------------------------- types
@@ -873,7 +873,7 @@ const subagentLogPath = (cwd: string, role: string): string => {
  * (bug เดิม: execFile ค้างเงียบๆ จนโดน SIGTERM). ใช้ --mode json ไม่ใช่ print เพราะ print mode
  * buffer stdout ทั้งก้อนแล้วปล่อยทีเดียวตอนจบ (ทดลองแล้ว: chunk เดียวก่อน close — log ดูเหมือนค้าง
  * จนงานเสร็จ) ส่วน json mode เป็น JSONL event stream ที่ไหลตั้งแต่ต้น → parse event เป็น text
- * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ alt+z).
+ * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ ctrl+_).
  */
 function runSubagent(
 	role: string,
@@ -1136,6 +1136,14 @@ const availableModelChoices = (ctx: ExtensionContext): { pattern: string; label:
 	}
 };
 
+/** panelize(theme, lines, w): ทำให้ dialog "ลอย" ออกจาก transcript: pad ทุกบรรทัดเต็มความกว้าง w (นับด้วย visibleWidth —
+ *  ANSI escape ไม่กินจอ) แล้วทาพื้นหลังด้วย theme.bg("selectedBg") — token เดียวกับ
+ *  user message bubble ของ pi จึงตาม theme dark/light อัตโนมัติ (ห้าม hardcode ANSI/hex เอง)
+ *  theme.bg() reset เฉพาะ SGR 49 (bg) เลยไม่กินสี fg ภายในบรรทัด
+ *  theme param เป็น structural type — inject fake theme.bg ใน unit-test ได้โดยไม่ต้อง import Theme class */
+export const panelize = (theme: { bg: (color: string, text: string) => string }, lines: string[], w: number): string[] =>
+	lines.map((ln) => theme.bg("selectedBg", ln + " ".repeat(Math.max(0, w - visibleWidth(ln)))));
+
 // ----------------------------------------------------------------------------- extension
 
 export default function (pi: ExtensionAPI) {
@@ -1210,7 +1218,7 @@ export default function (pi: ExtensionAPI) {
 		const line =
 			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
 			` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
-			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (alt+z ดูสด)` : "") +
+			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+_ ดูสด)` : "") +
 			(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
 			(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 			(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : "");
@@ -1403,6 +1411,7 @@ export default function (pi: ExtensionAPI) {
 
 	// dialogs ของ zense render เป็น overlay ลอยทับ transcript แทนการ render inline ก่อเต็มจอ —
 	// ปิดแล้วกลับไปเห็น context เดิมทันที (กไก่ pi: ctx.ui.custom({ overlay: true, overlayOptions }))
+
 	const OVERLAY_LG = { overlay: true, overlayOptions: { width: "92%", minWidth: 60, maxHeight: "85%" } } as const; // spec sign dialog (ต้องอ่าน spec ยาว)
 	const OVERLAY_MD = { overlay: true, overlayOptions: { width: "80%", minWidth: 56, maxHeight: "80%" } } as const; // pickers กลาง
 	const OVERLAY_XL = { overlay: true, overlayOptions: { width: "95%", minWidth: 60, maxHeight: "90%" } } as const; // live tail
@@ -1485,7 +1494,7 @@ export default function (pi: ExtensionAPI) {
 					out.push(`  ${theme.fg("muted", `[n] ${nLabel}`)}`);
 					out.push(...new Text(theme.fg("dim", "↑↓ เลื่อนทีละบรรทัด • ←→ ทีละหน้า • g บนสุด • G ล่างสุด"), 1, 0).render(w));
 					out.push(...border.render(w));
-					return out;
+					return panelize(theme, out, w);
 				},
 				invalidate: () => {
 					cachedWidth = -1;
@@ -1523,14 +1532,15 @@ export default function (pi: ExtensionAPI) {
 			selectList.onCancel = () => done(null);
 			let filter = "";
 			return {
-				render: (w: number) => [
-					...border.render(w),
-					...new Text(theme.fg("accent", theme.bold(title)), 1, 0).render(w),
-					...new Text(theme.fg("dim", `filter: ${filter || "(พิมพ์เพื่อคัดกรอง)"}${hint ? ` • ${hint}` : ""}`), 1, 0).render(w),
-					...selectList.render(w),
-					...new Text(theme.fg("dim", "↑↓ เลือก • Enter ยืนยัน • Esc ยกเลิก • พิมพ์ = filter"), 1, 0).render(w),
-					...border.render(w),
-				],
+				render: (w: number) =>
+					panelize(theme, [
+						...border.render(w),
+						...new Text(theme.fg("accent", theme.bold(title)), 1, 0).render(w),
+						...new Text(theme.fg("dim", `filter: ${filter || "(พิมพ์เพื่อคัดกรอง)"}${hint ? ` • ${hint}` : ""}`), 1, 0).render(w),
+						...selectList.render(w),
+						...new Text(theme.fg("dim", "↑↓ เลือก • Enter ยืนยัน • Esc ยกเลิก • พิมพ์ = filter"), 1, 0).render(w),
+						...border.render(w),
+					], w),
 				invalidate: () => {
 					selectList.invalidate();
 				},
@@ -1600,7 +1610,7 @@ export default function (pi: ExtensionAPI) {
 					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
 					out.push(...new Text(theme.fg("dim", "auto refresh 1s • ↑↓ เลื่อน • ←→ หน้า • g/G บนสุด/ล่างสุด • Esc ปิด (sub-agent ยังรันต่อ)"), 1, 0).render(w));
 					out.push(...border.render(w));
-					return out;
+					return panelize(theme, out, w);
 				},
 				invalidate: () => {},
 				handleInput: (data: string) => {
@@ -1662,7 +1672,7 @@ export default function (pi: ExtensionAPI) {
 			container.addChild(new Spacer(1));
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 			return {
-				render: (w: number) => container.render(w),
+				render: (w: number) => panelize(theme, container.render(w), w),
 				invalidate: () => container.invalidate(),
 				handleInput: (data: string) => {
 					list.handleInput(data);
@@ -2157,10 +2167,10 @@ export default function (pi: ExtensionAPI) {
 
 	// ----- human gates: commands
 
-	// alt+z — pi รุ่นใหม่เอา ctrl+r ไปใช้กับ app.session.rename แล้ว (shortcut conflict ตอนโหลด) และ
-	// ctrl+letter อื่นก็โดนจองหมด (b/f/a/e/d/w/u/k/j/y/c/z/g/v/p/l/t/o/x/s/n) — ctrl+s/ctrl+q เสี่ยง XON/XOFF อีก
-	// เลยหนีมาใช้ alt+letter: alt+b/f/d/y ถูกใช้ใน editor แต่ alt+z ว่าง (fallback: /zense agents)
-	pi.registerShortcut("alt+z", {
+	// ทางเลือก shortcut ที่พิจารณาแล้ว: ctrl+letter ถูก pi จองหมด (docs/keybindings.md — undo ถึง ctrl+-),
+	// alt+letter เสียบน macOS เพราะ Option key default ส่งอักขระแทน Escape-prefix (กดไม่ติดเด็ดขาด)
+	// → ctrl+_ (payload 0x1F): pi-tui keys.js รองรับชัดเจน + ไม่ชน default binding ไหนของ pi เลย (fallback: /zense agents)
+	pi.registerShortcut(Key.ctrl("_"), {
 		description: "Zense: ดู sub-agent runs สดๆ (live tail)",
 		handler: (ctx) => openAgentsViewer(ctx),
 	});

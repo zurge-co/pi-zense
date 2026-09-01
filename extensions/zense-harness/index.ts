@@ -38,6 +38,7 @@ interface Spec {
 	version: number;
 	title: string;
 	intent: string;
+	approach?: string[];       // แนวทางการทำงาน (presentational — โชว์ตอน sign dialog ให้คนเซ็นเห็น shape ของงาน; optional เพราะ persisted spec เก่าไม่มี field นี้)
 	scope: string[];           // path globs the agent may touch
 	constraints: string[];
 	criteria: Criterion[];
@@ -226,6 +227,7 @@ const freshState = (): State => ({
 export interface SpecDraft {
 	title: string;
 	intent: string;
+	approach: string[];
 	scope: string[];
 	constraints: string[];
 	criteria: Criterion[];
@@ -264,7 +266,7 @@ export const extractJsonObject = (text: string): unknown => {
 
 /**
  * A: parse + validate draft ของ requirements sub-agent ตาม contract:
- *   - spec shape    → {title,intent,scope,constraints,criteria[{id,text,check}],specDebt}
+ *   - spec shape    → {title,intent,approach,scope,constraints,criteria[{id,text,check}],specDebt}
  *   - clarify shape (F) → {"questions": [...]} (ขอถามกลับแทนการเดา) — ถือเป็น clarify เฉพาะตอนที่ยังไม่มี criteria
  *   - อื่นๆ        → error พร้อมข้อความบอกว่าพังตรงไหน (ใช้เป็น feedback ตอน retry รอบ 2)
  * ผิดรูปเล็กน้อยจะถูก normalize (criteria id หาย → auto c1..n, array หาย → []) แต่
@@ -294,6 +296,7 @@ export const parseSpecDraft = (text: string): DraftParse => {
 		draft: {
 			title: typeof o.title === "string" && o.title.trim() ? o.title.trim() : "untitled",
 			intent: typeof o.intent === "string" ? o.intent : "",
+			approach: asStringArray(o.approach) ?? [],
 			scope: asStringArray(o.scope) ?? [],
 			constraints: asStringArray(o.constraints) ?? [],
 			criteria,
@@ -425,9 +428,10 @@ export const buildRequirementsPrompt = (intent: string, lessons: string[], facts
 
 ` +
 	`Step 2 — DRAFT exactly ONE JSON object:
-{"title": string, "intent": string, "scope": string[], "constraints": string[], "criteria": [{"id": string, "text": string, "check": string}], "specDebt": string[]}
+{"title": string, "intent": string, "approach": string[], "scope": string[], "constraints": string[], "criteria": [{"id": string, "text": string, "check": string}], "specDebt": string[]}
 Rules:
 - scope: the minimal list of path prefixes the main agent may modify.
+- approach: 3–7 short bullets describing the planned work — main steps, which files will be created or modified, and expected outcomes — grounded in your Step 1 exploration (no guessing). This is presentational info shown to the human signer so they can see what will actually happen; it is NOT a machine-checked criterion.
 - criteria: few and atomic. Each "check" MUST be an executable command verified in Step 1 (e.g. "npm test"), "path exists: <p>", or a compound of those joined with "&&" (e.g. "path exists: src/a.ts && npm test"). Anything you cannot verify by running a command belongs in specDebt instead (it becomes forced human review).
 - Output ONLY the JSON object — no markdown fences, no commentary.
 
@@ -503,6 +507,7 @@ export const loadSpecExemplar = (cwd: string): string | null => {
 			return JSON.stringify({
 				title: s.title,
 				intent: s.intent.slice(0, 200),
+				approach: (s.approach ?? []).slice(0, 3),
 				scope: s.scope,
 				criteria: s.criteria.slice(0, 3),
 				specDebt: s.specDebt.slice(0, 2),
@@ -1709,7 +1714,7 @@ export default function (pi: ExtensionAPI) {
 	 *  (sub-agent ดราฟต์) — สองทาง behavior เหมือนกันเป๊ะ ไม่ diverge เวลาแก้ทีหลัง */
 	const commitSpec = async (
 		ctx: ExtensionContext,
-		fields: { title?: string; intent?: string; scope?: string[]; constraints?: string[]; criteria?: Criterion[]; specDebt?: string[] },
+		fields: { title?: string; intent?: string; approach?: string[]; scope?: string[]; constraints?: string[]; criteria?: Criterion[]; specDebt?: string[] },
 		source: "set" | "compile",
 	): Promise<{ version: number; signed: boolean; mdPath: string }> => {
 		const version = (state.spec?.version ?? 0) + 1;
@@ -1717,6 +1722,7 @@ export default function (pi: ExtensionAPI) {
 			version,
 			title: fields.title ?? "untitled",
 			intent: fields.intent ?? "",
+			approach: fields.approach ?? [],
 			scope: fields.scope ?? [],
 			constraints: fields.constraints ?? [],
 			criteria: fields.criteria ?? [],
@@ -1784,6 +1790,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("set"), Type.Literal("compile_spec")] as const),
 			intent: Type.Optional(Type.String({ description: "What the user wants and why" })),
+			approach: Type.Optional(Type.Array(Type.String(), { description: "Planned work outline for the signer: main steps, files to create/modify, expected outcomes (presentational — not machine-checked)" })),
 			scope: Type.Optional(Type.Array(Type.String(), { description: "Path prefixes the agent may modify" })),
 			constraints: Type.Optional(Type.Array(Type.String())),
 			criteria: Type.Optional(
@@ -2267,6 +2274,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	function renderSpecMd(s: Spec): string {
-		return `# Spec v${s.version}: ${s.title}\napproved: ${s.approved}\n\n## Intent\n${s.intent}\n\n## Scope\n${s.scope.map((x) => `- ${x}`).join("\n")}\n\n## Constraints\n${s.constraints.map((x) => `- ${x}`).join("\n")}\n\n## Acceptance criteria\n${s.criteria.map((c) => `- [ ] ${c.id}: ${c.text} *(check: ${c.check})*`).join("\n")}\n\n## Spec debt (human-verified only)\n${s.specDebt.map((x) => `- ${x}`).join("\n")}\n`;
+		return `# Spec v${s.version}: ${s.title}\napproved: ${s.approved}\n\n## Intent\n${s.intent}\n\n${s.approach?.length ? "## Approach\n" + s.approach.map((x) => `- ${x}`).join("\n") + "\n\n" : ""}## Scope\n${s.scope.map((x) => `- ${x}`).join("\n")}\n\n## Constraints\n${s.constraints.map((x) => `- ${x}`).join("\n")}\n\n## Acceptance criteria\n${s.criteria.map((c) => `- [ ] ${c.id}: ${c.text} *(check: ${c.check})*`).join("\n")}\n\n## Spec debt (human-verified only)\n${s.specDebt.map((x) => `- ${x}`).join("\n")}\n`;
 	}
 }

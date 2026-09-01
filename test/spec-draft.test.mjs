@@ -43,6 +43,26 @@ test("parseSpecDraft: valid spec (plain/fenced) → kind spec with normalized id
 	assert.equal(fenced.draft.title, "T");
 });
 
+test("parseSpecDraft: approach normalize — missing/invalid → [], valid array → kept", () => {
+	const withApproach = parseSpecDraft(JSON.stringify({ ...GOOD_SPEC, approach: ["add approach field to Spec/SpecDraft", "wire prompt contract + renderSpecMd", "npm test green"] }));
+	assert.equal(withApproach.kind, "spec");
+	assert.deepEqual(withApproach.draft.approach, ["add approach field to Spec/SpecDraft", "wire prompt contract + renderSpecMd", "npm test green"]);
+	const missing = parseSpecDraft(JSON.stringify(GOOD_SPEC));
+	assert.equal(missing.kind, "spec");
+	assert.deepEqual(missing.draft.approach, []); // missing → []
+	const invalid = parseSpecDraft(JSON.stringify({ ...GOOD_SPEC, approach: 42 }));
+	assert.deepEqual(invalid.draft.approach, []); // invalid → []
+	// clarify/error contract ไม่พัง: clarify ยังชนะเฉพาะตอนไม่มี criteria
+	assert.equal(parseSpecDraft(JSON.stringify({ questions: ["q"], approach: ["x"] })).kind, "clarify");
+});
+
+test("buildRequirementsPrompt: JSON contract includes approach (presentational, not a machine-checked criterion)", () => {
+	const p = buildRequirementsPrompt("add dark mode", []);
+	assert.match(p, /"approach": string\[\]/);
+	assert.match(p, /approach: 3–7 short bullets/);
+	assert.match(p, /NOT a machine-checked criterion/);
+});
+
 test("parseSpecDraft: clarify shape (questions only) → kind clarify; questions+criteria → spec", () => {
 	const clarify = parseSpecDraft(JSON.stringify({ questions: ["which env?", "which db?"] }));
 	assert.equal(clarify.kind, "clarify");

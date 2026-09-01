@@ -275,13 +275,39 @@ export interface SpecDraft {
 	specDebt: string[];
 }
 
+/** คำถาม clarify หนึ่งข้อ (หลัง normalize): รองรับทั้ง legacy string (choices ว่าง) และ shape ใหม่
+ *  ที่ sub-agent แนบตัวเลือกคำตอบมาให้ — มนุษย์เลือกจาก list แล้ว Enter ได้ทันที หรือเลือก "อื่นๆ (พิมพ์เอง)" */
+export interface ClarifyQuestion {
+	question: string;
+	choices: string[];
+}
+
 export type DraftParse =
 	| { kind: "spec"; draft: SpecDraft }
-	| { kind: "clarify"; questions: string[] }
+	| { kind: "clarify"; questions: ClarifyQuestion[] }
 	| { kind: "error"; error: string };
 
 const asStringArray = (v: unknown): string[] | undefined =>
 	Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : undefined;
+
+/** normalize questions ของ clarify draft → ClarifyQuestion[] เสมอ: legacy string → choices ว่าง,
+ *  object {question, choices} → เก็บตามนั้น (จำกัด 6 ตัวเลือก กัน dialog ยาวเกิน); item ที่ไม่มีคำถามจริง → ข้าม;
+ *  ไม่เหลือข้อไหนเลย → undefined (ตกไปเป็น error criteria-missing ตาม contract เดิม ไม่ใช่ clarify) */
+export const asClarifyQuestions = (v: unknown): ClarifyQuestion[] | undefined => {
+	if (!Array.isArray(v)) return undefined;
+	const out: ClarifyQuestion[] = [];
+	for (const x of v) {
+		if (typeof x === "string") {
+			const q = x.trim();
+			if (q) out.push({ question: q, choices: [] });
+		} else if (x && typeof x === "object" && !Array.isArray(x)) {
+			const o = x as Record<string, unknown>;
+			const q = typeof o.question === "string" ? o.question.trim() : "";
+			if (q) out.push({ question: q, choices: (asStringArray(o.choices) ?? []).slice(0, 6) });
+		}
+	}
+	return out.length ? out : undefined;
+};
 
 /**
  * ดึง JSON object เดียวออกจาก output ของ sub-agent — ทนได้ทั้ง JSON ดิบ, ```json fence
@@ -308,7 +334,8 @@ export const extractJsonObject = (text: string): unknown => {
 /**
  * A: parse + validate draft ของ requirements sub-agent ตาม contract:
  *   - spec shape    → {title,intent,approach,scope,constraints,criteria[{id,text,check}],specDebt}
- *   - clarify shape (F) → {"questions": [...]} (ขอถามกลับแทนการเดา) — ถือเป็น clarify เฉพาะตอนที่ยังไม่มี criteria
+ *   - clarify shape (F) → {"questions": [...]} (ขอถามกลับแทนการเดา) — ถือเป็น clarify เฉพาะตอนที่ยังไม่มี criteria;
+ *     คำถามเป็นได้ทั้ง string (legacy) และ object {question, choices} (แนบตัวเลือกคำตอบ ให้มนุษย์เลือกเร็ว)
  *   - อื่นๆ        → error พร้อมข้อความบอกว่าพังตรงไหน (ใช้เป็น feedback ตอน retry รอบ 2)
  * ผิดรูปเล็กน้อยจะถูก normalize (criteria id หาย → auto c1..n, array หาย → []) แต่
  * criteria ว่าง / item ไม่มี text/check ถือว่า invalid เพราะทำให้ spec ไม่มีฟัน
@@ -318,7 +345,7 @@ export const parseSpecDraft = (text: string): DraftParse => {
 	if (raw === undefined || typeof raw !== "object" || raw === null || Array.isArray(raw))
 		return { kind: "error", error: "output ไม่ใช่ JSON object (หา JSON ที่ parse ได้ไม่เจอ — สั่ง output ONLY JSON ไว้)" };
 	const o = raw as Record<string, unknown>;
-	const qs = asStringArray(o.questions);
+	const qs = asClarifyQuestions(o.questions);
 	if (qs?.length && o.criteria === undefined) return { kind: "clarify", questions: qs.slice(0, 5) };
 	if (!Array.isArray(o.criteria) || o.criteria.length === 0)
 		return { kind: "error", error: "criteria ต้องเป็น array ที่มีอย่างน้อย 1 รายการ (แต่ละอันต้องมี check เป็นคำสั่งที่รันได้จริง)" };
@@ -477,7 +504,7 @@ Rules:
 - Output ONLY the JSON object — no markdown fences, no commentary.
 
 ` +
-	`Step 3 — CLARIFY INSTEAD OF GUESSING: if the request is ambiguous enough that a wrong guess would be costly, do NOT draft yet. Output exactly {"questions": ["short question", "…max 5…"]}. A human will answer and you will be re-run with the answers.` +
+	`Step 3 — CLARIFY INSTEAD OF GUESSING (grilling loop): if the request is ambiguous enough that a wrong guess would be costly, do NOT draft yet. You get multiple rounds — each round you are re-run with ALL previous answers appended to the Request — so ask only the 1–2 most decision-critical questions per round instead of dumping every doubt at once. Output exactly {"questions": ["short question", "…max 5…"]}; when a question has a few plausible answers, attach them as choices so the human can pick quickly (they can also type their own): {"questions": [{"question": "…", "choices": ["option A", "option B"]}]} — the two shapes may be mixed in one array.` +
 	// W3: exemplar (few-shot จาก spec ที่เคย signed) + facts (context priming ที่ harness เก็บเอง)
 	// แทรกก่อน lessons — หลักฐานจาก repo ตัวเองสำคัญกว่าบทเรียนกว้างๆ ทั้งคู่ optional เพื่อ backward compat
 	(exemplar ? `\n\nA previously SIGNED spec from this repo (style/format exemplar — do NOT copy its content):\n${exemplar}` : "") +
@@ -1601,6 +1628,22 @@ export default function (pi: ExtensionAPI) {
 			};
 		}, OVERLAY_MD);
 
+	// ----- คำถาม clarify ของ requirements: มี choices → picker (เลือกจากตัวเลือก หรือ "อื่นๆ (พิมพ์เอง)"), ไม่มี → input ตรง
+
+	/** ถามคำถาม clarify 1 ข้อ: choices ว่าง → free-text input เหมือนเดิม; มี choices → zensePick ที่ต่อท้ายด้วย
+	 *  "อื่นๆ (พิมพ์เอง)" ซึ่งเปิด free-text input ต่อ. Esc (picker/input) → undefined = ข้าม (semantics เดิมของ Esc ใน input) */
+	const askClarifyQuestion = async (ctx: ExtensionContext, q: ClarifyQuestion): Promise<string | undefined> => {
+		if (!q.choices.length) return ctx.ui.input(`❓ requirements ถาม: ${q.question}`, "(ตอบสั้นๆ ได้ — Esc/ว่าง = ข้าม)");
+		const FREE_TEXT = "__clarify_free_text__";
+		const picked = await zensePick(ctx, `❓ requirements ถาม: ${q.question}`, [
+			...q.choices.map((c) => ({ value: c, label: c })),
+			{ value: FREE_TEXT, label: "อื่นๆ (พิมพ์เอง)", description: "เลือกแล้วพิมพ์คำตอบเอง" },
+		]);
+		if (picked === null) return undefined;
+		if (picked === FREE_TEXT) return ctx.ui.input(`❓ requirements ถาม: ${q.question}`, "(พิมพ์คำตอบเอง — Esc/ว่าง = ข้าม)");
+		return picked;
+	};
+
 	// ----- live sub-agent observability: ดู output สดระหว่างรัน (กันลังเลว่าค้างหรือเปล่า)
 
 	const tailViewer = (ctx: ExtensionContext, run: SubagentRun): Promise<null> =>
@@ -1871,30 +1914,30 @@ export default function (pi: ExtensionAPI) {
 				const exemplar = loadSpecExemplar(ctx.cwd);
 				let intent = params.intent.trim();
 				let launches = 0;
-				let clarifyRounds = 0;      // F: รอบถาม-ตอบกับมนุษย์ (max 2)
+				let clarifyRounds = 0;      // F: รอบถาม-ตอบกับมนุษย์ (max 4 — wayfinder-style grilling วนได้หลายรอบ แต่มีเพดานกันรำคาญผู้ใช้)
 				let parseRetried = false;   // A: retry ตอน JSON invalid ได้ 1 ครั้ง
 				let clarifyClosed = false;  // คำถามถูกโยนลง specDebt แล้ว — ห้าม clarify ซ้ำ (กันลูปไม่รู้จบ)
-				// ลูปเดียวจัดการทั้ง clarify (F) และ parse-retry (A) — budget รวม 4 launches กันลูปพัง
-				while (launches < 4) {
+				// ลูปเดียวจัดการทั้ง clarify (F) และ parse-retry (A) — budget รวม 7 launches กันลูปพัง (4 clarify + retry + draft สุดท้ายพอดี)
+				while (launches < 7) {
 					launches++;
 					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons, facts, exemplar));
 					if (!draft.ok) return { content: [{ type: "text", text: `sub-agent failed: ${draft.output}` }], details: draft };
 					const parsed = parseSpecDraft(draft.output);
-					if (parsed.kind === "clarify" && !clarifyClosed && clarifyRounds < 2 && ctx.hasUI) {
+					if (parsed.kind === "clarify" && !clarifyClosed && clarifyRounds < 4 && ctx.hasUI) {
 						// F: ถามมนุษย์ทีละข้อ (Esc/เว้นว่าง = ข้าม) — คำถามที่ไม่ได้คำตอบโยนลง specDebt แล้วดราฟต์ต่อแบบ conservative
 						clarifyRounds++;
 						learn(ctx, `spec-draft: clarify round ${clarifyRounds} — ${parsed.questions.length} questions`);
 						const answers: string[] = [];
 						for (const q of parsed.questions) {
-							const a = await ctx.ui.input(`❓ requirements ถาม: ${q}`, "(ตอบสั้นๆ ได้ — Esc/ว่าง = ข้าม)");
+							const a = await askClarifyQuestion(ctx, q);
 							if (a === undefined) break;
-							if (a.trim()) answers.push(`- Q: ${q}\n  A: ${a.trim()}`);
+							if (a.trim()) answers.push(`- Q: ${q.question}\n  A: ${a.trim()}`);
 						}
 						const unanswered = parsed.questions.slice(answers.length);
 						if (answers.length) intent += `\n\nHuman clarifications (authoritative — refine the request accordingly):\n${answers.join("\n")}`;
 						if (unanswered.length) {
 							clarifyClosed = true;
-							intent += `\n\nUnanswered clarifying questions — list them in specDebt and proceed with conservative, explicit assumptions:\n${unanswered.map((q) => `- ${q}`).join("\n")}`;
+							intent += `\n\nUnanswered clarifying questions — list them in specDebt and proceed with conservative, explicit assumptions:\n${unanswered.map((q) => `- ${q.question}`).join("\n")}`;
 						}
 						continue;
 					}
@@ -1902,7 +1945,7 @@ export default function (pi: ExtensionAPI) {
 						// ถามมนุษย์ไม่ได้จริงๆ (ไม่มี UI / ครบรอบ / ถูกข้าม) — โยนคำถามลง specDebt ให้ดราฟต์ต่อแบบ conservative
 						clarifyClosed = true;
 						learn(ctx, `spec-draft: clarify forfeited (${!ctx.hasUI ? "no UI" : "rounds exhausted"}) — questions → specDebt`);
-						intent += `\n\nClarifying questions that could NOT be asked — list them in specDebt and draft the spec with conservative, explicit assumptions:\n${parsed.questions.map((q) => `- ${q}`).join("\n")}`;
+						intent += `\n\nClarifying questions that could NOT be asked — list them in specDebt and draft the spec with conservative, explicit assumptions:\n${parsed.questions.map((q) => `- ${q.question}`).join("\n")}`;
 						continue;
 					}
 					if (parsed.kind === "error") {

@@ -66,10 +66,34 @@ test("buildRequirementsPrompt: JSON contract includes approach (presentational, 
 test("parseSpecDraft: clarify shape (questions only) → kind clarify; questions+criteria → spec", () => {
 	const clarify = parseSpecDraft(JSON.stringify({ questions: ["which env?", "which db?"] }));
 	assert.equal(clarify.kind, "clarify");
-	assert.deepEqual(clarify.questions, ["which env?", "which db?"]);
+	assert.deepEqual(clarify.questions, [
+		{ question: "which env?", choices: [] },
+		{ question: "which db?", choices: [] },
+	]);
 	// มี criteria แล้ว = draft จริง ไม่ใช่ clarification
 	const withCriteria = parseSpecDraft(JSON.stringify({ questions: ["q"], ...GOOD_SPEC }));
 	assert.equal(withCriteria.kind, "spec");
+});
+
+test("parseSpecDraft: clarify questions normalize — choices shape, mixed legacy, junk skipped, cap 5", () => {
+	// shape ใหม่: sub-agent แนบ choices มาให้มนุษย์เลือกเร็ว
+	const withChoices = parseSpecDraft(JSON.stringify({ questions: [{ question: "pick env?", choices: ["dev", "prod"] }] }));
+	assert.equal(withChoices.kind, "clarify");
+	assert.deepEqual(withChoices.questions, [{ question: "pick env?", choices: ["dev", "prod"] }]);
+	// ปนกันใน array เดียวได้: legacy string + object ใหม่
+	const mixed = parseSpecDraft(JSON.stringify({ questions: ["plain?", { question: "with choice?", choices: ["a"] }] }));
+	assert.deepEqual(mixed.questions, [
+		{ question: "plain?", choices: [] },
+		{ question: "with choice?", choices: ["a"] },
+	]);
+	// item ที่ไม่มีคำถามจริงถูกข้าม
+	const junky = parseSpecDraft(JSON.stringify({ questions: [{ foo: 1 }, "real?"] }));
+	assert.deepEqual(junky.questions, [{ question: "real?", choices: [] }]);
+	// เหลือ 0 ข้อ → ไม่ใช่ clarify (ตกเป็น error criteria-missing ตาม contract เดิม)
+	assert.equal(parseSpecDraft(JSON.stringify({ questions: [{ foo: 1 }] })).kind, "error");
+	// cap 5 ข้อเหมือนเดิม (กันคำถามล้น dialog)
+	const many = parseSpecDraft(JSON.stringify({ questions: ["1", "2", "3", "4", "5", "6"] }));
+	assert.equal(many.questions.length, 5);
 });
 
 test("parseSpecDraft: invalid outputs → kind error with a specific reason (retry feedback)", () => {
@@ -164,6 +188,9 @@ test("buildRequirementsPrompt: enforces explore-first, JSON-only output and the 
 	assert.match(p, /EXPLORE \(read-only/);
 	assert.match(p, /NO write\/edit tools/);
 	assert.match(p, /"questions"/);
+	assert.match(p, /"choices"/); // grilling loop: sub-agent แนบตัวเลือกคำตอบได้
+	assert.match(p, /type their own/); // ผู้ใช้พิมพ์เองได้เสมอ
+	assert.match(p, /1–2 most decision-critical/); // ถามทีละน้อยข้อ วนหลายรอบ
 	assert.match(p, /Request: add dark mode$/);
 	assert.doesNotMatch(p, /Past lessons/);
 	const withLessons = buildRequirementsPrompt("x", ["📚 lesson one"]);

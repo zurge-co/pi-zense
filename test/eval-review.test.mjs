@@ -224,14 +224,14 @@ test("buildReviewerPrompt: carries eval evidence + git + flags/debt, defines str
 	assert.match(p, /Intent: make things fast/);
 	assert.match(p, /Eval verdict: PASS/);
 	assert.match(p, /C2=FAIL/);
-	assert.match(p, /C1:pass/);
+	assert.match(p, /C1: pass — ok/); // r2: probe แนบ detail verbatim แทน id:status ล้วน
 	assert.match(p, /out-of-scope write: x/);
 	assert.match(p, /debt one/);
 	assert.match(p, /need-fix: criteria failed: C2/);
 	assert.match(p, /abc impl v2/);
 	assert.match(p, /never write "to be implemented"/);
 	assert.match(p, /## Human actions/);
-	assert.match(buildReviewerPrompt("i", undefined, [], [], [], "", "Rollback"), /missing sections: Rollback/);
+	assert.match(buildReviewerPrompt("i", undefined, [], [], [], "", "Rollback"), /was rejected: Rollback/); // r5: feedback ใช้ได้ทั้ง schema และ grounding
 });
 
 test("buildReviewerPrompt: stale lastEval (version/tree) is dropped and warned", () => {
@@ -246,7 +246,7 @@ test("buildReviewerPrompt: stale lastEval (version/tree) is dropped and warned",
 	const staleV = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 2, head: "tree-aaa" });
 	assert.doesNotMatch(staleV, /Eval verdict: PASS/);
 	assert.doesNotMatch(staleV, /C1=PASS/);
-	assert.doesNotMatch(staleV, /C1:pass/);
+	assert.doesNotMatch(staleV, /C1: pass/);
 	assert.match(staleV, /STALE eval evidence/);
 	// tree ไม่ตรง (แก้โค้ดหลัง eval) → stale เช่นกัน
 	const staleT = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 1, head: "tree-bbb" });
@@ -256,7 +256,7 @@ test("buildReviewerPrompt: stale lastEval (version/tree) is dropped and warned",
 	const fresh = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 1, head: "tree-aaa" });
 	assert.match(fresh, /Eval verdict: PASS/);
 	assert.match(fresh, /C1=PASS/);
-	assert.match(fresh, /C1:pass/);
+	assert.match(fresh, /C1: pass — ok/); // r2: probe detail verbatim
 	assert.doesNotMatch(fresh, /STALE/);
 });
 

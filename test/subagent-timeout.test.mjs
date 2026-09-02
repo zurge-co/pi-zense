@@ -1,75 +1,66 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import {
-	buildRequirementsPrompt,
-	gatherRepoFacts,
-	probeToolchain,
-	subagentTimeout,
-} from "../extensions/zense-harness/index.ts";
+import { subagentTimeout } from "../extensions/zense-harness/index.ts";
 
 // B: timeout ต่อ role — ป้องกัน regression ของ bug "code=143 signal=null" (timeout ถูกรายงานเป็น crash)
-test("subagentTimeout: per-role map, default fallback, env override", () => {
+test("subagentTimeout: per-role map + default fallback (ไม่มี env override แล้ว)", () => {
 	assert.equal(subagentTimeout("requirements"), 600_000);
 	assert.equal(subagentTimeout("grader"), 600_000);
 	assert.equal(subagentTimeout("reviewer"), 480_000);
 	assert.equal(subagentTimeout("unknown-role"), 300_000); // role แปลก → default
-	assert.equal(subagentTimeout("requirements", { ZENSE_SUBAGENT_TIMEOUT_MS: "120000" }), 120_000);
-	assert.equal(subagentTimeout("requirements", {}), 600_000); // ไม่มี env = ไม่ override
-	assert.equal(subagentTimeout("requirements", { ZENSE_SUBAGENT_TIMEOUT_MS: "0" }), 600_000); // ค่าไม่ valid ไม่ override
-	assert.equal(subagentTimeout("requirements", { ZENSE_SUBAGENT_TIMEOUT_MS: "-5" }), 600_000);
-	assert.equal(subagentTimeout("requirements", { ZENSE_SUBAGENT_TIMEOUT_MS: "abc" }), 600_000);
 });
 
-// C: toolchain probe — filter เฉพาะที่มีจริง + best-effort ไม่ throw แม้ PATH พัง
-test("probeToolchain: keeps existing tools only, tolerates failure", () => {
-	const r = probeToolchain(["node", "definitely-not-a-tool-xyz-123"]);
-	assert.ok(r.includes("node")); // test รันบน node → ต้องเจอ
-	assert.ok(!r.includes("definitely-not-a-tool-xyz-123"));
-	assert.deepEqual(probeToolchain(["definitely-not-a-tool-xyz-123"]), []);
-	assert.deepEqual(probeToolchain(["node"], { PATH: "/nonexistent-dir-xyz" }), []); // PATH ว่าง → [] ไม่ throw
-});
-
-// C: gatherRepoFacts ต้องดัน toolchain fact (ให้ sub-agent ไม่ต้อง probe ทีละตัวจนชน timeout)
-test("gatherRepoFacts: toolchain fact + package facts from tmp dir", () => {
-	const dir = mkdtempSync(join(tmpdir(), "zense-facts-"));
+// s2: ช่องปรับของ agent = .zense/config.json (key subagentTimeoutMs) — อ่านสดทุก call ไม่ cache
+test("subagentTimeout: .zense/config.json overrides built-in map, read fresh per call", () => {
+	const dir = mkdtempSync(join(tmpdir(), "zense-cfg-"));
 	try {
-		writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: { test: "node --test" } }));
-		const facts = gatherRepoFacts(dir);
-		assert.ok(facts.some((f) => f.includes("package: demo")));
-		assert.ok(facts.some((f) => f.includes("scripts:") && f.includes("node --test")));
-		const toolFact = facts.find((f) => f.includes("toolchain on PATH"));
-		assert.ok(toolFact, "missing toolchain fact");
-		assert.match(toolFact, /node/);
-		assert.match(toolFact, /do NOT re-probe/);
+		// ยังไม่มี config → built-in map
+		assert.equal(subagentTimeout("requirements", dir), 600_000);
+		mkdirSync(join(dir, ".zense"), { recursive: true });
+		// role entry → ทับ map
+		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 900_000 } }));
+		assert.equal(subagentTimeout("requirements", dir), 900_000);
+		assert.equal(subagentTimeout("grader", dir), 600_000); // role อื่นไม่โดน
+		// default entry ครอบ role ที่ไม่ระบุ
+		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { default: 45_000 } }));
+		assert.equal(subagentTimeout("grader", dir), 45_000);
+		assert.equal(subagentTimeout("requirements", dir), 45_000);
+		// role entry ชนะ default
+		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { default: 45_000, reviewer: 120_000 } }));
+		assert.equal(subagentTimeout("reviewer", dir), 120_000);
+		// ค่า invalid (0/ติดลบ/ไม่ใช่ตัวเลข) → ข้าม ไปใช้ map
+		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 0, default: -5 } }));
+		assert.equal(subagentTimeout("requirements", dir), 600_000);
+		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: "60k" } }));
+		assert.equal(subagentTimeout("requirements", dir), 600_000);
+		// JSON พัง → map (ไม่ throw)
+		writeFileSync(join(dir, ".zense", "config.json"), "{oops");
+		assert.equal(subagentTimeout("requirements", dir), 600_000);
+		// อ่านสด: เขียนใหม่ตอน runtime → call ถัดไปเห็นทันที
+		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 777_000 } }));
+		assert.equal(subagentTimeout("requirements", dir), 777_000);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-// C: manifest ต่อ ecosystem — repo ที่ไม่มี package.json (cargo/go/deno) ต้องได้ fact ครอบ ไม่ให้เดาเอง
-test("gatherRepoFacts: ecosystem manifests (non-npm repos) become facts", () => {
-	const dir = mkdtempSync(join(tmpdir(), "zense-manifests-"));
+// s2: worktree ไม่มี .zense (gitignored) → fallback ไป main repo
+test("subagentTimeout: cwd ไม่มี config → fallback dir ถัดไป (worktree → main repo)", () => {
+	const wt = mkdtempSync(join(tmpdir(), "zense-wt-"));
+	const main = mkdtempSync(join(tmpdir(), "zense-main-"));
 	try {
-		writeFileSync(join(dir, "Cargo.toml"), "[package]\nname = \"demo\"\n");
-		writeFileSync(join(dir, "go.mod"), "module demo\n");
-		writeFileSync(join(dir, "app.csproj"), "<Project/>\n");
-		const facts = gatherRepoFacts(dir).join("\n");
-		assert.match(facts, /Cargo\.toml/);
-		assert.match(facts, /go\.mod/);
-		assert.match(facts, /app\.csproj/);
-		assert.match(facts, /do not re-scan/);
+		mkdirSync(join(main, ".zense"), { recursive: true });
+		writeFileSync(join(main, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 800_000 } }));
+		assert.equal(subagentTimeout("requirements", wt, main), 800_000); // wt ไม่มี → main
+		mkdirSync(join(wt, ".zense"), { recursive: true });
+		writeFileSync(join(wt, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 111_000 } }));
+		assert.equal(subagentTimeout("requirements", wt, main), 111_000); // wt มีของตัวเอง → ชนะ
+		assert.equal(subagentTimeout("reviewer", wt, main), 480_000); // ไม่มีใน config ทั้งคู่ → map
 	} finally {
-		rmSync(dir, { recursive: true, force: true });
+		rmSync(wt, { recursive: true, force: true });
+		rmSync(main, { recursive: true, force: true });
 	}
-});
-
-// C: prompt ต้องสั่งเรื่อง hard time limit + ไม่ re-probe สิ่งที่ facts มี (ต้นตอ code=143 เดิม)
-test("buildRequirementsPrompt: hard time limit + batched probe + trust facts", () => {
-	const p = buildRequirementsPrompt("do x", [], ["- toolchain on PATH: node"]);
-	assert.match(p, /HARD wall-clock limit/);
-	assert.match(p, /ONE bash loop/);
-	assert.match(p, /do NOT re-probe one-by-one|never probe toolchains or test commands one-by-one/);
 });

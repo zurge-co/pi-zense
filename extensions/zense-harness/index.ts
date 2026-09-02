@@ -469,16 +469,29 @@ export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
 
 /** B (2026-09-02): timeout ต่อ role — log จริง (.zense/subagents/) พิสูจน์ว่า requirements/grader โดนฆ่า
  *  ที่ 240s พอดีทุกไฟล์ (งาน explore repo + รัน check นานกว่านั้น). override ทุก role ได้ด้วย
- *  env ZENSE_SUBAGENT_TIMEOUT_MS (มิลลิวินาที, >0) — ไว้ตอน debug หรือเครื่องช้า */
+ *  ไม่มี env override (ถอด 2026-09-02 ตามคำตัดสินใจ user: env เป็น knob ที่ agent แกะไม่ได้ตอนรัน)
+ *  ช่องปรับของ agent = .zense/config.json key subagentTimeoutMs {"<role>": ms, "default": ms}
+ *  อ่านสดทุกครั้งที่ launch (ไม่ cache) → agent เขียนไฟล์ปุ๊บ รอบถัดไปใช้ทันที ไม่ต้อง restart
+ *  (ส่ง cwd ก่อนแล้ว fallbackCwd: worktree ไม่มี .zense ของตัวเองเพราะ gitignored → fallback ไป main repo) */
 export const SUBAGENT_TIMEOUT_MS: Record<string, number> = {
 	requirements: 600_000,
 	grader: 600_000,
 	reviewer: 480_000,
 	default: 300_000,
 };
-export const subagentTimeout = (role: string, env = process.env): number => {
-	const override = Number(env.ZENSE_SUBAGENT_TIMEOUT_MS);
-	if (Number.isFinite(override) && override > 0) return override;
+export const subagentTimeout = (role: string, cwd?: string, fallbackCwd?: string): number => {
+	for (const dir of [cwd, fallbackCwd]) {
+		if (!dir) continue;
+		try {
+			const cfgPath = join(zenseDir(dir), "config.json");
+			if (!existsSync(cfgPath)) continue;
+			const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as { subagentTimeoutMs?: Record<string, number> };
+			const v = cfg.subagentTimeoutMs?.[role] ?? cfg.subagentTimeoutMs?.default;
+			if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+		} catch {
+			/* config พัง/อ่านไม่ได้ → ลอง dir ถัดไป แล้วเหลือ built-in map */
+		}
+	}
 	return SUBAGENT_TIMEOUT_MS[role] ?? SUBAGENT_TIMEOUT_MS.default;
 };
 
@@ -879,6 +892,27 @@ export const parseReviewerPacket = (text: string): PacketParse => {
 	return { ok: missing.length === 0, missing, tldr };
 };
 
+/** r4 (2026-09-02): ตัวตรวจ packet หลอน — ดึง token ที่ "อ้างว่าเป็นของจริง" จาก packet แล้วเช็คว่ามี
+ *  อยู่ใน evidence ที่ harness feed จริงไหม (BACKLOG item 5: reviewer เคยแต่ง ENTROPY_TIMEOUT_MINS /
+ *  SUB_AGENT_KILLED / commit hash ปลอมขึ้นมาเอง) จับ 3 แบบ: SCREAMING_SNAKE ที่มี _ อย่างน้อย 1 ชุด
+ *  (กัน false-positive กับ PASS/FAIL/OVERALL), hex 7-40 ตัว (commit hash), ข้อความใน backtick
+ *  — backtick หลายคำ = การเน้นประโยค ไม่ใช่ identifier → ข้าม; backtick คำเดียวที่หน้าตาเป็น path
+ *  ให้ผ่านถ้าไฟล์มีจริง (pathExists inject เพื่อ unit-test) */
+export const findUngroundedTokens = (packet: string, evidence: string, pathExists: (p: string) => boolean = existsSync): string[] => {
+	const found = new Set<string>();
+	const isPathy = (t: string) => t.includes("/") || /\.[a-z]{1,6}$/i.test(t);
+	for (const m of packet.matchAll(/`([^`\n]+)`/g)) {
+		const t = m[1].trim();
+		if (!t || /\s/.test(t) || evidence.includes(t)) continue;
+		const bare = t.replace(/:\d+$/, ""); // file:line → ตัด :line ก่อน (ไม่งั้น regex นามสกุลไม่แมตช์และ path check ไม่ทำงาน)
+		if (isPathy(bare) && pathExists(bare)) continue;
+		found.add(t);
+	}
+	for (const m of packet.matchAll(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g)) if (!evidence.includes(m[0])) found.add(m[0]);
+	for (const m of packet.matchAll(/\b[0-9a-f]{7,40}\b/g)) if (!evidence.includes(m[0])) found.add(m[0]);
+	return [...found];
+};
+
 /** eval evidence นี้เป็นของรอบปัจจุบันหรือไม่ — stale เมื่อ spec version เปลี่ยน หรือ tree ที่ eval ไม่ตรง tree ที่กำลัง review
  *  (ใช้ tree SHA ไม่ใช่ commit SHA โดยตั้งใจ: merge-back --no-ff หลัง eval PASS ให้ tree เดิมเป๊ะ → ไม่ทำให้รอบปกติ stale ปลอม)
  *  current ไม่ส่งมา (legacy callsite) → ไม่เช็ค เพื่อ backward compat */
@@ -905,27 +939,38 @@ export const buildReviewerPrompt = (
 	gitSummary: string,
 	feedback: string,
 	freshness?: { specVersion?: number; head?: string }, // spec version + tree SHA (HEAD^{tree}) ของ tree ที่กำลัง review
+	criteria?: { id?: string; text: string; check?: string }[], // r2: criteria จริงแบบ verbatim (แทน id=verdict ล้วน)
 ): string => {
 	const stale = isLastEvalStale(lastEval, freshness);
 	const ev = stale ? undefined : lastEval;
+	// r2: probes แนบ detail จริง (เดิมย่อเหลือ id:status จน reviewer แต่งรายละเอียดเอง — BACKLOG item 5)
+	const probeLines = (ev?.probes ?? [])
+		.map((p) => `  - ${p.id}: ${p.status}${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""} — ${p.detail.split("\n")[0].slice(0, 160)}`)
+		.join("\n");
+	const criteriaLines = (criteria ?? [])
+		.map((c) => `  - ${c.id ?? "?"}: ${ev?.perCriteria?.[c.id ?? ""] ?? "?"} — ${c.text}${c.check ? ` [check: ${c.check}]` : ""}`)
+		.join("\n");
 	return `You are the REVIEWER sub-agent. The work is DONE and already machine-graded — ground every statement in the evidence below; never write \"to be implemented\".\n\n` +
 	`Evidence:\n- Intent: ${intent}\n- Eval verdict: ${ev?.verdict ?? "(no eval record)"}` +
 	(stale ? `\n- ⚠️ STALE eval evidence withheld: the stored zense_eval result belongs to an older spec version (v${lastEval?.specVersion ?? "?"}) or tree (${lastEval?.head?.slice(0, 8) ?? "?"}) — re-run zense_eval before trusting any eval verdict.` : "") +
-	(ev?.perCriteria && Object.keys(ev.perCriteria).length
-		? `\n- Per-criteria verdicts: ${Object.entries(ev.perCriteria).map(([id, v]) => `${id}=${v}`).join(", ")}`
-		: "") +
-	(ev?.probes?.length ? `\n- Probe results (harness-executed): ${ev.probes.map((p) => `${p.id}:${p.status}`).join(", ")}` : "") +
+	(criteriaLines ? `\n- Criteria verdicts (authoritative — id: verdict — text [check]):\n${criteriaLines}` : ev?.perCriteria && Object.keys(ev.perCriteria).length ? `\n- Per-criteria verdicts: ${Object.entries(ev.perCriteria).map(([id, v]) => `${id}=${v}`).join(", ")}` : "") +
+	(probeLines ? `\n- Probe results (harness-executed, verbatim):\n${probeLines}` : "") +
 	`\n- Trajectory flags: ${flags.length ? flags.join(" | ") : "(none)"}` +
 	`\n- Spec debt (human-verified): ${specDebt.length ? specDebt.join(" | ") : "(none)"}` +
 	`\n- Escalations: ${escalations.length ? escalations.map((e) => `${e.kind}: ${e.detail.slice(0, 80)}`).join(" | ") : "(none)"}` +
 	(gitSummary ? `\n- Git evidence:\n${gitSummary}` : "") +
-	`\n\nProduce an incident-report-style review packet with EXACTLY these section headers (one per line):\n` +
+	`\n- Pipeline tools (for referencing only): zense_spec, zense_adr, zense_eval, zense_review\n\n` +
+	`GROUNDING CONTRACT (hard rules):\n` +
+	`- Every commit hash, file path, line number, identifier, env-var name and config key you mention MUST be copied VERBATIM from the Evidence block above — never invent or reconstruct one from memory.\n` +
+	`- Anything not present in the Evidence is NOT a fact: omit it, or move it to "Human actions" phrased as an open question.\n` +
+	`- The TL;DR must state the eval verdict exactly as recorded and must not contradict per-criteria verdicts, trajectory flags or escalations.\n\n` +
+	`Produce an incident-report-style review packet with EXACTLY these section headers (one per line):\n` +
 	`## TL;DR\n(max 3 lines — the 90-second answer for a human deciding whether to deploy)\n` +
-	`## Intent vs Implementation\n## Risks\n(name up to 3 spots the human MUST eyeball, as file:line where possible)\n` +
+	`## Intent vs Implementation\n## Risks\n(name up to 3 spots the human MUST eyeball — file:line copied verbatim from the Evidence, or omit the line number)\n` +
 	`## Rollback\n(concrete commands, e.g. git revert <hash> / files to restore — no vague advice)\n` +
 	`## Human actions\n(follow-ups only a human can do: spec debt, unanswered questions)\n` +
 	`Do NOT dump raw diffs; summarize. No commentary outside the sections.` +
-	(feedback ? `\n\nSYSTEM FEEDBACK: previous packet was missing sections: ${feedback}. Output the full packet with all headers.` : "");
+	(feedback ? `\n\nSYSTEM FEEDBACK: your previous packet was rejected: ${feedback}. Output the full corrected packet with all headers.` : "");
 };
 
 // ----------------------------------------------------------------------------- sub-agent runner
@@ -998,7 +1043,7 @@ function runSubagent(
 	role: string,
 	task: string,
 	cwd: string,
-	timeoutMs = subagentTimeout("default"),
+	timeoutMs = subagentTimeout("default", cwd),
 	onChunk?: (chunk: string) => void,
 	logPath: string = subagentLogPath(cwd, role),
 	modelPattern?: string,           // pi --model pattern (เช่น "anthropic/claude-sonnet") — undefined = ปล่อย pi ใช้ default
@@ -1118,7 +1163,7 @@ function runSubagent(
 				res({
 					ok: false,
 					output:
-						`sub-agent exited code=${code} signal=${signal}${timedOut ? ` (TIMEOUT ${timeoutMs / 1000}s)` : ""}\n` +
+						`sub-agent exited code=${code} signal=${signal}${timedOut ? ` (TIMEOUT ${timeoutMs / 1000}s — bump per-role limit in .zense/config.json key subagentTimeoutMs)` : ""}\n` +
 						`last output:\n${out.slice(-4_000)}\n(full log: ${relLog})`,
 					logPath,
 					...modelInfo,
@@ -1390,8 +1435,9 @@ export default function (pi: ExtensionAPI) {
 			// ใช้ worktree root เป็น cwd ถ้ามี worktree active → grader/reviewer รัน/เทสใน worktree (โค้ดที่แก้จริง)
 			const subCwd = state.worktree?.root ?? ctx.cwd;
 			// C: role ถูกล็อก read-only (SUBAGENT_EXCLUDE_TOOLS) → sub-agent ร่าง spec/อ่าน repo ได้แต่แก้โค้ดไม่ได้
-			// B: timeout ต่อ role (SUBAGENT_TIMEOUT_MS) แทน 240_000 ตายตัว — requirements/grader 600s
-			const r = await runSubagent(role, task, subCwd, subagentTimeout(role), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role]);
+			// B: timeout ต่อ role — built-in map + ช่องของ agent: .zense/config.json (subagentTimeoutMs)
+			// ส่ง subCwd ก่อนแล้ว ctx.cwd (worktree ไม่มี .zense ของตัวเอง → config อยู่ที่ main repo)
+			const r = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role]);
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
@@ -2220,6 +2266,10 @@ export default function (pi: ExtensionAPI) {
 			// ต้องสั่งขั้นต่อไป explicit ในข้อความที่คืนให้ agent (เหมือน FAIL branch) —
 			// ถ้าไม่เขียนบอก agent จะถือว่างานจบแล้วตอบ user ทันที ทำให้ reviewer ไม่ถูกเรียกเลย
 			delete state.evalOverrideFails; // anti-loop guard: รอบจบสมบูรณ์ → ล้างตัวนับ
+			// r1 (2026-09-02): PASS = "กลับไปแก้" resolve แล้ว → ล้าง escalation need-fix ที่ค้างจากรอบ FAIL
+			// ไม่ล้าง = reviewer เห็น "criteria failed: c2,c3,c6" เก่าปน evidence แล้วเขียน TL;DR ขัด verdict PASS
+			// (เคสจริงรอบ spec v1) — need-decision คงไว้เพราะยังรอมนุษย์ตัดสิน
+			state.escalations = state.escalations.filter((e) => e.kind !== "need-fix");
 			const report =
 				`${grade.output}${probeSection}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}` +
 				`\n\n✅ Eval PASS — ขั้นต่อไป (บังคับ): เรียก \`zense_review\` ทันทีเพื่อให้ reviewer sub-agent สร้าง review packet` +
@@ -2270,7 +2320,7 @@ export default function (pi: ExtensionAPI) {
 			let packetFeedback = "";
 			const packetInput = (): string =>
 				buildReviewerPrompt(state.spec?.intent ?? "(no spec)", state.lastEval, state.trajectoryFlags, state.spec?.specDebt ?? [], state.escalations,
-					gitChangeSummary(reviewRoot, state.baselineHead), packetFeedback, freshness);
+					gitChangeSummary(reviewRoot, state.baselineHead), packetFeedback, freshness, state.spec?.criteria);
 			let reviewer = await launchSubagent(ctx, "reviewer", packetInput());
 			let packetParse = parseReviewerPacket(reviewer.output);
 			// A (schema): section ไม่ครบ → retry 1 ครั้งพร้อม feedback (แทน slice ดิบ 900 ตัวอักษรที่ผ่านทุกกรณี)
@@ -2280,6 +2330,23 @@ export default function (pi: ExtensionAPI) {
 				reviewer = await launchSubagent(ctx, "reviewer", packetInput());
 				packetParse = parseReviewerPacket(reviewer.output);
 			}
+			// r5 (grounding): token ใน packet ที่ไม่มีใน evidence = แต่งขึ้นเอง → retry 1 ครั้งพร้อมรายชื่อ
+			// รอบสองยังโดย → trajectory flag "reviewer hallucination" ให้มนุษย์รู้ว่าต้องตรวจ packet ก่อนเชื่อ
+			// (review เป็น advisory — ไม่ block packet)
+			const checkGrounding = (text: string): string[] =>
+				findUngroundedTokens(text, packetInput(), (p) => existsSync(join(reviewRoot, p)));
+			let ungrounded = reviewer.ok ? checkGrounding(reviewer.output) : [];
+			if (ungrounded.length) {
+				learn(ctx, `reviewer: ungrounded tokens [${ungrounded.slice(0, 5).join(",")}] — retry`);
+				packetFeedback = `ungrounded tokens not present in the evidence (remove them or quote verbatim): ${ungrounded.slice(0, 8).join(", ")}`;
+				reviewer = await launchSubagent(ctx, "reviewer", packetInput());
+				ungrounded = reviewer.ok ? checkGrounding(reviewer.output) : [];
+				if (ungrounded.length) {
+					state.trajectoryFlags.push(`reviewer hallucination: ${ungrounded.slice(0, 5).join(",")}`);
+					learn(ctx, `flag: reviewer hallucination: ${ungrounded.slice(0, 5).join(",")}`);
+					ctx.ui.notify(`⚠ reviewer อ้าง token ที่ไม่มีใน evidence: ${ungrounded.slice(0, 3).join(", ")} — เพิ่ม trajectory flag ตรวจ packet ก่อนใช้`, "warning");
+				}
+			}
 			const packet = {
 				tlDr: packetParse.ok && packetParse.tldr ? packetParse.tldr : reviewer.output.slice(0, 900),
 				trajectory: state.trajectoryFlags,
@@ -2288,7 +2355,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			pi.appendEntry("zense-review-packet", packet);
 			learn(ctx, `review packet: flags=${packet.trajectory.length}, escalations=${packet.escalations.length}, sections-ok=${packetParse.ok}${packetParse.missing.length ? ` missing=[${packetParse.missing.join(",")}]` : ""}`);
-			return { content: [{ type: "text", text: reviewer.ok ? reviewer.output.slice(0, 2_000) : `reviewer failed: ${reviewer.output}` }], details: packet };
+			return { content: [{ type: "text", text: reviewer.ok ? reviewer.output.slice(0, 4_000) : `reviewer failed: ${reviewer.output}` }], details: packet };
 		},
 	});
 

@@ -14,7 +14,7 @@
   "license": "MIT",
   "author": "",
   "scripts": {
-    "test": "node --no-warnings --test test/index.test.mjs test/adr-deny.test.mjs test/worktree.test.mjs test/spec-draft.test.mjs test/eval-review.test.mjs test/fullscreen-default.test.mjs test/subagent-timeout.test.mjs"
+    "test": "node --no-warnings --test test/index.test.mjs test/adr-deny.test.mjs test/worktree.test.mjs test/spec-draft.test.mjs test/eval-review.test.mjs test/fullscreen-default.test.mjs test/subagent-timeout.test.mjs test/reviewer-grounding.test.mjs"
   },
   "repository": {
     "type": "git",

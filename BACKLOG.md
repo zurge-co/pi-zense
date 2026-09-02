@@ -10,7 +10,7 @@
 | 2 | Bug | Critical | zense_eval ทิ้ง parameter `note` | | |
 | 3 | Bug | Critical | Probe exit code 127 → false FAIL | | |
 | 4 | Bug | Critical | Quality gate false positive — `\bgrep\b` ใน prose grep | | |
-| 5 | Workflow | High | Reviewer sub-agent hallucinate | | |
+| 5 | Workflow | High | Reviewer sub-agent hallucinate | Done | commit นี้ (v3) |
 | 6 | Workflow | Medium | Scope check flag เทียบ — worktree redirect | | |
 | 7 | Workflow | — | Worktree หลุดตอน bump spec (v6) | Done | 94e2886 |
 | 8 | Hygiene | Low | Cleanup worktree + branch ค้าง | Done | release 0.18.0 |
@@ -45,9 +45,8 @@
 
 ### B. Bug ด้าน workflow (เจอจากการใช้งานจริงวันนี้)
 
-**5. Reviewer sub-agent hallucinate**
-- 2 รอบติด: เอาบริบท eval เก่ามาปน, เดา commit/rollback ที่ไม่มีจริง
-- prompt ต้อง ground ด้วย `git log` + `lastEval` ปัจจุบันเท่านั้น (อาจต้องให้ harness feed facts เองเหมือนตอน requirements)
+**5. Reviewer sub-agent hallucinate — ✅ แก้แล้ว (v3, commit นี้)**
+- 2 รอบติด: เอาบริบท eval เก่ามาปน, เดา commit/rollback ที่ไม่มีจริง → ราก 2 ชั้น: (1) รอบ FAIL ค้าง escalation `need-fix: criteria failed: …` ไม่เคยถูกล้างตอน PASS → reviewer เห็นปน evidence เขียน TL;DR ขัด verdict จริง — แก้ด้วยล้าง need-fix ตอน PASS; (2) evidence ถูกย่อเหลือ id:status → แต่ง identifier/hash เอง (ENTROPY_TIMEOUT_MINS ฯลฯ) — แก้ด้วย evidence verbatim (probe detail + criteria text) + grounding contract ใน prompt + `findUngroundedTokens` ตรวจ token ใน packet ต้องมีใน evidence (retry×1 → trajectory flag `reviewer hallucination`)
 
 **6. Scope check flag เทียบ**
 - write ที่ redirect เข้า worktree โดน out-of-scope write: `.zense/worktree/...` ทุกครั้ง
@@ -60,7 +59,7 @@
 **11. Sub-agent timeout: `code=143 signal=null` ไม่มี TIMEOUT marker + requirements ชน timeout บ่อย — ✅ แก้แล้ว (commit นี้)**
 - ต้นตอ: `runSubagent` ยิง SIGTERM ที่ 240s → pi จับ SIGTERM เองแล้ว exit(143) → close ได้ `code=143 signal=null` → เงื่อนไข `signal==="SIGTERM"` เดิมไม่เคยจริง ทุก timeout ดูเป็น crash ลึกลับ (พิสูจน์จาก log: เวลา start→last write = 240s พอดีทุกไฟล์)
 - แก้ A: `timedOut` flag set ใน timer callback + SIGKILL backstop 5s + log มี `(timeout SIGTERM)` marker
-- แก้ B: timeout ต่อ role (`SUBAGENT_TIMEOUT_MS`: requirements/grader 600s, reviewer 480s, default 300s) override ได้ด้วย env `ZENSE_SUBAGENT_TIMEOUT_MS`
+- แก้ B: timeout ต่อ role (`SUBAGENT_TIMEOUT_MS`: requirements/grader 600s, reviewer 480s, default 300s) — ช่องปรับของ agent คือ `.zense/config.json` (key `subagentTimeoutMs`) อ่านสดทุก launch (env override ถอดออก 2026-09-02 ตามคำตัดสินใจ user)
 - แก้ C (ต้นตอจริง): requirements เสียเวลา `command -v` ทีละตัว (deno cargo go make …) → `gatherRepoFacts` เพิ่ม `probeToolchain` (execSync เดียว, timeout 5s) ดัน `toolchain on PATH` เข้า facts + prompt สั่ง trust facts / batch probe ใน ONE bash loop
 - test: `test/subagent-timeout.test.mjs` (เพิ่มใน `npm test`)
 

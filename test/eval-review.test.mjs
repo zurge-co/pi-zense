@@ -136,10 +136,10 @@ test("gatherRepoFacts: reads package scripts + README head + layout, tolerates b
 		assert.match(facts, /test="node --test test\/x\.mjs"/);
 		assert.match(facts, /README\.md \(head\)/);
 		assert.match(facts, /top-level dirs: src/);
-		// dir เปล่า → ไม่ throw และไม่มี facts
+		// dir เปล่า → ไม่มี fact ของ repo (toolchain fact ของ host มีได้ — repo แบบ cargo/go ไม่มี package.json ก็ต้องใช้), ไม่ throw
 		const bare = mkdtempSync(join(tmpdir(), "zense-facts-bare-"));
 		try {
-			assert.deepEqual(gatherRepoFacts(bare), []);
+			assert.ok(gatherRepoFacts(bare).every((f) => f.startsWith("- toolchain on PATH")));
 		} finally {
 			rmSync(bare, { recursive: true, force: true });
 		}

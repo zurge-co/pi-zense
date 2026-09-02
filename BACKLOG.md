@@ -16,6 +16,7 @@
 | 8 | Hygiene | Low | Cleanup worktree + branch ค้าง | Done | release 0.18.0 |
 | 9 | Hygiene | Low | Lesson เข้า memory อย่างเป็นทางการ | | |
 | 10 | Tool | Medium | `zense_backlog` tool — state เก็บใน `.zense/backlog.json` | | |
+| 11 | Bug | Critical | Sub-agent โดน timeout 240s แต่รายงานเป็น `exited code=143 signal=null` ลึกลับ + requirements เสียเวลา probe toolchain เองจนชน timeout | Done | commit นี้ |
 
 ---
 
@@ -55,6 +56,13 @@
 
 **7. Worktree หลุดตอน bump spec**
 - ✅ แก้แล้ว (v6, merge 94e2886)
+
+**11. Sub-agent timeout: `code=143 signal=null` ไม่มี TIMEOUT marker + requirements ชน timeout บ่อย — ✅ แก้แล้ว (commit นี้)**
+- ต้นตอ: `runSubagent` ยิง SIGTERM ที่ 240s → pi จับ SIGTERM เองแล้ว exit(143) → close ได้ `code=143 signal=null` → เงื่อนไข `signal==="SIGTERM"` เดิมไม่เคยจริง ทุก timeout ดูเป็น crash ลึกลับ (พิสูจน์จาก log: เวลา start→last write = 240s พอดีทุกไฟล์)
+- แก้ A: `timedOut` flag set ใน timer callback + SIGKILL backstop 5s + log มี `(timeout SIGTERM)` marker
+- แก้ B: timeout ต่อ role (`SUBAGENT_TIMEOUT_MS`: requirements/grader 600s, reviewer 480s, default 300s) override ได้ด้วย env `ZENSE_SUBAGENT_TIMEOUT_MS`
+- แก้ C (ต้นตอจริง): requirements เสียเวลา `command -v` ทีละตัว (deno cargo go make …) → `gatherRepoFacts` เพิ่ม `probeToolchain` (execSync เดียว, timeout 5s) ดัน `toolchain on PATH` เข้า facts + prompt สั่ง trust facts / batch probe ใน ONE bash loop
+- test: `test/subagent-timeout.test.mjs` (เพิ่มใน `npm test`)
 
 ---
 

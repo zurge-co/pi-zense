@@ -23,7 +23,7 @@
  *   P5 Review/Deploy: zense_review builds a review-packet card (exception-based)
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, execSync, spawn } from "node:child_process";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
@@ -467,6 +467,21 @@ export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
 	reviewer: ["write", "edit"],
 };
 
+/** B (2026-09-02): timeout ต่อ role — log จริง (.zense/subagents/) พิสูจน์ว่า requirements/grader โดนฆ่า
+ *  ที่ 240s พอดีทุกไฟล์ (งาน explore repo + รัน check นานกว่านั้น). override ทุก role ได้ด้วย
+ *  env ZENSE_SUBAGENT_TIMEOUT_MS (มิลลิวินาที, >0) — ไว้ตอน debug หรือเครื่องช้า */
+export const SUBAGENT_TIMEOUT_MS: Record<string, number> = {
+	requirements: 600_000,
+	grader: 600_000,
+	reviewer: 480_000,
+	default: 300_000,
+};
+export const subagentTimeout = (role: string, env = process.env): number => {
+	const override = Number(env.ZENSE_SUBAGENT_TIMEOUT_MS);
+	if (Number.isFinite(override) && override > 0) return override;
+	return SUBAGENT_TIMEOUT_MS[role] ?? SUBAGENT_TIMEOUT_MS.default;
+};
+
 /** argv ของ pi sub-agent ตัวเดียวที่ runSubagent ใช้ — แยกออกมาเพื่อ test ได้ว่า flag ถูกต้อง */
 /** model ที่ sub-agent รันจริง (จาก JSONL events, รูป 'provider/id') ตรง pattern ที่ config ไว้ใน models.json ไหม —
  *  match กรณี: exact (case-insensitive) หรือ pattern = usedModel + ':<thinking-level>' (suffix ที่ pi ตัดออกตอน resolve) */
@@ -492,7 +507,7 @@ export const buildRequirementsPrompt = (intent: string, lessons: string[], facts
 	`You are the REQUIREMENTS sub-agent for a spec-gated SDLC harness. Your single JSON output becomes the machine-checked contract for the main agent's implementation, so every criterion must be grounded in THIS repository's reality — never guess.
 
 ` +
-	`Step 1 — EXPLORE (read-only, mandatory before drafting): read README*, package.json / other manifests, test configs, CI configs and the relevant source layout. Actually RUN the candidate test/lint/build commands you plan to reference, so every check you write is proven to work here. You have NO write/edit tools — do not attempt to modify anything.
+	`Step 1 — EXPLORE (read-only, mandatory before drafting): read README*, package.json / other manifests, test configs, CI configs and the relevant source layout. Actually RUN the candidate test/lint/build commands you plan to reference, so every check you write is proven to work here. You have NO write/edit tools — do not attempt to modify anything. You run under a HARD wall-clock limit — be economical: never probe toolchains or test commands one-by-one; if the harness-provided facts below already list them, trust the list and move on, otherwise batch ALL probes into ONE bash loop.
 
 ` +
 	`Step 2 — DRAFT exactly ONE JSON object:
@@ -515,6 +530,29 @@ Rules:
 	`\n\nRequest: ${intent}`;
 
 // ----------------------------------------------------------------------------- eval/review evidence helpers (module scope — export เพื่อ unit-test ได้)
+
+/** C (2026-09-02): toolchain probe ฝั่ง harness — จาก log จริง requirements sub-agent เสียหลายรอบ
+ *  กับยิง `command -v` ทีละตัว (deno cargo go make just mvn …) จนชน timeout. harness เช็คให้ครั้งเดียว
+ *  (execSync เดียว, timeout 5s) แล้วดันผลเป็น fact — sub-agent ไม่ต้องเสีย tool call ไป probe เอง */
+export const TOOLCHAIN_PROBE = [
+	"node", "npm", "pnpm", "bun", "deno", "python3", "pip3", "uv", "cargo", "go", "make", "just",
+	"mvn", "gradle", "dotnet", "composer", "php", "ruby", "docker", "kubectl", "git",
+];
+export const probeToolchain = (tools: readonly string[] = TOOLCHAIN_PROBE, env = process.env): string[] => {
+	try {
+		// `; true` ปิดท้ายจำเป็น: ถ้าตัวสุดท้ายของลิสต์ไม่เจอบน PATH loop exit 1 → execSync throw
+		// ทั้งก้อนแล้ว catch ได้ [] เสมอ (default TOOLCHAIN_PROBE เคยรอดเพียงเพราะตัวท้ายคือ git)
+		const out = execSync(`for t in ${tools.join(" ")}; do command -v "$t" >/dev/null 2>&1 && printf '%s\\n' "$t"; done; true`, {
+			encoding: "utf8",
+			timeout: 5_000,
+			env,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		return out ? out.split("\n").filter(Boolean) : [];
+	} catch {
+		return []; // probe พัง/timeout → ไม่มี fact ก็ยังทำงานได้ (best-effort เหมือนส่วนอื่นของ gatherRepoFacts)
+	}
+};
 
 /**
  * W3: context priming — harness เก็บข้อเท็จจริงถูกๆ ของ repo ให้ requirements sub-agent เอง
@@ -557,6 +595,19 @@ export const gatherRepoFacts = (cwd: string): string[] => {
 	}
 	const configs = ["tsconfig.json", "vitest.config.ts", "vitest.config.mts", "jest.config.js", "jest.config.ts", ".mocharc.json"].filter((f) => existsSync(join(cwd, f)));
 	if (configs.length) facts.push(`configs present: ${configs.join(", ")}`);
+	// C: manifest ต่อ ecosystem — บอก sub-agent ว่า repo นี้เป็น ecosystem ไหน (cargo/go/deno/python/...)
+	// รวมถึง repo ที่ไม่มี package.json (cargo/go) ซึ่งเคยทำให้ sub-agent เดาผิดและเสียเวลา probe เอง
+	const manifestNames = ["deno.json", "deno.jsonc", "Cargo.toml", "go.mod", "pyproject.toml", "requirements.txt", "Gemfile", "composer.json", "pom.xml", "build.gradle", "build.gradle.kts"];
+	const manifests = manifestNames.filter((f) => existsSync(join(cwd, f)));
+	try {
+		manifests.push(...readdirSync(cwd).filter((f) => f.endsWith(".csproj")));
+	} catch {
+		/* skip */
+	}
+	if (manifests.length) facts.push(`ecosystem manifests present (trust this — do not re-scan): ${manifests.join(", ")}`);
+	// C: toolchain ที่เจอบน PATH — fact เดียวจบ แทนที่จะให้ sub-agent probe ทีละตัวจนชน timeout
+	const tools = probeToolchain();
+	if (tools.length) facts.push(`toolchain on PATH (verified — do NOT re-probe one-by-one): ${tools.join(", ")}`);
 	return facts.map((f) => `- ${f}`);
 };
 
@@ -947,7 +998,7 @@ function runSubagent(
 	role: string,
 	task: string,
 	cwd: string,
-	timeoutMs = 240_000,
+	timeoutMs = subagentTimeout("default"),
 	onChunk?: (chunk: string) => void,
 	logPath: string = subagentLogPath(cwd, role),
 	modelPattern?: string,           // pi --model pattern (เช่น "anthropic/claude-sonnet") — undefined = ปล่อย pi ใช้ default
@@ -1039,7 +1090,17 @@ function runSubagent(
 			for (const line of lines) handleLine(line);
 		});
 		child.stderr?.on("data", (d) => append(String(d)));
-		const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+		// A (2026-09-02): timedOut เป็น flag ที่ set ใน timer callback — ห้ามเช็คจาก signal อีกต่อไป
+		// เพราะ pi จับ SIGTERM เองแล้ว exit(143) → close ได้ code=143 signal=null ทำให้เงื่อนไข
+		// signal==="SIGTERM" เดิมไม่เคยจริง = timeout ทุกครั้งถูกรายงานเป็น "exited code=143" ลึกลับ
+		// SIGKILL backstop 5s: กัน pi ค้างใน tool call ยาวไม่ยอมตายหลังรับ SIGTERM
+		let timedOut = false;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+			killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+		}, timeoutMs);
 		child.on("error", (err) => {
 			clearTimeout(timer);
 			appendFileSync(logPath, `\n[spawn error] ${err.message}\n`);
@@ -1047,9 +1108,9 @@ function runSubagent(
 		});
 		child.on("close", (code, signal) => {
 			clearTimeout(timer);
+			clearTimeout(killTimer);
 			if (lineBuf.trim()) handleLine(lineBuf); // flush บรรทัดค้างท้าย stream
-			const timedOut = signal === "SIGTERM";
-			appendFileSync(logPath, `\n--- exited code=${code} signal=${signal} ---\n`);
+			appendFileSync(logPath, `\n--- exited code=${code} signal=${signal}${timedOut ? " (timeout SIGTERM)" : ""} ---\n`);
 			appendFileSync(logPath, `--- used model: ${usedModel ?? "(not captured from events)"} ---\n`);
 			const modelInfo = usedModel !== undefined ? { usedModel } : {};
 			if (code === 0 && !signal) res({ ok: true, output: (finalText || out).slice(-16_000), logPath, ...modelInfo });
@@ -1329,7 +1390,8 @@ export default function (pi: ExtensionAPI) {
 			// ใช้ worktree root เป็น cwd ถ้ามี worktree active → grader/reviewer รัน/เทสใน worktree (โค้ดที่แก้จริง)
 			const subCwd = state.worktree?.root ?? ctx.cwd;
 			// C: role ถูกล็อก read-only (SUBAGENT_EXCLUDE_TOOLS) → sub-agent ร่าง spec/อ่าน repo ได้แต่แก้โค้ดไม่ได้
-			const r = await runSubagent(role, task, subCwd, 240_000, onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role]);
+			// B: timeout ต่อ role (SUBAGENT_TIMEOUT_MS) แทน 240_000 ตายตัว — requirements/grader 600s
+			const r = await runSubagent(role, task, subCwd, subagentTimeout(role), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role]);
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";

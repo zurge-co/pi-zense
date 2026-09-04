@@ -45,6 +45,7 @@ interface Spec {
 	specDebt: string[];        // unverifiable items → forced human review
 	approved: boolean;
 	approvedAt?: number;
+	changesFrom?: string[];    // สรุปสิ่งที่เปลี่ยนเทียบ version ก่อน (commitSpec คำนวณตอน v>=2 — ห้ามนำเสนอ spec เดิมซ้ำโดยไม่บอก change)
 }
 interface State {
 	phase: "requirements" | "design" | "implementation" | "eval" | "review" | "maintenance";
@@ -85,6 +86,55 @@ interface Worktree {
 }
 
 const zenseDir = (cwd: string) => join(cwd, ".zense");
+
+// ----------------------------------------------------------------------------- spec version change summary (module scope — export เพื่อ unit-test ได้)
+
+/**
+ * เทียบ spec ใหม่ (next) กับ version ก่อน (prev) แบบ field-by-field แล้วคืนบรรทัดสรุป
+ * ที่มนุษย์อ่านเข้าใจ — เงื่อนไขสำคัญของ re-spec loop: เมื่อ eval/review verify ไม่ผ่าน
+ * แล้วต้อง commit spec version ใหม่ มนุษย์ผู้เซ็นต้องเห็นชัดๆ ว่า "version นี้แก้อะไรจาก
+ * version ก่อน" — ห้ามนำเสนอ spec เดิมซ้ำเงียบๆ. criteria เทียบตาม id: เพิ่ม (+) / ลบ (−) /
+ * แก้ (~ text/check); ส่วนที่เป็น list (approach/scope/constraints/specDebt) เทียบแบบ set.
+ * ไม่มีการเปลี่ยนแปลงเลย → คืนบรรทัดเตือนบรรทัดเดียว (caller ใช้ตรวจ identical ได้จากตัวนี้) */
+export const buildSpecChanges = (prev: Spec, next: Spec): string[] => {
+	const lines: string[] = [];
+	if (prev.title !== next.title) lines.push(`title: "${prev.title}" → "${next.title}"`);
+	if (prev.intent !== next.intent) lines.push(`intent: เปลี่ยน (อ่านเนื้อใหม่ใน spec ด้านล่าง)`);
+	const listDiff = (label: string, a: string[], b: string[]) => {
+		for (const x of b.filter((x) => !a.includes(x))) lines.push(`${label} +: ${x}`);
+		for (const x of a.filter((x) => !b.includes(x))) lines.push(`${label} −: ${x}`);
+	};
+	listDiff("approach", prev.approach ?? [], next.approach ?? []);
+	listDiff("scope", prev.scope ?? [], next.scope ?? []);
+	listDiff("constraints", prev.constraints ?? [], next.constraints ?? []);
+	const prevById = new Map((prev.criteria ?? []).map((c) => [c.id, c]));
+	const nextById = new Map((next.criteria ?? []).map((c) => [c.id, c]));
+	for (const [id, c] of nextById) {
+		const p = prevById.get(id);
+		if (!p) lines.push(`criteria +: ${id}: ${c.text} (check: ${c.check})`);
+		else if (p.text !== c.text || p.check !== c.check)
+			lines.push(
+				`criteria ~: ${id}` +
+					(p.text !== c.text ? ` text: "${p.text}" → "${c.text}"` : "") +
+					(p.check !== c.check ? ` check: "${p.check}" → "${c.check}"` : ""),
+			);
+	}
+	for (const [id, c] of prevById) if (!nextById.has(id)) lines.push(`criteria −: ${id}: ${c.text}`);
+	listDiff("specDebt", prev.specDebt ?? [], next.specDebt ?? []);
+	return lines.length
+		? lines
+		: [`⚠️ ไม่มีการเปลี่ยนแปลงจาก v${prev.version} — spec ใหม่เหมือน version ก่อนทุกประการ`];
+};
+
+/** render spec เป็น markdown — ใช้ทั้ง archive .md และ sign dialog (dialog เรนเดอร์ตัวนี้อยู่แล้ว)
+ *  v>=2 ที่มี changesFrom จะมี section "## Changes in v{N} (vs v{N-1})" คั่นก่อน Intent เสมอ
+ *  → ผู้เซ็นเห็น change ของ version ใหม่ชัดก่อนอ่านเนื้อเต็ม; spec เก่าที่ไม่มี field เรนเดอร์เหมือนเดิม */
+export const renderSpecMd = (s: Spec): string =>
+	`# Spec v${s.version}: ${s.title}\napproved: ${s.approved}\n\n` +
+	(s.changesFrom?.length
+		? `## Changes in v${s.version} (vs v${s.version - 1})\n${s.changesFrom.map((x) => `- ${x}`).join("\n")}\n\n`
+		: "") +
+	`## Intent\n${s.intent}\n\n${s.approach?.length ? "## Approach\n" + s.approach.map((x) => `- ${x}`).join("\n") + "\n\n" : ""}## Scope\n${s.scope.map((x) => `- ${x}`).join("\n")}\n\n## Constraints\n${s.constraints.map((x) => `- ${x}`).join("\n")}\n\n## Acceptance criteria\n${s.criteria.map((c) => `- [ ] ${c.id}: ${c.text} *(check: ${c.check})*`).join("\n")}\n\n## Spec debt (human-verified only)\n${s.specDebt.map((x) => `- ${x}`).join("\n")}\n`;
 
 /**
  * merge "tuiMode": "fullscreen" เข้า settings.json — เฉพาะตอนที่ key ยังไม่มีเท่านั้น (ผู้ใช้ยังไม่เคยเลือก)
@@ -1918,8 +1968,22 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		fields: { title?: string; intent?: string; approach?: string[]; scope?: string[]; constraints?: string[]; criteria?: Criterion[]; specDebt?: string[] },
 		source: "set" | "compile",
-	): Promise<{ version: number; signed: boolean; mdPath: string }> => {
+	): Promise<{ version: number; signed: boolean; mdPath: string; changes?: string[] }> => {
 		const version = (state.spec?.version ?? 0) + 1;
+		// resolve prev spec ก่อนหน้าก่อน overwrite — state ใน session ถ้ามี; reload/resume แล้ว state หาย
+		// → fallback อ่าน .zense/spec.json (latest copy ตอนนี้ยังเป็น version เก่า) แบบ best-effort
+		let prevSpec: Spec | undefined = state.spec;
+		if (!prevSpec) {
+			try {
+				const latestJson = join(zenseDir(ctx.cwd), "spec.json");
+				if (existsSync(latestJson)) {
+					const p = JSON.parse(readFileSync(latestJson, "utf8")) as Spec;
+					if (p && typeof p.version === "number") prevSpec = p;
+				}
+			} catch {
+				/* best-effort: อ่านไม่ได้ → ไม่มี changes section เฉยๆ ไม่ให้ commit พัง */
+			}
+		}
 		state.spec = {
 			version,
 			title: fields.title ?? "untitled",
@@ -1931,6 +1995,15 @@ export default function (pi: ExtensionAPI) {
 			specDebt: fields.specDebt ?? [],
 			approved: false,
 		};
+		// re-spec (v>=2): คำนวณ change summary เทียบ version ก่อนเสมอ — ผู้เซ็นต้องเห็นว่า version นี้
+		// แก้อะไร ห้ามนำเสนอ spec เดิมซ้ำเงียบๆ; identical → buildSpecChanges คืนบรรทัดเตือน + log lesson
+		// (ไม่ block: บาง flow ตั้งใจ re-version) | v1 ไม่มี prev → ไม่ตั้ง changesFrom, behavior คงเดิม
+		if (prevSpec && version >= 2) {
+			const changes = buildSpecChanges(prevSpec, state.spec);
+			state.spec.changesFrom = changes;
+			if (changes.length === 1 && changes[0].startsWith("⚠️"))
+				learn(ctx, `spec v${version} re-spec identical to v${version - 1} (no changes)`);
+		}
 		state.specSource = source; // H: จำที่มาของ spec — ใช้ telemetry ตอน gate override
 		// Specs are append-only: every version gets a unique timestamped file in
 		// .zense/specs/ so any past spec can be re-read. spec.{json,md} stay as
@@ -1973,8 +2046,15 @@ export default function (pi: ExtensionAPI) {
 		}
 		persist();
 		updateWidget(ctx);
-		return { version, signed, mdPath };
+		return { version, signed, mdPath, ...(state.spec.changesFrom?.length ? { changes: state.spec.changesFrom } : {}) };
 	};
+
+	/** suffix ของ tool result ของ zense_spec: re-spec (v>=2) ต้องแนบ change summary ให้ agent/มนุษย์เห็นใน
+	 *  transcript ด้วย — ไม่ใช่แค่ใน dialog/archive (identical → บรรทัดเตือน ⚠️ จาก buildSpecChanges ติดมาด้วย) */
+	const changesText = (r: { version: number; changes?: string[] }): string =>
+		r.changes?.length
+			? `\n\nChanges in v${r.version} (vs v${r.version - 1}):\n${r.changes.map((x) => `- ${x}`).join("\n")}`
+			: "";
 
 	// ----- tools exposed to the agent ("phase sub-agents" via pi.registerTool)
 
@@ -2078,7 +2158,7 @@ export default function (pi: ExtensionAPI) {
 						? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
 						: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 					return {
-						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` }],
+						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` + changesText(r) }],
 						details: { version: r.version, approved: r.signed, clarifyRounds, qualityGate: gated.notes, logPath: draft.logPath },
 					};
 				}
@@ -2090,7 +2170,7 @@ export default function (pi: ExtensionAPI) {
 				? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
 				: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 			return {
-				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.` }],
+				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.` + changesText(r) }],
 				details: { version: r.version, approved: r.signed },
 			};
 		},
@@ -2496,7 +2576,5 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	function renderSpecMd(s: Spec): string {
-		return `# Spec v${s.version}: ${s.title}\napproved: ${s.approved}\n\n## Intent\n${s.intent}\n\n${s.approach?.length ? "## Approach\n" + s.approach.map((x) => `- ${x}`).join("\n") + "\n\n" : ""}## Scope\n${s.scope.map((x) => `- ${x}`).join("\n")}\n\n## Constraints\n${s.constraints.map((x) => `- ${x}`).join("\n")}\n\n## Acceptance criteria\n${s.criteria.map((c) => `- [ ] ${c.id}: ${c.text} *(check: ${c.check})*`).join("\n")}\n\n## Spec debt (human-verified only)\n${s.specDebt.map((x) => `- ${x}`).join("\n")}\n`;
-	}
+	// renderSpecMd อยู่ module scope (export เพื่อ unit-test) — closure นี้เรียกใช้งานตัวนั้นตรงๆ
 }

@@ -1667,7 +1667,15 @@ export default function (pi: ExtensionAPI) {
 	/** redirect tool call ของ main agent เข้า worktree (mutate event.input) — ทำให้ agent
 	 *  ทำงานใน worktree โดยไม่รู้ตัว. sub-agent เป็นคนละ process จึงไม่ถูกตัวนี้ (และใช้ cwd ของมันเอง). */
 	const applyRedirect = (ev: any, ctx: ExtensionContext) => {
-		const wt = state.worktree;
+		let wt = state.worktree;
+		// self-heal: worktree ถูก merge/ลบนอก flow (เช่น mergeWorktreeBack ถูกเรียกด้วยมือหลัง auto-merge พลาด)
+		// → pointer ค้างใน session state ทำทุก bash โดนต่อ "cd <wtRoot>" ที่ไม่มีแล้ว — ถ้า dir หายไปให้ล้างเงียบๆ
+		if (wt && !existsSync(wt.root)) {
+			learn(ctx, "worktree self-heal: " + wt.root + " ไม่มีแล้ว (merge นอก flow?) — ล้าง pointer ที่ค้าง");
+			state.worktree = null;
+			persist(); updateWidget(ctx);
+			wt = null;
+		}
 		if (!wt) return;
 		if (ev.toolName === "write" || ev.toolName === "edit" || ev.toolName === "read") {
 			const p = (ev.input as { path?: string })?.path;

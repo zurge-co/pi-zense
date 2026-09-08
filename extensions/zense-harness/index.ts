@@ -573,6 +573,18 @@ export interface InstalledExtension {
 	scope: string;  // user | project | temporary
 }
 
+/** label แสดงใน UI: basename เดี่ยวๆ ชนกันได้ (package หลาย entry-point เช่น pi-synthetic มี 6× index.ts —
+ *  ดูเหมือน list ซ้ำทั้งที่คนละไฟล์) '.../node_modules/@aliou/pi-synthetic/extensions/provider/index.ts'
+ *  → 'provider/index.ts'; fallback = basename สำหรับ path ที่หา package dir ไม่เจอ */
+export const extDisplayLabel = (ext: InstalledExtension): string => {
+	const segs = ext.path.split(/[\\/]/).filter(Boolean);
+	const pkgTail = ext.source.replace(/^npm:/, "").split("/").filter(Boolean).pop() ?? "";
+	const idx = pkgTail ? segs.lastIndexOf(pkgTail) : -1;
+	const rel = idx >= 0 ? segs.slice(idx + 1) : segs.slice(-1);
+	if (rel[0] === "extensions") rel.shift();
+	return rel.join("/");
+};
+
 /** enumerate extensions ที่ pi จะโหลดจริง — ใช้ DefaultPackageManager/SettingsManager (กลไกเดียวกันกับ
  *  `pi config` ใน core ไม่ reimplement discovery ให้ drift); onMissing=skip (UI config ห้ามกระตุ้น install)
  *  agentDir/globalDir inject ได้เพื่อ test ด้วย tmp dir ไม่แตะ home จริง; พัง → [] (fallback boot เปลือย) */
@@ -1971,7 +1983,7 @@ export default function (pi: ExtensionAPI) {
 		}, OVERLAY_LG);
 
 	/** ext-config: checkbox dialog เลือก extensions ที่ sub-agent จะโหลด — default all-ticked (user tick ออก)
-	 *  คืน array ของ path ที่ถูกตัดออก (exclusions) หรือ null เมื่อ cancel; ไม่ใช้ SelectList เพราะเป็น single-select */
+	 *  คืน array ของ path ที่ tick ไว้ = จะโหลด (includes) หรือ null เมื่อ cancel; ไม่ใช้ SelectList เพราะเป็น single-select */
 	const extConfigDialog = (ctx: ExtensionContext, role: string, items: { path: string; label: string; checked: boolean }[]): Promise<string[] | null> =>
 		ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
@@ -2005,7 +2017,8 @@ export default function (pi: ExtensionAPI) {
 					else if (data === "a") checked.fill(true);
 					else if (data === "n") checked.fill(false);
 					else if (matchesKey(data, Key.enter)) {
-						done(items.filter((_, i) => !checked[i]).map((it) => it.path));
+						// includes = ตัวที่ tick — เดิมส่งกลับเป็น exclusions (!checked) ทำผล flip (ติ๊กไม่เอาดันโหลด)
+						done(items.filter((_, i) => checked[i]).map((it) => it.path));
 						return;
 					} else if (matchesKey(data, Key.escape)) {
 						done(null);
@@ -2766,7 +2779,7 @@ export default function (pi: ExtensionAPI) {
 			const includes = await extConfigDialog(
 				ctx,
 				role,
-				exts.map((e) => ({ path: e.path, label: `${basename(e.path)} · ${e.source}`, checked: cur.has(e.path) })),
+				exts.map((e) => ({ path: e.path, label: `${extDisplayLabel(e)} · ${e.source}`, checked: cur.has(e.path) })),
 			);
 			if (includes === null) return ctx.ui.notify("ยกเลิก — config เดิมไม่เปลี่ยน", "info");
 			apply(includes);
@@ -2777,11 +2790,11 @@ export default function (pi: ExtensionAPI) {
 		else if (action === "none" || action === "default") apply([]);
 		else if (action === "on" || action === "off") {
 			const target = vals.join(" ").trim();
-			if (!target) return ctx.ui.notify(`ขาดเป้าหมาย — /zense ext-config ${role} ${action} <เลขลำดับ|path>`, "warning");
+			if (!target) return ctx.ui.notify(`ขาดเป้าหมาย — /zense ext-config-show ${role} ${action} <เลขลำดับ|path>`, "warning");
 			const asNum = Number(target);
 			const hit =
 				Number.isInteger(asNum) && asNum >= 1 && asNum <= exts.length ? exts[asNum - 1].path : exts.find((e) => e.path.includes(target))?.path;
-			if (!hit) return ctx.ui.notify(`หา extension "${target}" ไม่เจอ — ดู list ด้วย /zense ext-config ${role} (ไม่ใส่ action)`, "warning");
+			if (!hit) return ctx.ui.notify(`หา extension "${target}" ไม่เจอ — ดู list ด้วย /zense ext-config-show ${role} (ไม่ใส่ action)`, "warning");
 			const next = new Set(cur);
 			if (action === "on") next.add(hit);
 			else next.delete(hit);
@@ -2801,11 +2814,11 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("zense", {
-		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory | models | ext-config",
+		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory | models | ext-config-show",
 		getArgumentCompletions: (prefix) =>
 			// pi ส่งมาแค่ prefix ของคำปัจจุบัน (ไม่บอกตำแหน่ง) → union ทุก token: subcommands + roles + actions
 			// ของ ext-config ไว้ใน list เดียว พิมพ์ตำแหน่งไหนก็ complete ได้ (noise เล็กน้อยตำแหน่งแรกแต่คุ้ม)
-			["status", "approve", "agents", "gate", "memory", "models", "ext-config", "requirements", "grader", "reviewer", "all", "none", "on", "off"]
+			["status", "approve", "agents", "gate", "memory", "models", "ext-config-show", "requirements", "grader", "reviewer", "all", "none", "on", "off"]
 				.filter((s) => s.startsWith(prefix))
 				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
@@ -2906,9 +2919,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				writeModelsConfig(ctx.cwd, role, pattern);
 				ctx.ui.notify(`✅ ${role}: ${pattern} — เขียน ${relative(ctx.cwd, cfgPath)} แล้ว (มีผล sub-agent run ถัดไปทันที)`, "info");
-			} else if (sub === "ext-config") {
-				// ext-config (arg แบบเดิม — backward compat): ไม่มี role → view รวม; มี role → เดลิเกต runExtConfig
-				// (ทางหลักใหม่ = per-role commands /zense:ext-config:<role> — autocomplete จากชื่อ command ตรงๆ)
+			} else if (sub === "ext-config-show" || sub === "ext-config") {
+				// ext-config-show (ชื่อใหม่; ext-config เดิมรับเป็น alias): ไม่มี role → view รวมทุก role;
+				// มี role → เดลิเกต runExtConfig (ทางหลัก = per-role commands /zense:ext-config:<role>)
 				const roles = ["requirements", "grader", "reviewer"];
 				const [role, action, ...vals] = rest;
 				if (!role || !roles.includes(role)) {
@@ -2920,7 +2933,7 @@ export default function (pi: ExtensionAPI) {
 								return `  ${r}: ${inc.length ? `โหลด ${inc.length} ตัว` : "boot เปลือย (ไม่โหลด extension)"}`;
 							}),
 							`persist: local ${join(zenseDir(ctx.cwd), "config.json")} · global ${join(zenseGlobalConfigDir(), "config.json")} (seed ครั้งแรก + fallback)`,
-							"ตั้งค่า: /zense:ext-config:grader | :requirements | :reviewer (TUI = checkbox ทันที) หรือ /zense ext-config <role> all|none|on|off <เลขลำดับ|path>",
+							"ตั้งค่า: /zense:ext-config:grader | :requirements | :reviewer (TUI = checkbox ทันที) หรือ /zense ext-config-show <role> all|none|on|off <เลขลำดับ|path>",
 						].join("\n"),
 						"info",
 					);
@@ -2928,7 +2941,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				await runExtConfig(ctx, role, action, vals);
 			} else {
-				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models|ext-config", "info");
+				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models|ext-config-show", "info");
 			}
 		},
 	});

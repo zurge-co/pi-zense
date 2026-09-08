@@ -199,6 +199,29 @@ test("applyWorktreeBack: worktree ไม่มีการเปลี่ยน�
 	rmSync(base, { recursive: true, force: true });
 });
 
+test("applyWorktreeBack: repo ที่ gitignore .zense/ — staging ใน worktree ห้ามล้ม (git ≥2.55 exclude-pathspec regression) + .zense ไม่ตามเข้า main", () => {
+	const base = mkdtempSync(join(tmpdir(), "zense-wt-ignored-"));
+	const cwd = join(base, "repo");
+	mkdirSync(cwd, { recursive: true });
+	const git = gitIn(cwd);
+	git(["init", "-q"]);
+	git(["config", "user.email", "t@t"]);
+	git(["config", "user.name", "t"]);
+	writeFileSync(join(cwd, ".gitignore"), ".zense/\n"); // ← เคสที่ git add แบบ ':!.zense' เดิม fatal exit 1
+	writeFileSync(join(cwd, "README.md"), "# init\n");
+	git(["add", "-A"]);
+	git(["commit", "-q", "-m", "init"]);
+	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt);
+	writeFileSync(join(wt.root, ".zense", "spec.json"), "{}\n"); // harness state ถูก ignore ใน worktree ด้วย (สืบจาก .gitignore)
+	writeFileSync(join(wt.root, "src.txt"), "impl\n");
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true, `apply ต้องสำเร็จแม้ .zense ถูก gitignore: ${ar.msg}`);
+	assert.deepEqual(stagedIn(git), ["src.txt"], "เฉพาะ source เท่านั้นที่ staged — harness state ไม่ตาม");
+	assert.ok(!existsSync(wt.root), "worktree cleaned up");
+	rmSync(base, { recursive: true, force: true });
+});
+
 test("applyWorktreeBack: guard dirty main — main มี uncommitted change นอก .zense → refuse (ok=false dirtyMain) ไม่แตะ branch/worktree", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);

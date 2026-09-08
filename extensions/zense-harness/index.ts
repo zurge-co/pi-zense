@@ -304,10 +304,28 @@ export const composeSnapshotMessage = (dirty: string[]): string => {
 	return `${subject}\n\nFiles snapshotted (uncommitted at pre-spec check):\n${names.map((n) => `- ${n}`).join("\n")}\n`;
 };
 
+/** stage ทุก change ยกเว้น .zense (policy: harness state ห้ามเข้า index/commit เด็ดขาด) —
+ *  ห้ามใช้ exclude pathspec (`git add -A -- . ':!.zense'`): git ≥2.55 fatal exit 1
+ *  "The following paths are ignored by one of your .gitignore files: .zense" ทันทีที่ traversal
+ *  เจอ dir ที่ถูก ignore แม้มี exclusion ครอบอยู่ (exclude-only / --ignore-errors ก็ไม่รอด —
+ *  เจอจริง git 2.55.0) → snapshot รายงาน "git add failed" ทั้งที่ policy เดิมถูกต้องอยู่แล้ว
+ *  วิธีที่ใช้ได้ทุกกรณี: add ธรรมดา (ignored files ถูกข้ามเงียบๆ exit 0) แล้ว unstage .zense ทิ้งเสมอ —
+ *  กันเคสโปรเจกต์ที่ไม่ได้ ignore .zense (add -A จะดูด harness state ทั้งหมดรวม .zense/worktree/)
+ *  โดย reset กลับ HEAD (tracked .zense — ถ้ามี — คงสภาพ index เดิม ไม่กลายเป็น staging deletion)
+ *  หรือ rm --cached เมื่อยังไม่มี commit แรก (ไม่มี HEAD ให้ reset); best-effort, ไม่มีใน index → no-op */
+export const gitAddButZense = (cwd: string): { ok: boolean; out: string; err: string } => {
+	const add = gitOk(["add", "-A", "--", "."], cwd);
+	if (!add.ok) return add;
+	const head = gitOk(["rev-parse", "--verify", "-q", "HEAD"], cwd);
+	if (head.ok) gitOk(["reset", "-q", "--", ".zense"], cwd); // reset <paths> กลับ HEAD (default commit) — tracked .zense คงสภาพ index เดิม
+	else gitOk(["rm", "-r", "--cached", "-q", "--ignore-unmatch", ".zense"], cwd); // no HEAD ให้ reset — ลบออกจาก index เท่านั้น worktree ไม่แตะ
+	return add;
+};
+
 /** snapshot commit ของที่ค้างอยู่ (มนุษย์เลือก "commit ให้" จาก pre-spec dialog) — matcher กับ behavior เดิม
- *  ของ harness: add -A ยกเว้น .zense + --no-verify; ไม่มีอะไร staged → ok แต่ msg="nothing to commit" */
+ *  ของ harness: add -A ยกเว้น .zense (ผ่าน gitAddButZense) + --no-verify; ไม่มีอะไร staged → ok แต่ msg="nothing to commit" */
 export const snapshotUncommitted = (cwd: string, message: string): { ok: boolean; msg: string } => {
-	const add = gitOk(["add", "-A", "--", ".", NOT_ZENSE], cwd);
+	const add = gitAddButZense(cwd);
 	// ไม่เช็ค add = error จะไปโผล่ที่ commit แทน ("nothing to commit") ทั้งที่ของจริง add ล้ม → รายงานต้นตอตรงๆ
 	if (!add.ok) return { ok: false, msg: `git add failed: ${add.err}` };
 	if (gitOk(["diff", "--cached", "--quiet"], cwd).ok) return { ok: true, msg: "nothing to commit" };
@@ -349,7 +367,8 @@ export const applyWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): ApplyB
 	const base = mb.ok ? mb.out.trim() : "";
 	const interimSubjects = base ? gitOk(["log", "--format=%s", `${base}..HEAD`], wt.root).out.split("\n").map((s) => s.trim()).filter(Boolean) : [];
 	// stage changes ใน worktree (ยกเว้น .zense) — รวม untracked files ด้วย (git diff --quiet HEAD ไม่เห็น untracked)
-	gitOk(["add", "-A", "--", ".", ":!.zense"], wt.root);
+	// ผ่าน gitAddButZense: exclude pathspec กับ git add ล้มเมื่อ .zense ถูก ignore (git ≥2.55 — ดูคอมเมนต์ helper)
+	gitAddButZense(wt.root);
 	if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
 		gitOk(["commit", "-m", "(interim — squashed at apply-back)", "--no-verify"], wt.root);
 	}

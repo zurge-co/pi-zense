@@ -19,6 +19,11 @@ import {
 	parseReviewerPacket,
 	runCheckProbes,
 	SUBAGENT_EXCLUDE_TOOLS,
+	SUBAGENT_STRIP_FLAGS,
+	buildCompactProbeSection,
+	buildEvalResultText,
+	buildReviewResultText,
+	COMMENT_DISCIPLINE_GUIDELINE,
 } from "../extensions/zense-harness/index.ts";
 
 const CRITERIA = [
@@ -392,4 +397,114 @@ test("runCheckProbes: leading runner prefix executes the stripped command (pass/
 	assert.equal(probes[2].exitCode, 127); // คำสั่งข้างในหาย → cmdErr ยัง skipped เหมือนเดิม
 	assert.match(probes[2].detail, /probe command error/);
 	assert.match(probes[3].detail, /not found: definitely-missing-file-xyz/);
+});
+
+// ----- M (spec v2 ข้อ 1): per-role strip flags table
+test("SUBAGENT_STRIP_FLAGS: grader/reviewer bare เต็มตัว, requirements ตัดเฉพาะ themes/templates", () => {
+	const FULL = ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"];
+	assert.deepEqual(SUBAGENT_STRIP_FLAGS.grader, FULL);
+	assert.deepEqual(SUBAGENT_STRIP_FLAGS.reviewer, FULL);
+	assert.deepEqual(SUBAGENT_STRIP_FLAGS.requirements, ["--no-themes", "--no-prompt-templates"]);
+	assert.equal(SUBAGENT_STRIP_FLAGS["unknown-role"], undefined);
+});
+
+// ----- M (spec v2 ข้อ 2): compact tool-result builders
+test("buildCompactProbeSection: ลงรายละเอียดเฉพาะ probes ที่ไม่ pass; pass รวมบรรทัดเดียว", () => {
+	const section = buildCompactProbeSection([
+		{ id: "c1", status: "pass", detail: "ok" },
+		{ id: "c2", status: "fail", exitCode: 1, detail: "npm test exploded\nstack line 2" },
+		{ id: "c3", status: "skipped", detail: "not machine-runnable" },
+		{ id: "c4", status: "pass", detail: "ok too" },
+	]);
+	assert.match(section, /## Probes/);
+	assert.match(section, /- c2: fail \(exit 1\) — npm test exploded/);
+	assert.match(section, /- c3: skipped — not machine-runnable/);
+	assert.match(section, /probes pass: c1,c4/); // pass รวมบรรทัดเดียว
+	assert.ok(!section.includes("stack line 2"), "detail ต้องถูกตัดเป็นบรรทัดเดียว");
+	assert.ok(!section.includes("- c1:"), "probe ที่ pass ห้ามมีบรรทัด detail ของตัวเอง");
+});
+
+test("buildEvalResultText PASS: verdict + verdicts ครบทุก criterion + directives เรียก zense_review + log hint", () => {
+	const text = buildEvalResultText({
+		verdict: "PASS",
+		criteria: [
+			{ id: "C1", text: "tests pass", check: "npm test" },
+			{ id: "C2", text: "file exists", check: "path exists: src/x.ts" },
+		],
+		perCriteria: { C1: "PASS", C2: "PASS" },
+		evidence: { C1: "npm test exit 0", C2: "file found" },
+		failedIds: [],
+		probeOverrides: [],
+		probes: [
+			{ id: "C1", status: "pass", detail: "ok" },
+			{ id: "C2", status: "pass", detail: "ok" },
+		],
+		trajectory: ["out-of-scope write: x"],
+		specDebt: ["manual QA"],
+		logPath: ".zense/subagents/t-grader.log",
+	});
+	assert.match(text, /✅ Eval PASS/);
+	assert.match(text, /zense_review/, "PASS directives ต้องสั่งเรียก zense_review ทันที (agent เคยถือว่างานจบเงียบๆ)");
+	assert.match(text, /- C1: PASS — npm test exit 0/);
+	assert.match(text, /- C2: PASS — file found/);
+	assert.match(text, /probes pass: C1,C2/);
+	assert.match(text, /out-of-scope write/);
+	assert.match(text, /manual QA/);
+	assert.match(text, /\.zense\/subagents\/t-grader\.log/);
+	assert.match(text, /อ่านเอง|log/, "ต้องชี้ log ให้ agent อ่านเอง");
+});
+
+test("buildEvalResultText FAIL: เฉพาะ criteria ที่ FAIL + evidence ตัด 120 chars + ไม่มีบรรทัดของตัวที่ PASS", () => {
+	const longEvidence = "x".repeat(200);
+	const text = buildEvalResultText({
+		verdict: "FAIL",
+		criteria: [
+			{ id: "C1", text: "a", check: "npm test" },
+			{ id: "C2", text: "b", check: "npm run build" },
+		],
+		perCriteria: { C1: "PASS", C2: "FAIL" },
+		evidence: { C1: "passed fine", C2: `${longEvidence}\nsecond line` },
+		failedIds: ["C2"],
+		probeOverrides: ["C2"],
+		probes: [
+			{ id: "C1", status: "pass", detail: "ok" },
+			{ id: "C2", status: "fail", exitCode: 2, detail: "build broke" },
+		],
+		trajectory: [],
+		specDebt: [],
+		logPath: ".zense/subagents/t-grader.log",
+	});
+	assert.match(text, /❌ Eval FAIL/);
+	assert.match(text, /criteria ที่ไม่ผ่าน: C2/);
+	assert.match(text, /probe override → FAIL \[C2\]/);
+	assert.match(text, /- C2: FAIL — /);
+	assert.ok(!text.includes("- C1: PASS"), "FAIL branch ต้องตัด per-criteria ที่ PASS ออก");
+	const c2Line = text.split("\n").find((l) => l.startsWith("- C2:"));
+	assert.ok(c2Line.length <= 121 + "- C2: FAIL — ".length, `evidence ต้องถูกตัด ~120 chars (ได้ ${c2Line.length})`);
+	assert.ok(!text.includes("second line"), "evidence ต้องเหลือบรรทัดเดียว");
+	assert.match(text, /probes pass: C1/);
+	assert.match(text, /build broke/);
+	assert.ok(text.length < 2_500, `ข้อความ FAIL ต้องสั้นกว่า output ดิบแบบเดิมอย่างมีนัยสำคัญ (ได้ ${text.length} chars)`);
+});
+
+test("buildReviewResultText: TL;DR + counts + log hint; failure branch มี error tail และ log", () => {
+	const okText = buildReviewResultText({ ok: true, tlDr: "all good", trajectoryCount: 2, escalationCount: 1, logPath: ".zense/subagents/t-reviewer.log" });
+	assert.match(okText, /all good/);
+	assert.match(okText, /trajectory flags: 2 · escalations: 1/);
+	assert.match(okText, /t-reviewer\.log/);
+	assert.ok(okText.length < 600, "compact result ต้องสั้นกว่า packet slice(0,4000) เดิม");
+	const errText = buildReviewResultText({ ok: false, tlDr: "", trajectoryCount: 0, escalationCount: 0, logPath: ".zense/subagents/t-reviewer.log", errorOutput: "exited code=1" });
+	assert.match(errText, /reviewer failed: exited code=1/);
+	assert.match(errText, /t-reviewer\.log/);
+});
+
+// ----- M (spec v2 ข้อ 3): comment-discipline guideline
+test("COMMENT_DISCIPLINE_GUIDELINE: ครอบประเด็นบังคับ 5 ข้อและอยู่ในขนาด guideline สั้น", () => {
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /non-obvious/); // WHY เท่านั้น
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /WHAT a line does/i); // ห้าม what-comment
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /banner/i); // ห้าม separator/banner
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /JSDoc/i); // ห้าม docstring boilerplate
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /existing decision-recording comments/i); // ห้ามลบ comment เดิมของ repo
+	const lines = COMMENT_DISCIPLINE_GUIDELINE.split("\n");
+	assert.ok(lines.length <= 10, `guideline ต้องสั้น ~8 บรรทัด (ได้ ${lines.length})`);
 });

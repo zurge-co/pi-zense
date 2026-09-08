@@ -183,6 +183,29 @@ test("buildSubagentArgv: requirements role is read-only (--exclude-tools write,e
 	assert.equal(plain.at(-1), "grade it");
 });
 
+test("buildSubagentArgv: per-role strip flags — grader/reviewer boot bare เต็มตัว, requirements เก็บ skills/extensions", () => {
+	const FULL = ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"];
+	for (const role of ["grader", "reviewer"]) {
+		const a = buildSubagentArgv(`task-${role}`, undefined, undefined, role);
+		for (const f of FULL) assert.ok(a.includes(f), `${role} ต้องมี ${f}`);
+		assert.equal(a.at(-1), `task-${role}`, "task ต้องอยู่ท้าย argv เสมอ");
+		// strip flags ต้องอยู่หลัง --no-session และก่อน task (ก่อน --exclude-tools/--model ถ้ามี)
+		assert.ok(a.indexOf("--no-themes") > a.indexOf("--no-session"), `${role}: strip flags ต้องหลัง --no-session`);
+	}
+	// grader ใช้คู่กับ --exclude-tools + --model → ordering: strip นำก่อนทั้งคู่
+	const g = buildSubagentArgv("grade", "sonnet", ["write", "edit"], "grader");
+	assert.ok(g.indexOf("--no-skills") < g.indexOf("--exclude-tools"), "strip flags ต้องมาก่อน --exclude-tools");
+	assert.ok(g.indexOf("--exclude-tools") < g.indexOf("--model"), "--exclude-tools ต้องมาก่อน --model (contract เดิม)");
+	// requirements: explore repo ต้องเห็น skills/extensions — ตัดเฉพาะ themes/prompt-templates
+	const req = buildSubagentArgv("draft", undefined, undefined, "requirements");
+	assert.ok(req.includes("--no-themes") && req.includes("--no-prompt-templates"));
+	assert.ok(!req.includes("--no-skills") && !req.includes("--no-extensions"), "requirements ห้าม strip skills/extensions");
+	// ไม่ส่ง role / role ไม่รู้จัก → ไม่มี strip flags (เช็คเฉพาะ strip flag จริง — argv มี --no-session อยู่แล้ว)
+	const STRIP_ONLY = ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"];
+	assert.ok(!STRIP_ONLY.some((f) => buildSubagentArgv("x").includes(f)));
+	assert.ok(!STRIP_ONLY.some((f) => buildSubagentArgv("x", undefined, undefined, "mystery").includes(f)));
+});
+
 test("buildRequirementsPrompt: enforces explore-first, JSON-only output and the clarify contract", () => {
 	const p = buildRequirementsPrompt("add dark mode", []);
 	assert.match(p, /EXPLORE \(read-only/);

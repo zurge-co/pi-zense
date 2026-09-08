@@ -517,6 +517,18 @@ export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
 	reviewer: ["write", "edit"],
 };
 
+/** M (2026-09-08): per-role boot strip flags — sub-agent ทุก launch จ่าย system prompt ของ pi
+ *  ใหม่ทั้งก้อน (skills/prompt templates/themes/extensions ถูกโหลดเหมือน session ปกติ) ทั้งที่ role
+ *  เป็นหน้าที่ตายตัว: grader/reviewer ตัดสินจาก evidence ใน prompt ล้วน → boot เปลือยเต็มตัว;
+ *  requirements ต้อง explore repo เป้าหมาย (skills/extensions ของ repo อาจให้ context จำเป็น)
+ *  → ตัดเฉพาะ themes/prompt-templates. กรณี --no-extensions ปลอดภัยเพราะ harness bails ตัวเองใน
+ *  sub-agent ด้วย PI_ZENSE_SUBAGENT=1 อยู่แล้ว — ปิดเฉพาะ extension อื่นของผู้ใช้ ไม่ทำ zense หลุด */
+export const SUBAGENT_STRIP_FLAGS: Record<string, string[]> = {
+	requirements: ["--no-themes", "--no-prompt-templates"],
+	grader: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
+	reviewer: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
+};
+
 /** B (2026-09-02): timeout ต่อ role — log จริง (.zense/subagents/) พิสูจน์ว่า requirements/grader โดนฆ่า
  *  ที่ 240s พอดีทุกไฟล์ (งาน explore repo + รัน check นานกว่านั้น). override ทุก role ได้ด้วย
  *  ไม่มี env override (ถอด 2026-09-02 ตามคำตัดสินใจ user: env เป็น knob ที่ agent แกะไม่ได้ตอนรัน)
@@ -554,9 +566,11 @@ export const modelMatchesPattern = (usedModel: string, pattern: string): boolean
 	return used.length > 0 && (pat === used || pat.startsWith(`${used}:`));
 };
 
-export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[]): string[] => {
-	// argv: --exclude-tools ก่อน --model ก่อน task; ไม่ใส่ -- นำหน้า task (คงพฤติกรรมเดิมของไฟล์นี้)
+export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[], role?: string): string[] => {
+	// argv: strip flags (per-role) ก่อน --exclude-tools ก่อน --model ก่อน task; ไม่ใส่ -- นำหน้า task (คงพฤติกรรมเดิม)
+	// M: strip flags จาก SUBAGENT_STRIP_FLAGS ตาม role — เดิมโหลด skills/templates/themes/extensions ครบทุก launch
 	const argv = ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "json", "--no-session"];
+	if (role && SUBAGENT_STRIP_FLAGS[role]?.length) argv.push(...SUBAGENT_STRIP_FLAGS[role]);
 	if (excludeTools?.length) argv.push("--exclude-tools", excludeTools.join(","));
 	if (modelPattern) argv.push("--model", modelPattern);
 	argv.push(task);
@@ -920,6 +934,90 @@ export const buildGraderPrompt = (spec: Spec, probes: ProbeResult[], diffSummary
 	`No extra commentary. The last line must be exactly 'OVERALL: PASS' or 'OVERALL: FAIL'.` +
 	(feedback ? `\n\nSYSTEM FEEDBACK: your previous response was rejected: ${feedback}. Return the corrected format only.` : "");
 
+// ----------------------------------------------------------------------------- M: compact tool-result display text
+// เดิมทุก branch ของ zense_eval/zense_review ต่อท้าย sub-agent output ดิบ (สูงสุด ~16k chars จาก runSubagent)
+// เข้า conversation history ถาวร → จ่าย input ซ้ำทุก turn หลัง eval. builders กลุ่มนี้ render เฉพาะสิ่งที่ main
+// agent ต้องใช้ตัดสินใจต่อ (verdict, per-criteria one-liner, probes ที่ไม่ผ่าน, directives, log path ให้อ่านเอง)
+// — ข้อมูลเต็มยังคงอยู่ใน details{} และ .zense/subagents/*.log เหมือนเดิม ไม่มีอะไรหายจาก pipeline
+
+/** ตัด evidence เป็น 1 บรรทัดสั้น — บังคับ ceiling เพื่อไม่ให้ tool result บวมกลับ */
+const oneLineEvidence = (s: string, max = 120): string => {
+	const line = (s ?? "").split("\n")[0].trim();
+	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+};
+
+/** probe section แบบบีบ: ลงรายละเอียดเฉพาะ probes ที่ไม่ pass; ที่ pass รวมเป็นบรรทัดเดียว
+ *  (เริ่มด้วย \n\n เหมือน probeSection เดิม — caller ต่อ string แบบเดิมได้ทุก branch) */
+export const buildCompactProbeSection = (probes: ProbeResult[]): string => {
+	const passIds = probes.filter((p) => p.status === "pass").map((p) => p.id);
+	const lines = probes
+		.filter((p) => p.status !== "pass")
+		.map((p) => `- ${p.id}: ${p.status}${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""} — ${oneLineEvidence(p.detail, 200)}`);
+	if (passIds.length) lines.push(`probes pass: ${passIds.join(",")}`);
+	return `\n\n## Probes (harness-executed, authoritative)\n${lines.join("\n") || "(no probes)"}`;
+};
+
+/** input ของ buildEvalResultText — ทุก field มีอยู่แล้วใน handler (ไม่ดึง output ดิบของ sub-agent เข้ามา) */
+export interface EvalResultView {
+	verdict: string;
+	criteria: Criterion[];
+	perCriteria: Record<string, "PASS" | "FAIL">;
+	evidence: Record<string, string>;
+	failedIds: string[];
+	probeOverrides: string[];
+	probes: ProbeResult[];
+	trajectory: string[];
+	specDebt: string[];
+	logPath: string; // path ของ .zense/subagents/*.log — agent อ่านเองเมื่อต้องการรายละเอียด
+}
+
+/** render ข้อความผลของ zense_eval ทั้ง PASS/FAIL — FAIL แสดงเฉพาะ criteria ที่ไม่ผ่าน (เอาที่ PASS ออกจากสมาธิของ agent)
+ *  ทั้งสอง branch จบด้วยชี้ log เต็ม + directives; ห้ามแตะ directives (FAIL = กลับไปแก้, PASS = บังคับเรียก zense_review — agent เคยถือว่างานจบเงียบๆ) */
+export const buildEvalResultText = (v: EvalResultView): string => {
+	const out: string[] = [
+		v.verdict === "PASS"
+			? "✅ Eval PASS — ขั้นต่อไป (บังคับ): เรียก `zense_review` ทันทีเพื่อให้ reviewer sub-agent สร้าง review packet — ห้ามสรุป/ตอบ user จบงานก่อนจนกว่าจะเรียก zense_review แล้ว"
+			: "❌ Eval FAIL — กลับไปแก้แล้วเรียก zense_eval ใหม่ (ห้ามไป review จนกว่าจะ PASS)",
+	];
+	if (v.verdict === "FAIL") {
+		out.push(`criteria ที่ไม่ผ่าน: ${v.failedIds.length ? v.failedIds.join(", ") : "(overall FAIL — ดู evidence ด้านล่างหรือ log เต็ม)"}`);
+		if (v.probeOverrides.length)
+			out.push(
+				`⚠ probe override → FAIL [${v.probeOverrides.join(", ")}]: harness รัน check เองแล้วไม่ผ่านทั้งที่ grader ให้ PASS — สาเหตุได้ 2 ทาง: (1) artifact ผิดจริง → อ่าน probe detail ด้านล่างแล้วแก้; (2) check command ใน spec เสีย (placeholder/path ผิด — แก้ artifact ยังไงก็ไม่ผ่าน) → เรียก zense_spec เวอร์ชันใหม่แก้ check แล้วเซ็นใหม่`,
+			);
+	}
+	// FAIL: เฉพาะ criteria ที่ไม่ผ่าน (ตัดเสียงรบกวน); PASS: ครบทุกตัวเพื่อยืนยันความครอบคลุม
+	const showIds = v.verdict === "FAIL" ? new Set(v.failedIds) : null;
+	const critLines = v.criteria
+		.filter((c) => !showIds || showIds.has(c.id))
+		.map((c) => `- ${c.id}: ${v.perCriteria[c.id] ?? "?"} — ${oneLineEvidence(v.evidence[c.id] ?? "")}`);
+	if (critLines.length) out.push("", "## Verdicts", ...critLines);
+	out.push(buildCompactProbeSection(v.probes).slice(2)); // ตัด \n\n นำหน้าออก — out.push คั่นบรรทัดอยู่แล้ว
+	out.push("", "## Trajectory flags", v.trajectory.join("\n") || "(none)");
+	out.push("", "## Spec debt (needs human)", v.specDebt.join("\n") || "(none)");
+	out.push("", `🧪 grader output ดิบ (รายละเอียดแต่ละ criterion) อยู่ใน log: ${v.logPath} — อ่านเองด้วย read ถ้าต้องการ`);
+	return out.join("\n");
+};
+
+/** render ข้อความผลของ zense_review — เดิมคืน reviewer.output.slice(0,4_000) ทั้งก้อน; เหลือ TL;DR + counts + log path
+ *  (packet เต็มอยู่ใน details{} และ zense-review-packet card ใน transcript) */
+export const buildReviewResultText = (opts: { ok: boolean; tlDr: string; trajectoryCount: number; escalationCount: number; logPath: string; errorOutput?: string }): string =>
+	opts.ok
+		? `✅ Review packet พร้อม — เปิดดู review card ใน transcript ได้\n\n${opts.tlDr}\n\ntrajectory flags: ${opts.trajectoryCount} · escalations: ${opts.escalationCount}\n\n🧪 packet เต็ม (ทุก section) อยู่ใน log: ${opts.logPath} — อ่านเองด้วย read ถ้าต้องการรายละเอียด`
+		: `reviewer failed: ${opts.errorOutput ?? "(no output)"}\n\n🧪 log: ${opts.logPath}`;
+
+/** M (comment discipline, spec v2 ข้อ 3): system-prompt appendix เฉพาะ phase implementation
+ *  — ลด output token จาก comment เกินจำเป็น (what-comment / JSDoc boilerplate / banner)
+ *  ยึดหลัก "comment = WHY, ไม่ใช่ WHAT" และคุมเฉพาะโค้ดใหม่/บรรทัดที่แก้ — ห้ามแตะ decision-comments เดิมของ repo */
+export const COMMENT_DISCIPLINE_GUIDELINE = [
+	"Code-comment discipline for this implementation phase (saves tokens; keep the code readable):",
+	"- Comment only the non-obvious: WHY a decision was made, an invariant that must hold, or a trap/edge case.",
+	"- Never narrate WHAT a line does (the code already says it). No banner/separator comments (// ---- style).",
+	"- No JSDoc/docstring boilerplate on self-describing functions; document parameters only when non-obvious.",
+	"- Leave TODO/FIXME only when real follow-up exists, with reason; do not scatter them as filler.",
+	"- Applies to NEW code and lines you touch. Do not delete or rewrite existing decision-recording comments.",
+].join("\n");
+
 const REVIEW_SECTIONS = ["TL;DR", "Intent vs Implementation", "Risks", "Rollback", "Human actions"] as const;
 
 export interface PacketParse {
@@ -1101,8 +1199,10 @@ function runSubagent(
 ): Promise<{ ok: boolean; output: string; logPath: string; usedModel?: string }> {
 	const relLog = relative(cwd, logPath);
 	return new Promise((res) => {
-		const argv = buildSubagentArgv(task, modelPattern, excludeTools);
-		writeFileSync(logPath, `$ pi --mode json --no-session${excludeTools?.length ? ` --exclude-tools ${excludeTools.join(",")}` : ""}${modelPattern ? ` --model ${modelPattern}` : ""} <task ${task.length} chars>\n--- live output (${role}) ---\n`);
+		// M: ส่ง role เข้า argv builder เพื่อให้ได้ strip flags ของ role นั้น — log header echo flag จริงเพื่อ audit ได้ในภายหลัง
+		const argv = buildSubagentArgv(task, modelPattern, excludeTools, role);
+		const strip = SUBAGENT_STRIP_FLAGS[role];
+		writeFileSync(logPath, `$ pi --mode json --no-session${strip?.length ? ` ${strip.join(" ")}` : ""}${excludeTools?.length ? ` --exclude-tools ${excludeTools.join(",")}` : ""}${modelPattern ? ` --model ${modelPattern}` : ""} <task ${task.length} chars>\n--- live output (${role}) ---\n`);
 		const child = spawn("env", argv, {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -1579,6 +1679,13 @@ export default function (pi: ExtensionAPI) {
 		if (adrViolation) return { block: true, reason: adrViolation };
 		// redirect write นี้เข้า worktree ที่ท้ายสุด (หลัง scope/ADR ที่ใช้ path เดิมของ main)
 		applyRedirect(ev, ctx);
+	});
+
+	// ----- M (spec v2 ข้อ 3): comment-discipline guideline append เข้า system prompt เฉพาะตอน implementation
+	// (system prompt ถูกส่งทุก turn — จ่ายเฉพาะช่วงที่มีการเขียนโค้ดจริงเท่านั้น; ออกจาก implementation แล้วหายไปเอง)
+	pi.on("before_agent_start", async (event) => {
+		if (state.phase !== "implementation") return;
+		return { systemPrompt: event.systemPrompt + "\n\n" + COMMENT_DISCIPLINE_GUIDELINE };
 	});
 
 	// ----- Phase 3: turn/token usage meter
@@ -2259,8 +2366,8 @@ export default function (pi: ExtensionAPI) {
 				learn(ctx, `eval: spec v${state.spec.version} → inconclusive (${reason})`);
 				persist(); updateWidget(ctx);
 				return {
-					content: [{ type: "text", text: `⚠️ Eval INCONCLUSIVE — ${reason}\nprobes (harness-executed, authoritative): ${probeSummary}\n${grade.output.slice(-3_000)}\n\nตัดสินไม่ได้อย่างน่าเชื่อถือ: ให้มนุษย์ดู probe results ข้างบนแล้วตัดสินเอง (escalation need-decision ถูกบันทึกแล้ว — /zense status) หรือสั่งเรียก zense_eval อีกครั้ง` }],
-					details: { inconclusive: true, reason, probes },
+					content: [{ type: "text", text: `⚠️ Eval INCONCLUSIVE — ${reason}\nprobes: ${probeSummary}${probeSection}\n\nตัดสินไม่ได้อย่างน่าเชื่อถือ: ให้มนุษย์ดู probe results ข้างบนแล้วตัดสินเอง (escalation need-decision ถูกบันทึกแล้ว — /zense status) หรือสั่งเรียก zense_eval อีกครั้ง\n\n🧪 grader output ดิบอยู่ใน log: ${evalView.logPath} — อ่านเองด้วย read ถ้าต้องการ` }],
+					details: { inconclusive: true, reason, probes, logPath: grade.logPath },
 					isError: true,
 				};
 			}
@@ -2277,13 +2384,22 @@ export default function (pi: ExtensionAPI) {
 			if (probeOverrides.length) learn(ctx, `grader: probe overrides → FAIL [${probeOverrides.join(",")}]`);
 			const failedCriteria = parsed.failedIds;
 			const verdict = failedCriteria.length || parsed.overall === "FAIL" ? "FAIL" : "PASS";
-			// section เดียวใช้ร่วมทั้ง FAIL/PASS/deadlock — แสดงหลักฐานที่ harness รันเองเสมอ
-			// (เดิม tool result มีแต่ output ดิบของ grader ที่อาจโดน probe primacy ทับแล้ว → header ขัดกับ body, agent เดาสาเหตุ FAIL ผิด)
-			const probeSection =
-				`\n\n## Probes (harness-executed, authoritative)\n` +
-				probes
-					.map((p) => `- ${p.id}: ${p.status}${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""} — ${p.detail.split("\n")[0].slice(0, 200)}`)
-					.join("\n");
+			// section เดียวใช้ร่วมทั้ง FAIL/PASS/deadlock/inconclusive — M: บีบด้วย buildCompactProbeSection
+			// (pass รวมบรรทัดเดียว ลงรายละเอียดเฉพาะ fail/skipped; grade.output ดิบชี้ไป log แทนการฝังใน transcript)
+			const probeSection = buildCompactProbeSection(probes);
+			// M: view กลางของทุก branch — pure builder render ข้อความให้ (PASS/FAIL); deadlock/inconclusive ต่อ directives เอง
+			const evalView: EvalResultView = {
+				verdict,
+				criteria: state.spec.criteria,
+				perCriteria: parsed.perCriteria,
+				evidence: parsed.evidence,
+				failedIds: failedCriteria,
+				probeOverrides,
+				probes,
+				trajectory: state.trajectoryFlags,
+				specDebt: state.spec.specDebt,
+				logPath: relative(ctx.cwd, grade.logPath),
+			};
 			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} judged=${Object.keys(parsed.perCriteria).length}/${state.spec.criteria.length} failed=[${failedCriteria.join(",")}]${probeOverrides.length ? ` probeOverrides=[${probeOverrides.join(",")}]` : ""}`);
 			// W2: เก็บ evidence ไว้เป็น input ของ reviewer (zense_review สร้าง evidence pack จาก lastEval)
 			// ผูก evidence กับรอบปัจจุบัน: specVersion + tree SHA ของ tree ที่ eval (HEAD^{tree} — ตั้งใจใช้ tree ไม่ใช่ commit SHA
@@ -2333,14 +2449,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				state.escalations.push({ kind: "need-fix", detail: `criteria failed: ${failedCriteria.join(",") || "grader FAIL"}`, at: Date.now() });
 				persist(); updateWidget(ctx);
-				const fixMsg =
-					`❌ Eval FAIL — กลับไปแก้แล้วเรียก zense_eval ใหม่ (ห้ามไป review จนกว่าจะ PASS)\n` +
-					`criteria ที่ไม่ผ่าน: ${failedCriteria.length ? failedCriteria.join(", ") : "(overall FAIL — ดู grader output)"}\n` +
-					(probeOverrides.length
-						? `⚠ probe override → FAIL [${probeOverrides.join(", ")}]: harness รัน check เองแล้วไม่ผ่านทั้งที่ grader ให้ PASS — สาเหตุได้ 2 ทาง: (1) artifact ผิดจริง → อ่าน probe detail ด้านล่างแล้วแก้; (2) check command ใน spec เสีย (placeholder/path ผิด — แก้ artifact ยังไงก็ไม่ผ่าน) → เรียก zense_spec เวอร์ชันใหม่แก้ check แล้วเซ็นใหม่\n`
-						: "\n") +
-					`${grade.output}${probeSection}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}`;
-				return { content: [{ type: "text", text: fixMsg }], details: { ok: grade.ok, verdict, failedCriteria, probes, trajectory: state.trajectoryFlags }, isError: true };
+				// M: ข้อความจาก pure builder — grade.output ดิบไม่ฝังใน transcript อีก (ชี้ log แทน); เฉพาะ evidence ของ criteria ที่ FAIL
+				return { content: [{ type: "text", text: buildEvalResultText(evalView) }], details: { ok: grade.ok, verdict, failedCriteria, probes, perCriteria: parsed.perCriteria, evidence: parsed.evidence, probeOverrides, trajectory: state.trajectoryFlags, logPath: grade.logPath }, isError: true };
 			}
 			// PASS: เดินไป review (unknown เป็นไปไม่ได้แล้ว — inconclusive ถูกดักไป escalate ก่อนหน้านี้)
 			// ต้องสั่งขั้นต่อไป explicit ในข้อความที่คืนให้ agent (เหมือน FAIL branch) —
@@ -2350,10 +2460,8 @@ export default function (pi: ExtensionAPI) {
 			// ไม่ล้าง = reviewer เห็น "criteria failed: c2,c3,c6" เก่าปน evidence แล้วเขียน TL;DR ขัด verdict PASS
 			// (เคสจริงรอบ spec v1) — need-decision คงไว้เพราะยังรอมนุษย์ตัดสิน
 			state.escalations = state.escalations.filter((e) => e.kind !== "need-fix");
-			const report =
-				`${grade.output}${probeSection}\n\n## Trajectory flags\n${state.trajectoryFlags.join("\n") || "(none)"}\n\n## Spec debt (needs human)\n${state.spec.specDebt.join("\n") || "(none)"}` +
-				`\n\n✅ Eval PASS — ขั้นต่อไป (บังคับ): เรียก \`zense_review\` ทันทีเพื่อให้ reviewer sub-agent สร้าง review packet` +
-				` — ห้ามสรุป/ตอบ user จบงานก่อนจนกว่าจะเรียก zense_review แล้ว`;
+			// M: PASS ก็ผ่าน builder เดียวกัน (verdict เป็นตัวเลือก branch ของข้อความ); directives "เรียก zense_review ทันที" คงไว้ใน builder
+			const report = buildEvalResultText(evalView);
 			// auto merge-back: เมื่อ eval PASS งาน verified สมบูรณ์ → merge worktree กลับเข้า main (auto-commit + git merge --no-ff)
 			if (state.worktree) {
 				const mr = mergeWorktreeBack(ctx.cwd, state.spec, state.worktree);
@@ -2435,7 +2543,11 @@ export default function (pi: ExtensionAPI) {
 			};
 			pi.appendEntry("zense-review-packet", packet);
 			learn(ctx, `review packet: flags=${packet.trajectory.length}, escalations=${packet.escalations.length}, sections-ok=${packetParse.ok}${packetParse.missing.length ? ` missing=[${packetParse.missing.join(",")}]` : ""}`);
-			return { content: [{ type: "text", text: reviewer.ok ? reviewer.output.slice(0, 4_000) : `reviewer failed: ${reviewer.output}` }], details: packet };
+			// M: ข้อความผลบีบด้วย pure builder — เดิม slice(0,4_000) ของ packet ดิบเข้า history ถาวร; packet เต็มยังอยู่ใน details{} + review card + log
+			const reviewText = reviewer.ok
+				? buildReviewResultText({ ok: true, tlDr: packet.tlDr, trajectoryCount: packet.trajectory.length, escalationCount: packet.escalations.length, logPath: relative(ctx.cwd, reviewer.logPath) })
+				: buildReviewResultText({ ok: false, tlDr: "", trajectoryCount: 0, escalationCount: 0, logPath: relative(ctx.cwd, reviewer.logPath), errorOutput: reviewer.output.slice(-2_000) });
+			return { content: [{ type: "text", text: reviewText }], details: { ...packet, logPath: reviewer.logPath } };
 		},
 	});
 

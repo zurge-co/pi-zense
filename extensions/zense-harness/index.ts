@@ -276,6 +276,47 @@ const PENDING_PATCH = "pending-apply.patch"; // reverse patch ของ change �
 const PENDING_MSG = "pending-apply.msg";     // commit message สำเร็จรูป (จาก squashed commit) — มนุษย์ commit -F ได้เลย
 const NOT_ZENSE = ":!.zense";                // pathspec: ทุกอย่างยกเว้น .zense (harness state ไม่เข้า apply/undo เด็ดขาด)
 
+/** เป็น git working tree หรือไม่ — feature ทุกอย่างที่พยิง git (pre-spec dirty guard, worktree, apply-back)
+ *  ต้อง degrade เงียบเมื่อ false (โปรเจกต์ที่ยังไม่ init git ไม่ควรเห็น guard นี้เลย) */
+export const isGitRepo = (cwd: string): boolean => gitOk(["rev-parse", "--is-inside-work-tree"], cwd).ok;
+
+/** รายการ uncommitted change นอก .zense (porcelain เช่น " M src/x.ts", "?? new.ts") — ว่าง = สะอาดหรือไม่ใช่ git repo
+ *  ใช้เป็น pre-spec guard: worktree ของ spec ใหม่ branch จาก HEAD ตอน approve → ของที่ยังไม่ commit
+ *  จะไม่ตามเข้า worktree และหลุดจาก baseline (baselineHead=HEAD) ทั้งที่ agent เห็นไฟล์อยู่ใน main */
+export const uncommittedChanges = (cwd: string): string[] => {
+	const r = gitOk(["status", "--porcelain", "--", ".", NOT_ZENSE], cwd);
+	if (!r.ok) return [];
+	return r.out.split("\n").map((s) => s.trimEnd()).filter(Boolean);
+};
+
+/** commit message ของ snapshot auto-commit — ห้าม fixed: สร้างจากรายชื่อไฟล์ที่ค้างจริง (subject ≤72 chars
+ *  ผ่าน sanitizeSubject; รายชื่อครบทุกไฟล์อยู่ใน body เผื่อ subject ถูกตัด) เพื่อ log อธิบายตัวเองได้ */
+export const composeSnapshotMessage = (dirty: string[]): string => {
+	const names = dirty.map((l) => l.slice(3).replace(/^"|"$/g, "")).filter(Boolean); // porcelain: "XY <path>" (octal-quoted ถ้ามีช่องว่าง/ไทย)
+	// ลดจำนวนชื่อไฟล์ใน subject ลงทีละตัวจนพอดี 72 chars (ห้ามปล่อยให้ sanitizeSubject ตัดทิ้ง
+	// เปล่าๆ — suffix "(+N)" ที่บอกว่ามีไฟล์อื่นอีกจะหายไปด้วย); body ด้านล่าง list ครบทุกไฟล์เสมอ
+	let subject = "";
+	for (let take = Math.min(3, names.length); take >= 0 && !subject; take--) {
+		const more = names.length > take ? ` (+${names.length - take})` : "";
+		const cand = sanitizeSubject(`chore: snapshot pre-spec${take ? `: ${names.slice(0, take).join(", ")}${more}` : more ? ` (${names.length} files)` : ""}`);
+		if (!cand.endsWith("…") || take === 0) subject = cand; // ยอมตัดตอน take=0 เท่านั้น (prefix เองยาวเกิน — แทบเป็นไปไม่ได้)
+	}
+	return `${subject}\n\nFiles snapshotted (uncommitted at pre-spec check):\n${names.map((n) => `- ${n}`).join("\n")}\n`;
+};
+
+/** snapshot commit ของที่ค้างอยู่ (มนุษย์เลือก "commit ให้" จาก pre-spec dialog) — matcher กับ behavior เดิม
+ *  ของ harness: add -A ยกเว้น .zense + --no-verify; ไม่มีอะไร staged → ok แต่ msg="nothing to commit" */
+export const snapshotUncommitted = (cwd: string, message: string): { ok: boolean; msg: string } => {
+	const add = gitOk(["add", "-A", "--", ".", NOT_ZENSE], cwd);
+	// ไม่เช็ค add = error จะไปโผล่ที่ commit แทน ("nothing to commit") ทั้งที่ของจริง add ล้ม → รายงานต้นตอตรงๆ
+	if (!add.ok) return { ok: false, msg: `git add failed: ${add.err}` };
+	if (gitOk(["diff", "--cached", "--quiet"], cwd).ok) return { ok: true, msg: "nothing to commit" };
+	const cm = gitOk(["commit", "-m", message, "--no-verify"], cwd);
+	if (!cm.ok) return { ok: false, msg: cm.err };
+	const h = gitOk(["rev-parse", "--short", "HEAD"], cwd);
+	return { ok: true, msg: h.ok ? h.out.trim() : "committed" };
+};
+
 export interface ApplyBackResult {
 	ok: boolean;
 	conflict?: boolean;   // merge --squash ชน — main ถูกย้อนสภาพเดิมแล้ว, เก็บ worktree ไว้ให้มนุษย์ resolve
@@ -2534,6 +2575,42 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "compile_spec") {
 				if (!params.intent?.trim())
 					return { content: [{ type: "text", text: "compile_spec ต้องการ intent — ส่งสรุป request ของผู้ใช้มาใน intent แล้วเรียกใหม่" }], details: {}, isError: true };
+				// pre-spec dirty guard: worktree ของ spec นี้จะ branch จาก HEAD ตอน approve — uncommitted change
+				// ใน main จะไม่ตามเข้า worktree และหลุดจาก baseline (baselineHead=HEAD) → ถามมนุษย์ก่อนเผา budget sub-agent
+				let preSpecNote = "";
+				// ไม่ใช่ git repo → feature นี้ปิดสนิท (ไม่เช็ค/ไม่ถาม/ไม่เตือน) — โปรเจกต์ยังไม่ init git ไม่มี baseline อยู่แล้ว
+				const preDirty = isGitRepo(ctx.cwd) ? uncommittedChanges(ctx.cwd) : [];
+				if (preDirty.length && ctx.hasUI) {
+					persist(); updateWidget(ctx);
+					const preview = preDirty.slice(0, 10).join("\n") + (preDirty.length > 10 ? `\n… (+${preDirty.length - 10} รายการ)` : "");
+					const choice = await ctx.ui.select(
+						`⚠️ มี uncommitted change ${preDirty.length} รายการค้างอยู่ใน main (นอก .zense):\n${preview}\n\nspec ใหม่ = baseline ที่ HEAD ตอนนี้ — ของที่ยังไม่ commit จะไม่เข้า worktree เมื่อเริ่ม implement`,
+						[
+							"📦 commit ให้เลย (snapshot ของที่ค้างไว้ แล้ว compile ต่อ)",
+							"⏩ ข้าม — compile ต่อโดยไม่ commit",
+							"🖐 เดี๋ยวจัดการเอง — ยกเลิก compile รอบนี้ก่อน (Esc ก็ยกเลิก)",
+						],
+					);
+					if (choice === undefined || choice.startsWith("🖐")) {
+						return { content: [{ type: "text", text: `⏸ compile ถูกยกเลิกตามที่เลือก — มี uncommitted change ${preDirty.length} รายการใน main\n\nรอมนุษย์จัดการ (commit/stash) แล้วเรียก zense_spec compile_spec ใหม่ได้เลย — ห้าม compile ต่อเองจนกว่ามนุษย์จะสั่ง` }], details: { preSpec: "aborted-dirty", dirty: preDirty }, isError: true };
+					}
+					if (choice.startsWith("📦")) {
+						const snap = snapshotUncommitted(ctx.cwd, composeSnapshotMessage(preDirty));
+						if (!snap.ok)
+							return { content: [{ type: "text", text: `⚠️ snapshot commit ไม่สำเร็จ: ${snap.msg}\ncommit ด้วยมือแล้วเรียก zense_spec compile_spec ใหม่` }], details: { preSpec: "snapshot-failed", dirty: preDirty }, isError: true };
+						ctx.ui.notify(`📦 snapshot ของที่ค้าง ${preDirty.length} รายการ → ${snap.msg} — compile ต่อ`, "info");
+						learn(ctx, `spec-compile: pre-spec snapshot commit ${snap.msg} (${preDirty.length} files)`);
+					} else {
+						state.trajectoryFlags.push(`spec compiled บน dirty main (${preDirty.length} uncommitted files)`);
+						learn(ctx, `flag: pre-spec dirty skip — compile โดย main มี uncommitted change ${preDirty.length} รายการ`);
+						preSpecNote = ` ⚠️ main มี uncommitted change ${preDirty.length} รายการ (มนุษย์เลือกข้าม) — baseline=HEAD ไม่ครอบของเหล่านี้`;
+					}
+				} else if (preDirty.length) {
+					// ไม่มี UI ถามไม่ได้ — compile ต่อแต่บันทึก flag + เตือนในผลลัพธ์ให้ agent แจ้งมนุษย์
+					state.trajectoryFlags.push(`spec compiled บน dirty main (${preDirty.length} uncommitted files, no UI to ask)`);
+					learn(ctx, `flag: pre-spec dirty (no UI) — compile โดย main มี uncommitted change ${preDirty.length} รายการ`);
+					preSpecNote = ` ⚠️ ถามมนุษย์ไม่ได้ (no UI): main มี uncommitted change ${preDirty.length} รายการ — baseline=HEAD ไม่ครอบของเหล่านี้; ควรให้มนุษย์ commit/stash ก่อนเริ่ม implement`;
+				}
 				const t0 = Date.now();
 				// Layer 3 (learning loop): ป้อนบทเรียนสะสมจาก memory.jsonl เข้า prompt เหมือนเดิม
 				// ให้ spec ใหม่สะท้อน incident เก่า เช่น scope เคยกว้างเกิน/เคย override บ่อย
@@ -2601,7 +2678,7 @@ export default function (pi: ExtensionAPI) {
 						? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
 						: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 					return {
-						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` + changesText(r) }],
+						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` + changesText(r) + preSpecNote }],
 						details: { version: r.version, approved: r.signed, clarifyRounds, qualityGate: gated.notes, logPath: draft.logPath },
 					};
 				}

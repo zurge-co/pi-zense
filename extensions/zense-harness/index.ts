@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type SelectItem } from "@earendil-works/pi-tui";
-import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, SettingsManager, getAgentDir, DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ----------------------------------------------------------------------------- types
 
@@ -557,6 +557,116 @@ export const subagentTimeout = (role: string, cwd?: string, fallbackCwd?: string
 	return SUBAGENT_TIMEOUT_MS[role] ?? SUBAGENT_TIMEOUT_MS.default;
 };
 
+/** ext-config (2026-09-08, v7): extension loading ของ sub-agent ต่อ role — DEFAULT = UNLOAD ทั้งหมด
+ *  (uniform bare boot ทุก role; เหตุผล user: กัน extension ที่มี gate/ค้างไปบล็อก sub-process) แล้วให้
+ *  user tick เพิ่มเข้าเองเฉพาะตัวที่ต้องการผ่าน /zense ext-config (opt-in — ตัวที่ user expect เช่น
+ *  provider @aliou/pi-synthetic จะโดน tick ไว้เอง ไม่ใช่หายเพราะเราตัดทิ้งให้).
+ *  include list persist 2 ชั้น: LOCAL <repo>/.zense/config.json (key subagentExtInclude — repo ใคร repo มัน)
+ *  + GLOBAL ~/.pi/agent/zense/config.json (seed ครั้งแรกครั้งเดียว มีแล้วไม่ overwrite)
+ *  resolution chain: local (cwd → fallbackCwd เมื่อ worktree) → global → built-in ([]) */
+export const zenseGlobalConfigDir = (): string => join(homedir(), ".pi", "agent", "zense");
+
+export interface InstalledExtension {
+	path: string;   // path ไฟล์ extension จริง (ใช้ส่ง -e และเป็น identity ของ exclusion)
+	enabled: boolean;
+	source: string; // package/ต้นทาง (แสดงใน UI ให้ user รู้ว่ามาจากไหน)
+	scope: string;  // user | project | temporary
+}
+
+/** enumerate extensions ที่ pi จะโหลดจริง — ใช้ DefaultPackageManager/SettingsManager (กลไกเดียวกันกับ
+ *  `pi config` ใน core ไม่ reimplement discovery ให้ drift); onMissing=skip (UI config ห้ามกระตุ้น install)
+ *  agentDir/globalDir inject ได้เพื่อ test ด้วย tmp dir ไม่แตะ home จริง; พัง → [] (fallback boot เปลือย) */
+export const listInstalledExtensions = async (cwd: string, agentDir = getAgentDir()): Promise<InstalledExtension[]> => {
+	try {
+		const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
+		const pm = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+		const resolved = await pm.resolve(async () => "skip");
+		return resolved.extensions.map((e) => ({ path: e.path, enabled: e.enabled, source: e.metadata.source, scope: e.metadata.scope }));
+	} catch {
+		return [];
+	}
+};
+
+const readExtIncludesFrom = (cfgPath: string, role: string): string[] | undefined => {
+	try {
+		if (!existsSync(cfgPath)) return undefined;
+		const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as { subagentExtInclude?: Record<string, unknown> };
+		const sub = cfg.subagentExtInclude;
+		if (!sub || typeof sub !== "object") return undefined;
+		const v = sub[role];
+		if (!Array.isArray(v)) return undefined;
+		return v.filter((p): p is string => typeof p === "string");
+	} catch {
+		return undefined; // config พัง → เทียบเท่าไม่มี (chain ต่อไป global/built-in ไม่ throw)
+	}
+};
+
+/** include list ของ role ตาม resolution chain: local (cwd→fallbackCwd) → global → built-in [] (boot เปลือย)
+ *  อ่านสดทุกครั้ง (ไม่ cache — save ปุ๊บ run ถัดไปเห็นทันที) */
+export const subagentExtIncludes = (role: string, cwd?: string, fallbackCwd?: string, globalDir = zenseGlobalConfigDir()): string[] => {
+	for (const dir of [cwd, fallbackCwd]) {
+		if (!dir) continue;
+		const v = readExtIncludesFrom(join(zenseDir(dir), "config.json"), role);
+		if (v !== undefined) return v;
+	}
+	return readExtIncludesFrom(join(globalDir, "config.json"), role) ?? [];
+};
+
+/** เขียน include list ของ role — LOCAL <cwd>/.zense/config.json เสมอ (คง key อื่นของ config ครบ)
+ *  + GLOBAL seed ครั้งแรกครั้งเดียว: global ยังไม่มี key ของ role → เขียนค่าเดียวกันลงไป; มีแล้วข้าม
+ *  (คำสั่ง user: "ถ้า global ยังไม่มีให้ครั้งแรก save ลง global ด้วย ถ้ามีแล้วให้ข้ามไป");
+ *  value=null = ลบ local override เท่านั้น ไม่ seed; คืน globalSeeded ให้ handler แจ้ง user */
+export const writeSubagentExtIncludes = (cwd: string, role: string, value: string[] | null, globalDir = zenseGlobalConfigDir()): { globalSeeded: boolean } => {
+	const writeInto = (cfgPath: string, mutate: (sub: Record<string, unknown>) => void): boolean => {
+		try {
+			let raw: Record<string, unknown> = {};
+			if (existsSync(cfgPath)) raw = JSON.parse(readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
+			const sub = { ...((raw.subagentExtInclude as Record<string, unknown> | undefined) ?? {}) };
+			mutate(sub);
+			if (Object.keys(sub).length) raw.subagentExtInclude = sub;
+			else delete raw.subagentExtInclude;
+			mkdirSync(dirname(cfgPath), { recursive: true });
+			writeFileSync(cfgPath, JSON.stringify(raw, null, 2));
+			return true;
+		} catch {
+			return false; // เขียนไม่ได้ → ข้ามเงียบๆ (config ไม่ควรทำ pipeline พัง)
+		}
+	};
+	writeInto(join(zenseDir(cwd), "config.json"), (sub) => {
+		if (value === null) delete sub[role];
+		else sub[role] = value;
+	});
+	let globalSeeded = false;
+	if (value !== null && readExtIncludesFrom(join(globalDir, "config.json"), role) === undefined)
+		globalSeeded = writeInto(join(globalDir, "config.json"), (sub) => {
+			sub[role] = value;
+		});
+	return { globalSeeded };
+};
+
+/** flags สุดท้ายของ role: DEFAULT (ไม่มี include) = uniform bare boot —
+ *  role ที่ base มี --no-extensions อยู่แล้ว → flags เดิมเป๊ะ; role ที่ไม่มี (requirements) → เพิ่มให้ด้วย
+ *  (กัน extension ที่มี gate/ค้างไปบล็อก sub-process). มี include list → --no-extensions + '-e <path>'
+ *  เฉพาะ path ที่ยัง installed+enabled จริง (ถูก uninstall ไปแล้วทิ้งเงียบๆ กัน boot error);
+ *  enumerate พัง → bare boot (degrade ปลอดภัยที่สุด) */
+export const subagentStripFlagsAsync = async (
+	role: string,
+	cwd?: string,
+	fallbackCwd?: string,
+	agentDir = getAgentDir(),
+	globalDir = zenseGlobalConfigDir(),
+): Promise<string[]> => {
+	const base = SUBAGENT_STRIP_FLAGS[role] ?? [];
+	const include = subagentExtIncludes(role, cwd, fallbackCwd, globalDir);
+	if (!include.length && base.includes("--no-extensions")) return base; // bare อยู่แล้ว — เดิมเป๊ะ ไม่ต้อง enumerate
+	const enumCwd = cwd ?? fallbackCwd;
+	const valid = include.length && enumCwd ? new Set((await listInstalledExtensions(enumCwd, agentDir)).filter((e) => e.enabled).map((e) => e.path)) : new Set<string>();
+	const flags = base.filter((f) => f !== "--no-extensions");
+	flags.push("--no-extensions");
+	for (const p of include) if (valid.has(p)) flags.push("-e", p);
+	return flags;
+};
+
 /** argv ของ pi sub-agent ตัวเดียวที่ runSubagent ใช้ — แยกออกมาเพื่อ test ได้ว่า flag ถูกต้อง */
 /** model ที่ sub-agent รันจริง (จาก JSONL events, รูป 'provider/id') ตรง pattern ที่ config ไว้ใน models.json ไหม —
  *  match กรณี: exact (case-insensitive) หรือ pattern = usedModel + ':<thinking-level>' (suffix ที่ pi ตัดออกตอน resolve) */
@@ -566,11 +676,13 @@ export const modelMatchesPattern = (usedModel: string, pattern: string): boolean
 	return used.length > 0 && (pat === used || pat.startsWith(`${used}:`));
 };
 
-export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[], role?: string): string[] => {
+export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[], role?: string, stripFlags?: string[]): string[] => {
 	// argv: strip flags (per-role) ก่อน --exclude-tools ก่อน --model ก่อน task; ไม่ใส่ -- นำหน้า task (คงพฤติกรรมเดิม)
 	// M: strip flags จาก SUBAGENT_STRIP_FLAGS ตาม role — เดิมโหลด skills/templates/themes/extensions ครบทุก launch
+	// ext-config: caller (runSubagent) resolve จาก subagentStripFlags() แล้วส่งมา — param นี้ชนะ built-in map
+	const flags = stripFlags ?? (role ? SUBAGENT_STRIP_FLAGS[role] : undefined);
 	const argv = ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "json", "--no-session"];
-	if (role && SUBAGENT_STRIP_FLAGS[role]?.length) argv.push(...SUBAGENT_STRIP_FLAGS[role]);
+	if (flags?.length) argv.push(...flags);
 	if (excludeTools?.length) argv.push("--exclude-tools", excludeTools.join(","));
 	if (modelPattern) argv.push("--model", modelPattern);
 	argv.push(task);
@@ -580,11 +692,11 @@ export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTo
 /** D: prompt ของ requirements sub-agent — บังคับ explore ก่อนดราฟต์ (grounding: criteria[].check
  *  ต้องเป็นคำสั่งที่มีอยู่และรันได้จริงใน repo นี้ ไม่ใช่เดา) + clarify contract (F) + output JSON เดียว
  *  (module scope + export: อยู่ข้าง parser ของมันเอง เวลาเปลี่ยน contract จะได้เห็นคู่กัน) */
-export const buildRequirementsPrompt = (intent: string, lessons: string[], facts?: string[], exemplar?: string | null): string =>
+export const buildRequirementsPrompt = (intent: string, lessons: string[], facts?: string[], exemplar?: string | null, timeoutMs = 300_000): string =>
 	`You are the REQUIREMENTS sub-agent for a spec-gated SDLC harness. Your single JSON output becomes the machine-checked contract for the main agent's implementation, so every criterion must be grounded in THIS repository's reality — never guess.
 
 ` +
-	`Step 1 — EXPLORE (read-only, mandatory before drafting): read README*, package.json / other manifests, test configs, CI configs and the relevant source layout. Actually RUN the candidate test/lint/build commands you plan to reference, so every check you write is proven to work here. You have NO write/edit tools — do not attempt to modify anything. You run under a HARD wall-clock limit — be economical: never probe toolchains or test commands one-by-one; if the harness-provided facts below already list them, trust the list and move on, otherwise batch ALL probes into ONE bash loop.
+	`Step 1 — EXPLORE (read-only, mandatory before drafting): read README*, package.json / other manifests, test configs, CI configs and the relevant source layout. Actually RUN the candidate test/lint/build commands you plan to reference, so every check you write is proven to work here. You have NO write/edit tools — do not attempt to modify anything. You run under a HARD wall-clock limit of about ${Math.max(1, Math.round(timeoutMs / 60_000))} minutes — be economical: never probe toolchains or test commands one-by-one; if the harness-provided facts below already list them, trust the list and move on, otherwise batch ALL probes into ONE bash loop. Never re-run commands the facts already answered, and never run anything likely to exceed ~30s more than once (full test suites, builds, installs): if a candidate check is slow, find a faster equivalent — and if none exists, push that verification into specDebt instead of burning your budget.
 
 ` +
 	`Step 2 — DRAFT exactly ONE JSON object:
@@ -1196,12 +1308,13 @@ function runSubagent(
 	logPath: string = subagentLogPath(cwd, role),
 	modelPattern?: string,           // pi --model pattern (เช่น "anthropic/claude-sonnet") — undefined = ปล่อย pi ใช้ default
 	excludeTools?: string[],         // C: role read-only (requirements) → ["write","edit"] (ดู SUBAGENT_EXCLUDE_TOOLS)
+	stripFlags?: string[],           // ext-config: resolved จาก subagentStripFlags(role, subCwd, ctx.cwd) — undefined = built-in map
 ): Promise<{ ok: boolean; output: string; logPath: string; usedModel?: string }> {
 	const relLog = relative(cwd, logPath);
 	return new Promise((res) => {
 		// M: ส่ง role เข้า argv builder เพื่อให้ได้ strip flags ของ role นั้น — log header echo flag จริงเพื่อ audit ได้ในภายหลัง
-		const argv = buildSubagentArgv(task, modelPattern, excludeTools, role);
-		const strip = SUBAGENT_STRIP_FLAGS[role];
+		const argv = buildSubagentArgv(task, modelPattern, excludeTools, role, stripFlags);
+		const strip = stripFlags ?? SUBAGENT_STRIP_FLAGS[role];
 		writeFileSync(logPath, `$ pi --mode json --no-session${strip?.length ? ` ${strip.join(" ")}` : ""}${excludeTools?.length ? ` --exclude-tools ${excludeTools.join(",")}` : ""}${modelPattern ? ` --model ${modelPattern}` : ""} <task ${task.length} chars>\n--- live output (${role}) ---\n`);
 		const child = spawn("env", argv, {
 			cwd,
@@ -1587,7 +1700,7 @@ export default function (pi: ExtensionAPI) {
 			// C: role ถูกล็อก read-only (SUBAGENT_EXCLUDE_TOOLS) → sub-agent ร่าง spec/อ่าน repo ได้แต่แก้โค้ดไม่ได้
 			// B: timeout ต่อ role — built-in map + ช่องของ agent: .zense/config.json (subagentTimeoutMs)
 			// ส่ง subCwd ก่อนแล้ว ctx.cwd (worktree ไม่มี .zense ของตัวเอง → config อยู่ที่ main repo)
-			const r = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role]);
+			const r = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], await subagentStripFlagsAsync(role, subCwd, ctx.cwd));
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
@@ -1848,6 +1961,52 @@ export default function (pi: ExtensionAPI) {
 				},
 			};
 		}, OVERLAY_LG);
+
+	/** ext-config: checkbox dialog เลือก extensions ที่ sub-agent จะโหลด — default all-ticked (user tick ออก)
+	 *  คืน array ของ path ที่ถูกตัดออก (exclusions) หรือ null เมื่อ cancel; ไม่ใช้ SelectList เพราะเป็น single-select */
+	const extConfigDialog = (ctx: ExtensionContext, role: string, items: { path: string; label: string; checked: boolean }[]): Promise<string[] | null> =>
+		ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
+			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
+			let cursor = 0;
+			const checked = items.map((i) => i.checked);
+			const visRows = () => Math.max(6, Math.floor(tui.terminal.rows * 0.6));
+			return {
+				render: (w: number) => {
+					const h = visRows();
+					const start = Math.max(0, Math.min(cursor - 2, Math.max(0, items.length - h)));
+					const out: string[] = [];
+					out.push(...border.render(w));
+					out.push(...new Text(theme.fg("accent", theme.bold(`🧩 sub-agent extensions — role "${role}" (default: boot เปลือย · space = เลือกโหลดเพิ่ม)`)), 1, 0).render(w));
+					out.push(...new Text(theme.fg("dim", "↑↓ เลื่อน • space toggle • a = โหลดทั้งหมด • n = ไม่โหลดเลย • enter บันทึก • esc ยกเลิก"), 1, 0).render(w));
+					for (let i = start; i < Math.min(items.length, start + h); i++) {
+						const box = checked[i] ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
+						const mark = i === cursor ? theme.fg("accent", "▸") : " ";
+						const line = ` ${mark} ${box} ${items[i].label}`;
+						out.push(i === cursor ? theme.bold(line) : line);
+					}
+					if (items.length > h) out.push(...new Text(theme.fg("dim", `— ${start + 1}-${Math.min(start + h, items.length)}/${items.length} —`), 1, 0).render(w));
+					out.push(...new Text(theme.fg("dim", `จะโหลด ${checked.filter(Boolean).length}/${items.length} extensions`), 1, 0).render(w));
+					out.push(...border.render(w));
+					return panelize(theme, out, w);
+				},
+				invalidate: () => {},
+				handleInput: (data: string) => {
+					if (matchesKey(data, Key.up)) cursor = Math.max(0, cursor - 1);
+					else if (matchesKey(data, Key.down)) cursor = Math.min(items.length - 1, cursor + 1);
+					else if (data === " ") checked[cursor] = !checked[cursor];
+					else if (data === "a") checked.fill(true);
+					else if (data === "n") checked.fill(false);
+					else if (matchesKey(data, Key.enter)) {
+						done(items.filter((_, i) => !checked[i]).map((it) => it.path));
+						return;
+					} else if (matchesKey(data, Key.escape)) {
+						done(null);
+						return;
+					}
+					tui.requestRender();
+				},
+			};
+		}, OVERLAY_MD);
 
 	// ----- picker กลางของ zense: title + search filter + SelectList (ใช้ซ้ำได้ทั้งเลือก role/model)
 
@@ -2215,7 +2374,7 @@ export default function (pi: ExtensionAPI) {
 				// ลูปเดียวจัดการทั้ง clarify (F) และ parse-retry (A) — budget รวม 7 launches กันลูปพัง (4 clarify + retry + draft สุดท้ายพอดี)
 				while (launches < 7) {
 					launches++;
-					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons, facts, exemplar));
+					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons, facts, exemplar, subagentTimeout("requirements", state.worktree?.root ?? ctx.cwd, ctx.cwd)));
 					if (!draft.ok) return { content: [{ type: "text", text: `sub-agent failed: ${draft.output}` }], details: draft };
 					const parsed = parseSpecDraft(draft.output);
 					if (parsed.kind === "clarify" && !clarifyClosed && clarifyRounds < 4 && ctx.hasUI) {
@@ -2583,9 +2742,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("zense", {
-		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory | models",
+		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory | models | ext-config",
 		getArgumentCompletions: (prefix) =>
-			["status", "approve", "agents", "gate", "memory", "models"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
+			["status", "approve", "agents", "gate", "memory", "models", "ext-config"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			if (sub === "status") {
@@ -2684,8 +2843,74 @@ export default function (pi: ExtensionAPI) {
 				}
 				writeModelsConfig(ctx.cwd, role, pattern);
 				ctx.ui.notify(`✅ ${role}: ${pattern} — เขียน ${relative(ctx.cwd, cfgPath)} แล้ว (มีผล sub-agent run ถัดไปทันที)`, "info");
+			} else if (sub === "ext-config") {
+				// ext-config: เลือก extensions ที่ sub-agent จะโหลด ต่อ role — DEFAULT boot เปลือย (unload ทั้งหมด
+				// กัน extension ที่มี gate/ค้างไปบล็อก sub-process) แล้วให้ user tick โหลดเพิ่มเฉพาะที่ต้องการ
+				// persist LOCAL .zense/config.json (key subagentExtInclude) + seed GLOBAL ~/.pi/agent/zense/config.json ครั้งแรกครั้งเดียว
+				const roles = ["requirements", "grader", "reviewer"];
+				const [role, action, ...vals] = rest;
+				if (!role || !roles.includes(role)) {
+					ctx.ui.notify(
+						[
+							"🧩 sub-agent extension loading (ต่อ role) — default: boot เปลือย ไม่โหลด extension เลย · tick เพิ่มเฉพาะที่ต้องการ (opt-in)",
+							...roles.map((r) => {
+								const inc = subagentExtIncludes(r, ctx.cwd);
+								return `  ${r}: ${inc.length ? `โหลด ${inc.length} ตัว` : "boot เปลือย (ไม่โหลด extension)"}`;
+							}),
+							`persist: local ${join(zenseDir(ctx.cwd), "config.json")} · global ${join(zenseGlobalConfigDir(), "config.json")} (seed ครั้งแรก + fallback)`,
+							"ตั้งค่า: /zense ext-config <role> (TUI = checkbox) · text: /zense ext-config <role> all | none | on|off <เลขลำดับ|path>",
+						].join("\n"),
+						"info",
+					);
+					return;
+				}
+				const exts = (await listInstalledExtensions(ctx.cwd)).filter((e) => e.enabled);
+				const cur = new Set(subagentExtIncludes(role, ctx.cwd));
+				const apply = (includes: string[]) => {
+					const { globalSeeded } = writeSubagentExtIncludes(ctx.cwd, role, includes);
+					ctx.ui.notify(
+						`✅ ${role}: จะโหลด ${includes.length}/${exts.length} extensions${includes.length ? "" : " (boot เปลือย)"} — save ลง local .zense/config.json แล้ว${globalSeeded ? " (+ seed global ~/.pi/agent/zense/config.json ครั้งแรก)" : ""} · มีผล sub-agent run ถัดไปทันที`,
+						"info",
+					);
+				};
+				if (ctx.mode === "tui" && !action) {
+					const includes = await extConfigDialog(
+						ctx,
+						role,
+						exts.map((e) => ({ path: e.path, label: `${basename(e.path)} · ${e.source}`, checked: cur.has(e.path) })),
+					);
+					if (includes === null) return ctx.ui.notify("ยกเลิก — config เดิมไม่เปลี่ยน", "info");
+					apply(includes);
+					return;
+				}
+				// text actions (non-TUI หรือระบุ action ชัดเจน) — on/off รับเลขลำดับ (1-based จาก list ด้านล่าง) หรือ substring ของ path
+				if (action === "all") apply(exts.map((e) => e.path));
+				else if (action === "none" || action === "default") apply([]);
+				else if (action === "on" || action === "off") {
+					const target = vals.join(" ").trim();
+					if (!target) return ctx.ui.notify(`ขาดเป้าหมาย — /zense ext-config ${role} ${action} <เลขลำดับ|path>`, "warning");
+					const asNum = Number(target);
+					const hit =
+						Number.isInteger(asNum) && asNum >= 1 && asNum <= exts.length ? exts[asNum - 1].path : exts.find((e) => e.path.includes(target))?.path;
+					if (!hit) return ctx.ui.notify(`หา extension "${target}" ไม่เจอ — ดู list ด้วย /zense ext-config ${role} (ไม่ใส่ action)`, "warning");
+					const next = new Set(cur);
+					if (action === "on") next.add(hit);
+					else next.delete(hit);
+					apply([...next]);
+				} else if (!action) {
+					ctx.ui.notify(
+						[
+							`extensions ที่ install ไว้ (enabled) — ${role} โหลด ${cur.size}/${exts.length}:`,
+							...exts.map((e, i) => `  ${i + 1}. ${cur.has(e.path) ? "[x]" : "[ ]"} ${e.path}`),
+							`toggle: /zense ext-config ${role} on|off <เลขลำดับ|path> · all = โหลดทั้งหมด · none = ไม่โหลดเลย (default)`,
+						].join("\n"),
+						"info",
+					);
+				} else {
+					return ctx.ui.notify(`action ไม่รู้จัก: "${action}" — ไม่ใส่ action (TUI=checkbox / non-TUI=list) | all | none | on|off <เลขลำดับ|path>`, "warning");
+				}
 			} else {
-				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models", "info");
+				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models|ext-config", "info");
 			}
 		},
 	});

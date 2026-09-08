@@ -508,3 +508,22 @@ test("COMMENT_DISCIPLINE_GUIDELINE: ครอบประเด็นบัง�
 	const lines = COMMENT_DISCIPLINE_GUIDELINE.split("\n");
 	assert.ok(lines.length <= 10, `guideline ต้องสั้น ~8 บรรทัด (ได้ ${lines.length})`);
 });
+
+// TDZ guard (2026-09-08): zense_eval inconclusive branch เคย crash "Cannot access 'probeSection'
+// before initialization" เพราะประกาศไว้หลัง branch — bug รอดเพราะไม่มี test ครอบ error path นี้เลย
+test("TDZ guard: probeSection ประกาศครั้งเดียวและอยู่ก่อน inconclusive branch เสมอ", async () => {
+	const { readFileSync } = await import("node:fs");
+	const { join, dirname } = await import("node:path");
+	const { fileURLToPath } = await import("node:url");
+	const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "zense-harness", "index.ts"), "utf8");
+	const decl = [...src.matchAll(/const probeSection = buildCompactProbeSection\(probes\)/g)];
+	assert.equal(decl.length, 1, "probeSection ต้องประกาศครั้งเดียว");
+	const branch = src.indexOf("if (!grade.ok || !parsed || !parsed.overall)");
+	assert.ok(branch > 0, "หา inconclusive branch ไม่เจอ (rename?)");
+	assert.ok(decl[0].index < branch, "probeSection ต้องประกาศก่อน inconclusive branch (TDZ regression)");
+	// evalView ก็เคยโดนด้วย (inconclusive ใช้ evalView.logPath ก่อนประกาศ) — ห้ามใช้ก่อน const evalView
+	const lines = src.split("\n");
+	const evalViewDecl = lines.findIndex((l) => l.includes("const evalView"));
+	const prematureUse = lines.findIndex((l, i) => l.includes("evalView.logPath") && i < evalViewDecl);
+	assert.equal(prematureUse, -1, "evalView.logPath ถูกใช้ก่อนประกาศ (TDZ regression)");
+});

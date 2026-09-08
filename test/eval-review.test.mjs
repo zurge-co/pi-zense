@@ -22,6 +22,7 @@ import {
 	SUBAGENT_STRIP_FLAGS,
 	buildCompactProbeSection,
 	buildEvalResultText,
+	buildPendingApplyEvidencePrefix,
 	buildReviewResultText,
 	COMMENT_DISCIPLINE_GUIDELINE,
 } from "../extensions/zense-harness/index.ts";
@@ -292,6 +293,49 @@ test("gitChangeSummary: baseline scopes log+diff to baseline..HEAD", () => {
 		} finally {
 			rmSync(nonGit, { recursive: true, force: true });
 		}
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("buildPendingApplyEvidencePrefix: reviewer ไม่อาจเข้าใจผิดว่า main ถูก commit แล้ว — label staged-uncommitted ชัดเมื่อมี pendingApply", () => {
+	// มี pendingApply (apply-back แล้ว รอมนุษย์ commit): ต้องบอกชัดว่า changes เป็น staged-but-uncommitted by design
+	const p = buildPendingApplyEvidencePrefix(true, false);
+	assert.match(p, /staged, uncommitted/);
+	assert.match(p, /a human commits after this review/);
+	assert.match(p, /no new commits since baseline.+expected/);
+	// มนุษย์แก้ไฟล์ระหว่าง review → note เพิ่ม แต่ review ดำเนินต่อ (ไม่ถือ stale)
+	const h = buildPendingApplyEvidencePrefix(true, true);
+	assert.match(h, /edited AFTER eval\+apply/);
+	assert.match(h, /review as normal/);
+	// ไม่มี pendingApply (flow เดิม/ก่อน eval) → ไม่มี label ปน
+	assert.equal(buildPendingApplyEvidencePrefix(false, false), "");
+	// ต่อเข้า buildReviewerPrompt เป็น gitSummary แล้ว label ต้องรอดเข้า prompt จริง
+	const prompt = buildReviewerPrompt("i", undefined, [], [], [], buildPendingApplyEvidencePrefix(true, false) + "\n" + "diffstat vs baseline:\n src.ts | 2 ++", "", {
+		specVersion: 1,
+		head: "tree-x",
+	});
+	assert.match(prompt, /staged, uncommitted/);
+	assert.match(prompt, /src\.ts \| 2/); // diffstat ของ staged changes ยังมากับ evidence
+});
+
+test("gitChangeSummary: change ที่ staged แต่ยังไม่ commit (pendingApply) ยังโผล่ใน diffstat/porcelain — reviewer เห็น evidence ครบ", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "zense-staged-"));
+	try {
+		const git = (args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		git(["init", "-q"]);
+		git(["config", "user.email", "t@t"]);
+		git(["config", "user.name", "t"]);
+		writeFileSync(join(cwd, "base.txt"), "base\n");
+		git(["add", "-A"]);
+		git(["commit", "-q", "-m", "baseline commit"]);
+		const baseline = git(["rev-parse", "HEAD"]).trim();
+		// จำลองสถานะหลัง apply-back: ไฟล์ใหม่ staged แต่ HEAD ไม่ขยับ (ยังไม่มี commit)
+		writeFileSync(join(cwd, "applied.txt"), "staged only\n");
+		git(["add", "applied.txt"]);
+		const s = gitChangeSummary(cwd, baseline);
+		assert.match(s, /applied\.txt/); // ทั้ง porcelain และ diffstat ต้องเห็น staged change
+		assert.doesNotMatch(s, /commits since baseline/); // ไม่มี commit ใหม่หลัง baseline (apply-back ไม่ commit — by design)
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
 	}

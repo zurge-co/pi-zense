@@ -24,7 +24,7 @@
  *   P6 Maintenance  : memory.jsonl learning log; incidents feed new criteria
  */
 import { execFileSync, execSync, spawn } from "node:child_process";
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
@@ -65,6 +65,7 @@ interface State {
 	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
 	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
 	worktreeLeaveNotified?: boolean; // dedupe notify “unmerged worktree” 1 ครั้ง/การสร้าง
+	pendingApply?: PendingApply;    // change ที่ apply เข้า main แบบ staged หลัง eval PASS รอมนุษย์ commit (ADR-003)
 }
 interface SubagentRun {
 	role: string;
@@ -77,12 +78,22 @@ interface SubagentRun {
 	status?: "running" | "done" | "failed";
 }
 /** Active per-session worktree: redirect ทุก tool call ของ main agent เข้าไปทำงานในนี้
- *  (ผ่านการ mutate event.input) จนกว่า eval PASS จะ merge กลับเข้า main; กัน 2 session เขียนทับกัน */
+ *  (ผ่านการ mutate event.input) จนกว่า eval PASS จะ apply เข้า main แบบ staged (ไม่ commit — ADR-003);
+ *  กัน 2 session เขียนทับกัน */
 interface Worktree {
 	root: string;               // absolute path ของ worktree (nested ใต้ <repo>/.zense/worktree/)
 	branch: string;             // zense/impl/v<N>-<stamp>
 	dir: string;                // === root (เก็บซ้ำเพื่อ semantic clarity ตอน worktree remove)
 	baseline?: string;          // HEAD ของ main ก่อนสร้าง branch — กลายเป็น git-evidence baseline ของรอบนี้
+}
+/** change ที่ applyWorktreeBack stage ไว้ใน main (ยังไม่ commit) — persist ข้าม session
+ *  + reconcile ตอน session start (ยังอยู่ใน index / ถูก commit / ถูก discard นอก flow) */
+interface PendingApply {
+	specVersion: number;
+	branch: string;             // branch ที่ apply มา (traceability — ถูกลบแล้วหลัง apply)
+	paths: string[];            // repo-relative paths ที่ถูก stage ตอน apply (undo hint + สรุปใน status)
+	appliedAt: number;
+	preApplyHead?: string;      // HEAD ของ main ก่อน apply (squash ไม่ขยับ HEAD — ใช้เทียบตอน reconcile ว่ามีคน commit แล้วหรือยัง)
 }
 
 const zenseDir = (cwd: string) => join(cwd, ".zense");
@@ -259,13 +270,39 @@ export const composeCommitMessage = (spec: Spec, interimSubjects: string[]): str
 	return `${subject}\n\n${body.join("\n\n")}\n`;
 };
 
-/** merge worktree branch กลับเข้า main — squash ทุก commit ใน branch (นับจาก branch point) เป็น
- *  commit เดียวด้วย message จาก spec ก่อนเสมอ (interim commits ของ agent ไม่ควรลากเข้า main เป็นกอง),
- *  แล้ว merge แบบ --ff-only ก่อน (main ไม่ขยับ → history สะอาด ได้ commit squashed ตัวเดียว),
- *  main ขยับไปแล้ว → fallback --no-ff พร้อม message จาก spec เหมือนกัน.
- *  conflict (เช่นอีก session merge ชน) → ไม่ force, คืน {ok:false,conflict:true} ให้ caller escalate.
- *  success → cleanup worktree + branch ด้วย */
-export const mergeWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): { ok: boolean; conflict?: boolean; msg: string } => {
+// ----- pending apply (ADR-003: eval PASS → apply เข้า main แบบ staged, ไม่ commit — มนุษย์ commit หลัง review)
+
+const PENDING_PATCH = "pending-apply.patch"; // reverse patch ของ change ที่ apply ไว้ — ใช้โดย discardPendingApply
+const PENDING_MSG = "pending-apply.msg";     // commit message สำเร็จรูป (จาก squashed commit) — มนุษย์ commit -F ได้เลย
+const NOT_ZENSE = ":!.zense";                // pathspec: ทุกอย่างยกเว้น .zense (harness state ไม่เข้า apply/undo เด็ดขาด)
+
+export interface ApplyBackResult {
+	ok: boolean;
+	conflict?: boolean;   // merge --squash ชน — main ถูกย้อนสภาพเดิมแล้ว, เก็บ worktree ไว้ให้มนุษย์ resolve
+	dirtyMain?: boolean;  // guard: main มี uncommitted change นอก .zense อยู่ก่อน → refuse ก่อนแตะ branch (เก็บ worktree)
+	msg: string;
+	paths: string[];      // repo-relative paths ที่ถูก stage ใน main (ว่าง = ไม่มี source change เลย)
+	commitMsg?: string;   // message ของ squashed commit ใน branch — เสนอเป็นคำสั่ง commit สำเร็จรูปให้มนุษย์
+}
+
+/** apply worktree branch เข้า main แบบ **staged-only** (ไม่ commit — ADR-003: มนุษย์ review ใน main แล้ว
+ *  commit ชั้นสุดท้ายเอง หรือสั่ง agent):
+ *  0) guard: main สกปรกนอก .zense → refuse (ของปนกัน = undo ลำบาก) — ยังไม่แตะ branch (retry ได้เสมอ)
+ *  1) squash interim commits ใน branch เป็น commit เดียว (logic เดิมของ merge-back; .zense ไม่ตาม)
+ *  2) git merge --squash — stage ทุก change เข้า index แต่ห้ามสร้าง commit/merge state
+ *  3) เก็บ reverse patch (git diff --cached) ไว้ .zense/pending-apply.patch ให้ discardPendingApply ย้อนคืนเป๊ะ
+ *  conflict → ย้อน non-.zense กลับ HEAD เอง (--squash ไม่เขียน MERGE_HEAD → merge --abort ใช้ไม่ได้)
+ *  แล้วคืน conflict=true เก็บ worktree. success → cleanup worktree + branch */
+export const applyWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): ApplyBackResult => {
+	// 0. guard: main ต้องสะอาด (ยกเว้น .zense) — มีของค้าง → refuse ก่อนแตะ branch
+	const dirty = gitOk(["status", "--porcelain", "--", ".", NOT_ZENSE], cwd);
+	if (dirty.ok && dirty.out.trim())
+		return {
+			ok: false,
+			dirtyMain: true,
+			paths: [],
+			msg: `main มี uncommitted change นอก .zense/ ค้างอยู่ → ไม่ apply (ของปนกัน undo จะลำบาก): commit/stash ของเดิมก่อน แล้ว eval ใหม่\n${dirty.out.trim().split("\n").slice(0, 10).join("\n")}`,
+		};
 	// 1. squash: หา branch point แล้วรวม interim commits เป็น commit เดียว (ยกเว้น .zense ตาม policy)
 	const mb = gitOk(["merge-base", wt.branch, "HEAD"], cwd);
 	const base = mb.ok ? mb.out.trim() : "";
@@ -273,7 +310,7 @@ export const mergeWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): { ok: 
 	// stage changes ใน worktree (ยกเว้น .zense) — รวม untracked files ด้วย (git diff --quiet HEAD ไม่เห็น untracked)
 	gitOk(["add", "-A", "--", ".", ":!.zense"], wt.root);
 	if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
-		gitOk(["commit", "-m", "(interim — squashed at merge-back)", "--no-verify"], wt.root);
+		gitOk(["commit", "-m", "(interim — squashed at apply-back)", "--no-verify"], wt.root);
 	}
 	const ahead = base ? Number(gitOk(["rev-list", "--count", `${base}..HEAD`], wt.root).out.trim() || "0") : 0;
 	if (base && ahead > 0) {
@@ -282,25 +319,53 @@ export const mergeWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): { ok: 
 		if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
 			gitOk(["commit", "-m", composeCommitMessage(spec, interimSubjects), "--no-verify"], wt.root);
 		} else {
-			// ไม่เหลือ source diff เลย (interim commits แตะเฉพาะ .zense) → รีเซ็ต branch กลับ base กัน commit ว่างหลุดเข้า main
+			// ไม่เหลือ source diff เลย (interim commits แตะเฉพาะ .zense) → รีเซ็ต branch กลับ base กัน squash commit ว่าง
 			gitOk(["reset", "--hard", base], wt.root);
 		}
 	} else if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
 		// หา branch point ไม่ได้ → squash ไม่ได้ แต่ยัง commit สิ่งที่ staged ด้วย message จาก spec
 		gitOk(["commit", "-m", composeCommitMessage(spec, []), "--no-verify"], wt.root);
 	}
-	// 2. merge เข้า main (main อาจมี uncommitted .zense/ — disjoint กับ source changes → git อนุญาต)
-	const subject = sanitizeSubject(spec.title || `zense impl v${spec.version}`);
-	if (!gitOk(["merge", "--ff-only", wt.branch], cwd).ok) {
-		if (!gitOk(["merge", "--no-ff", wt.branch, "-m", `${subject}\n\nzense: merge worktree ${wt.branch} (spec v${spec.version}, eval PASS)`], cwd).ok) {
-			gitOk(["merge", "--abort"], cwd);
-			return { ok: false, conflict: true, msg: `merge conflict — แก้ด้วยมือ: cd ${wt.root} แล้ว resolve/commit ใน branch ${wt.branch}; จากนั้น git merge ${wt.branch}` };
-		}
+	// เก็บ message ของ squashed commit ไว้ (ก่อน branch โดนลบ) — มนุษย์ commit ต่อด้วย message เดิมได้
+	const branchMsg = gitOk(["log", "-1", "--format=%B", wt.branch], cwd);
+	const commitMsg = branchMsg.ok && branchMsg.out.trim() ? branchMsg.out.trim() + "\n" : composeCommitMessage(spec, interimSubjects);
+	// 2. apply เข้า main แบบ staged-only — ห้าม finalize merge commit
+	if (!gitOk(["merge", "--squash", wt.branch], cwd).ok) {
+		// --squash ไม่เขียน MERGE_HEAD → merge --abort ใช้ไม่ได้: ย้อนเองเฉพาะ non-.zense
+		// (guard ข้อ 0 รับประกันว่าก่อน merge ไม่มี uncommitted/untracked change นอก .zense → ย้อนได้ไม่ลบของใคร)
+		gitOk(["reset", "-q", "HEAD", "--", ".", NOT_ZENSE], cwd);
+		gitOk(["restore", "--staged", "--worktree", "--source=HEAD", "--", ".", NOT_ZENSE], cwd);
+		gitOk(["clean", "-fd", "--", ".", NOT_ZENSE], cwd);
+		return { ok: false, conflict: true, paths: [], msg: `apply conflict — main ถูกย้อนกลับสภาพเดิมแล้ว; แก้ด้วยมือ: cd ${wt.root} แล้ว resolve/commit ใน branch ${wt.branch}; จากนั้น git merge --squash ${wt.branch} ใน main` };
 	}
-	// 3. cleanup worktree + branch
+	// 3. staged paths + reverse patch สำหรับ discard (patch ว่างได้ — เคส interim แตะเฉพาะ .zense)
+	const paths = gitOk(["diff", "--cached", "--name-only", "--", ".", NOT_ZENSE], cwd).out.split("\n").map((s) => s.trim()).filter(Boolean);
+	const patch = gitOk(["diff", "--cached", "--binary", "--", ".", NOT_ZENSE], cwd);
+	mkdirSync(zenseDir(cwd), { recursive: true });
+	writeFileSync(join(zenseDir(cwd), PENDING_PATCH), patch.ok ? patch.out : "");
+	// 4. cleanup worktree + branch (change ครบใน index ของ main แล้ว)
 	gitOk(["worktree", "remove", wt.dir, "--force"], cwd);
 	gitOk(["branch", "-D", wt.branch], cwd);
-	return { ok: true, msg: `merged ${wt.branch} → main (squashed, message จาก spec v${spec.version})` };
+	return { ok: true, paths, commitMsg, msg: `applied ${wt.branch} → main (staged, uncommitted — spec v${spec.version}; มนุษย์ commit หลัง review)` };
+};
+
+/** undo ของ applyWorktreeBack: unstage ทั้งหมด แล้ว reverse-apply patch ที่เก็บไว้
+ *  → main กลับสภาพก่อน apply เป๊ะ (reverse แตะเฉพาะไฟล์ใน patch — ของมนุษย์ที่ไม่เกี่ยวไม่โดน;
+ *  ไฟล์ใหม่ที่ apply สร้างถูกลบโดย reverse patch). reverse ไม่ลง = มนุษย์แก้ไฟล์ชน patch ค้างไว้
+ *  → fail ชัดๆ ไม่ลบของมนุษย์เงียบๆ (caller escalate ให้มนุษย์จัดการเอง). success → ลบ patch/msg ทิ้ง */
+export const discardPendingApply = (cwd: string): { ok: boolean; msg: string } => {
+	const patchPath = join(zenseDir(cwd), PENDING_PATCH);
+	if (!existsSync(patchPath))
+		return { ok: false, msg: `ไม่พบ ${patchPath} — undo อัตโนมัติไม่ได้; ย้อนด้วยมือ: git restore --staged --worktree -- <paths>` };
+	gitOk(["reset", "-q", "HEAD", "--", "."], cwd); // unstage ทุกอย่างก่อน — reverse patch กระทบ working tree เท่านั้น
+	if (readFileSync(patchPath, "utf8").trim()) {
+		const rr = gitOk(["apply", "-R", "--whitespace=nowarn", patchPath], cwd);
+		if (!rr.ok)
+			return { ok: false, msg: `reverse-apply patch ไม่ผ่าน (มีการแก้ไฟล์ที่ apply ไว้หลังจากนั้น?): ${rr.err}\nห้ามลบของมนุษย์เงียบๆ — ตรวจเองด้วย git status / git diff` };
+	}
+	rmSync(patchPath, { force: true });
+	rmSync(join(zenseDir(cwd), PENDING_MSG), { force: true });
+	return { ok: true, msg: "discarded — main กลับสภาพเหมือนก่อน apply (reverse patch สำเร็จ)" };
 };
 
 const freshState = (): State => ({
@@ -1186,7 +1251,8 @@ export const findUngroundedTokens = (packet: string, evidence: string, pathExist
 };
 
 /** eval evidence นี้เป็นของรอบปัจจุบันหรือไม่ — stale เมื่อ spec version เปลี่ยน หรือ tree ที่ eval ไม่ตรง tree ที่กำลัง review
- *  (ใช้ tree SHA ไม่ใช่ commit SHA โดยตั้งใจ: merge-back --no-ff หลัง eval PASS ให้ tree เดิมเป๊ะ → ไม่ทำให้รอบปกติ stale ปลอม)
+ *  (ใช้ tree SHA ไม่ใช่ commit SHA โดยตั้งใจ: หลัง eval PASS harness repin เป็น tree ที่ reviewer จะเห็นจริง
+ *   — ตอน apply-back = tree ของ index (write-tree) — ทำให้รอบปกติไม่ stale ปลอม)
  *  current ไม่ส่งมา (legacy callsite) → ไม่เช็ค เพื่อ backward compat */
 export const isLastEvalStale = (
 	lastEval: { specVersion?: number; head?: string } | undefined,
@@ -1244,6 +1310,18 @@ export const buildReviewerPrompt = (
 	`Do NOT dump raw diffs; summarize. No commentary outside the sections.` +
 	(feedback ? `\n\nSYSTEM FEEDBACK: your previous packet was rejected: ${feedback}. Output the full corrected packet with all headers.` : "");
 };
+
+/** คำนำหน้า git evidence ของ reviewer หลัง apply-back (ADR-003): บอกชัดว่า changes เป็น
+ *  staged-but-uncommitted ภายใต้ pendingApply รอมนุษย์ commit (กัน reviewer เข้าใจผิดว่า main ถูก commit แล้ว
+ *  — "no new commits since baseline" เป็นเรื่องปกติของ flow นี้) + note กรณีมนุษย์แก้ไฟล์หลัง eval+apply
+ *  (index tree ≠ pinned tree). pure builder → unit-test ได้ใน test/eval-review.test.mjs */
+export const buildPendingApplyEvidencePrefix = (pendingApply: boolean, humanEdited: boolean): string =>
+	(pendingApply
+		? 'NOTE: the git evidence below shows staged, uncommitted changes in the main working tree (by design — a human commits after this review; "no new commits since baseline" is expected).\n'
+		: "") +
+	(humanEdited
+		? "NOTE: files were edited AFTER eval+apply (index tree differs from the pinned tree — a human is editing during review); review as normal but surface this in the packet.\n"
+		: "");
 
 // ----------------------------------------------------------------------------- sub-agent runner
 
@@ -1616,7 +1694,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ----- git worktree helpers (per-session isolation: redirect ทุก tool call ของ main
 	//       agent เข้า worktree จนกว่า eval PASS จะ merge กลับ — กัน 2 session เขียนทับกัน)
-	// (git helpers gitOk/createWorktree/mergeWorktreeBack อยู่ที่ module scope เพื่อ export ให้ test ได้)
+	// (git helpers gitOk/createWorktree/applyWorktreeBack/discardPendingApply อยู่ที่ module scope เพื่อ export ให้ test ได้)
 
 	/** fullscreen default ให้คนติดตั้ง pi-zense โดยไม่ต้อง setup เอง: ตั้งครั้งเดียวต่อ file-ตอน key ยังว่าง
 	 *  interactive TUI เท่านั้น (sub-agent bail ตั้งแต่ต้น factory ด้วย PI_ZENSE_SUBAGENT แล้ว) — best-effort,
@@ -1646,6 +1724,23 @@ export default function (pi: ExtensionAPI) {
 			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
 		lastWidget = undefined; // pi ล้าง widget ตอน session switch/reload → ต้องส่งใหม่แม้ข้อความเดิม
+		// reconcile pendingApply ข้าม session/restart: change ที่ apply ค้างไว้ยัง staged อยู่ใน main ไหม
+		if (state.pendingApply) {
+			const pa = state.pendingApply;
+			if (gitOk(["diff", "--cached", "--quiet"], ctx.cwd).ok) {
+				// index ว่างแล้ว → มนุษย์ commit เองหรือทิ้งเองนอก flow → ล้าง pointer เงียบๆ + เก็บกวาดไฟล์ช่วยค้าง
+				learn(ctx, `pendingApply reconcile: spec v${pa.specVersion} — index ว่างแล้ว (commit/discard นอก flow)`);
+				state.pendingApply = undefined;
+				rmSync(join(zenseDir(ctx.cwd), PENDING_PATCH), { force: true });
+				rmSync(join(zenseDir(ctx.cwd), PENDING_MSG), { force: true });
+				persist();
+			} else {
+				ctx.ui.notify(
+					`⏳ zense: มี change จาก spec v${pa.specVersion} (${pa.paths.length} ไฟล์) ค้าง staged ใน main รอ commit — review แล้ว git commit -F .zense/pending-apply.msg (ไม่พอใจ → zense_discard หรือ /zense discard)`,
+					"warning",
+				);
+			}
+		}
 		updateWidget(ctx);
 	});
 
@@ -1669,6 +1764,7 @@ export default function (pi: ExtensionAPI) {
 			` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
 			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+_ ดูสด)` : "") +
 			(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
+			(state.pendingApply ? ` · ⏳staged v${state.pendingApply.specVersion}` : "") +
 			(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 			(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : "");
 		if (line === lastWidget) return; // เนื้อหาเดิม → ไม่ rebuild component (กัน dock relayout)
@@ -1680,7 +1776,7 @@ export default function (pi: ExtensionAPI) {
 	 *  ทำงานใน worktree โดยไม่รู้ตัว. sub-agent เป็นคนละ process จึงไม่ถูกตัวนี้ (และใช้ cwd ของมันเอง). */
 	const applyRedirect = (ev: any, ctx: ExtensionContext) => {
 		let wt = state.worktree;
-		// self-heal: worktree ถูก merge/ลบนอก flow (เช่น mergeWorktreeBack ถูกเรียกด้วยมือหลัง auto-merge พลาด)
+		// self-heal: worktree ถูก apply/ลบนอก flow (เช่น applyWorktreeBack ถูกเรียกด้วยมือหลัง auto-apply พลาด)
 		// → pointer ค้างใน session state ทำทุก bash โดนต่อ "cd <wtRoot>" ที่ไม่มีแล้ว — ถ้า dir หายไปให้ล้างเงียบๆ
 		if (wt && !existsSync(wt.root)) {
 			learn(ctx, "worktree self-heal: " + wt.root + " ไม่มีแล้ว (merge นอก flow?) — ล้าง pointer ที่ค้าง");
@@ -1851,7 +1947,7 @@ export default function (pi: ExtensionAPI) {
 		// worktree ยัง active ตอน agent run จบ (eval ยังไม่ PASS) → แจ้ง 1 ครั้ง/การสร้าง (dedupe) ให้มนุษย์รู้ว่ามี worktree ค้างอยู่
 		if (state.worktree && !state.worktreeLeaveNotified) {
 			state.worktreeLeaveNotified = true;
-			ctx.ui.notify(`🌳 worktree ค้างอยู่ (ยังไม่ merge): ${state.worktree.dir}\nbranch ${state.worktree.branch} — จะ merge อัตโนมัติเมื่อ eval PASS (หรือ merge ด้วยมือ: git merge ${state.worktree.branch})`, "info");
+			ctx.ui.notify(`🌳 worktree ค้างอยู่ (ยังไม่ apply เข้า main): ${state.worktree.dir}\nbranch ${state.worktree.branch} — จะ apply แบบ staged (ไม่ commit) อัตโนมัติเมื่อ eval PASS`, "info");
 			persist();
 		}
 		persist();
@@ -2241,6 +2337,9 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`🌳 worktree สร้างไม่ได้ — ทำงานใน main ตามปกติ (ไม่มี isolation ระหว่าง session)`, "warning");
 			}
 		}
+		// guard: ยังมี change ของ spec ก่อนค้าง staged รอ commit → เตือนล่วงหน้า (apply ครั้งถัดไปจะเจอ dirty-main guard อยู่ดี)
+		if (state.pendingApply)
+			ctx.ui.notify(`⚠ spec v${state.pendingApply.specVersion} ยังค้าง staged รอ commit อยู่ใน main — ควร commit หรือ discard ก่อนเริ่มงานใหม่ (ไม่เช่นนั้น apply ของ spec v${state.spec.version} จะถูก guard ปฏิเสธ)`, "warning");
 		learn(ctx, `signed spec v${state.spec.version}`);
 		persist();
 		updateWidget(ctx);
@@ -2585,7 +2684,7 @@ export default function (pi: ExtensionAPI) {
 			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} judged=${Object.keys(parsed.perCriteria).length}/${state.spec.criteria.length} failed=[${failedCriteria.join(",")}]${probeOverrides.length ? ` probeOverrides=[${probeOverrides.join(",")}]` : ""}`);
 			// W2: เก็บ evidence ไว้เป็น input ของ reviewer (zense_review สร้าง evidence pack จาก lastEval)
 			// ผูก evidence กับรอบปัจจุบัน: specVersion + tree SHA ของ tree ที่ eval (HEAD^{tree} — ตั้งใจใช้ tree ไม่ใช่ commit SHA
-		// เพราะ merge-back --no-ff ให้ tree เดิมเป๊ะ ไม่ควรทำให้รอบปกติกลายเป็น stale; reviewer จะเช็คซ้ำตอน review)
+		// เพราะ apply-back หลัง PASS ให้ content เดิมเป๊ะ (repin เป็น tree ของ index ด้วย write-tree) ไม่ควรทำให้รอบปกติกลายเป็น stale; reviewer จะเช็คซ้ำตอน review)
 		const evalTree = gitOk(["rev-parse", "HEAD^{tree}"], evalRoot);
 		state.lastEval = {
 			verdict, perCriteria: parsed.perCriteria, failedIds: failedCriteria, probes, at: Date.now(),
@@ -2644,19 +2743,41 @@ export default function (pi: ExtensionAPI) {
 			state.escalations = state.escalations.filter((e) => e.kind !== "need-fix");
 			// M: PASS ก็ผ่าน builder เดียวกัน (verdict เป็นตัวเลือก branch ของข้อความ); directives "เรียก zense_review ทันที" คงไว้ใน builder
 			const report = buildEvalResultText(evalView);
-			// auto merge-back: เมื่อ eval PASS งาน verified สมบูรณ์ → merge worktree กลับเข้า main (auto-commit + git merge --no-ff)
+			// auto apply-back (ADR-003): เมื่อ eval PASS → apply change จาก worktree เข้า main แบบ **staged-only
+			// ไม่ auto-commit** — มนุษย์ review diff ใน main ก่อน แล้ว commit ชั้นสุดท้ายเอง (หรือสั่ง agent commit)
 			if (state.worktree) {
-				const mr = mergeWorktreeBack(ctx.cwd, state.spec, state.worktree);
-				if (!mr.ok) {
-					escalate("need-decision", `worktree merge: ${mr.msg}`, ctx);
-					ctx.ui.notify(`⚠ ${mr.msg}`, "warning"); // เก็บ worktree ไว้ — reviewer ยังอ่าน worktree ได้
+				const wtBranch = state.worktree.branch;
+				const preHead = gitOk(["rev-parse", "HEAD"], ctx.cwd); // ไม่ขยับระหว่าง apply (squash ไม่ commit) — เก็บไว้เทียบตอน reconcile
+				const ar = applyWorktreeBack(ctx.cwd, state.spec, state.worktree);
+				if (!ar.ok) {
+					escalate("need-decision", `worktree apply: ${ar.msg}`, ctx);
+					ctx.ui.notify(`⚠ ${ar.msg}`, "warning"); // guard/conflict → เก็บ worktree ไว้ — reviewer ยังอ่าน worktree ได้
 				} else {
-					learn(ctx, `worktree merged: ${mr.msg}`);
+					learn(ctx, `worktree applied: ${ar.msg}`);
 					state.worktree = null;
-					// reviewer จะอ่าน main หลัง merge — repin lastEval.head เป็น tree ของ merge commit (เนื้อ tree เหมือนที่ eval)
-					const mergedTree = gitOk(["rev-parse", "HEAD^{tree}"], ctx.cwd);
-					if (mergedTree.ok && state.lastEval) state.lastEval.head = mergedTree.out.trim();
-					ctx.ui.notify(`🌳 worktree merged → main`, "info");
+					// reviewer จะอ่าน main หลัง apply — repin lastEval.head เป็น tree ของ **index** (staged changes)
+					// (HEAD^{tree} ไม่มี change ที่ stage ไว้ → ใช้ HEAD^{tree} จะ stale ปลอมทุกรอบ)
+					const idxTree = gitOk(["write-tree"], ctx.cwd);
+					if (idxTree.ok && state.lastEval) state.lastEval.head = idxTree.out.trim();
+					if (ar.paths.length) {
+						state.pendingApply = { specVersion: state.spec.version, branch: wtBranch, paths: ar.paths, appliedAt: Date.now(), ...(preHead.ok ? { preApplyHead: preHead.out.trim() } : {}) };
+						// commit message สำเร็จรูป (เขียนเป็นไฟล์ — message หลายบรรทัด quote ในคำสั่งเดียวพลาดง่าย)
+						try {
+							writeFileSync(join(zenseDir(ctx.cwd), PENDING_MSG), ar.commitMsg ?? composeCommitMessage(state.spec, []));
+						} catch {
+							/* best-effort */
+						}
+						ctx.ui.notify(
+							`🌳 apply เข้า main แล้ว แบบ **staged — ยังไม่ commit** (${ar.paths.length} ไฟล์จาก ${wtBranch})\n` +
+								`review ได้เลย: git status · git diff --cached\n` +
+								`➡️ เมื่อ review ผ่าน → commit: git commit -F .zense/pending-apply.msg (หรือสั่ง agent commit)\n` +
+								`⚠️ change ยังไม่ durable จนกว่าจะ commit — git stash / reset --hard / checkout . จะลบทิ้ง\n` +
+								`↩️ ไม่พอใจ → zense_discard (หรือ /zense discard) — reverse patch คืนสภาพก่อน apply เป๊ะ`,
+							"info",
+						);
+					} else {
+						ctx.ui.notify(`🌳 worktree applied → main — ไม่มี source change ให้ stage (interim แตะเฉพาะ .zense)`, "info");
+					}
 				}
 			}
 			state.phase = "review";
@@ -2683,14 +2804,29 @@ export default function (pi: ExtensionAPI) {
 			// evidence ต้องเป็นของรอบปัจจุบันเท่านั้น: git summary scope ด้วย baseline ตอน spec approval + lastEval ที่ไม่ตรง
 			// spec version/tree ปัจจุบันถูกตัดออกจาก prompt (ดู isLastEvalStale ใน buildReviewerPrompt) แทนที่จะหลุดไปให้ตัดสินจากของเก่า
 			const reviewRoot = state.worktree?.root ?? ctx.cwd;
-			const headNow = gitOk(["rev-parse", "HEAD^{tree}"], reviewRoot);
+			// ADR-003: หลัง apply change อยู่ใน index ไม่ใช่ HEAD — pin freshness ด้วย tree ตอน apply (lastEval.head
+			// ถูก repin เป็น tree ของ index ด้วย write-tree แล้ว) แทน HEAD^{tree} ไม่งั้น stale ปลอมทุกรอบ;
+			// มนุษย์แก้ไฟล์ระหว่าง review ไม่ถือเป็น stale แต่ note ให้ reviewer รู้ด้านล่าง
+			const headNow = state.pendingApply
+				? state.lastEval?.head
+					? { ok: true, out: state.lastEval.head, err: "" }
+					: gitOk(["write-tree"], reviewRoot)
+				: gitOk(["rev-parse", "HEAD^{tree}"], reviewRoot);
 			const freshness = { specVersion: state.spec?.version, ...(headNow.ok ? { head: headNow.out.trim() } : {}) };
 			if (isLastEvalStale(state.lastEval, freshness))
 				learn(ctx, `review: lastEval stale (spec v${state.lastEval?.specVersion ?? "?"} ≠ v${freshness.specVersion ?? "?"} หรือ tree เปลี่ยนหลัง eval) — ตัด eval evidence เก่าออกจาก reviewer prompt`);
+			// มนุษย์แก้ไฟล์หลัง eval+apply → tree ของ index ต่างจาก pin — review ดำเนินต่อปกติ แค่ note ใน prompt
+			const humanEdited = (() => {
+				if (!state.pendingApply || !state.lastEval?.head) return false;
+				const w = gitOk(["write-tree"], reviewRoot);
+				return w.ok && w.out.trim() !== state.lastEval.head;
+			})();
+			if (humanEdited) learn(ctx, "review: มีการแก้ไฟล์หลัง apply (human edit ระหว่าง review) — note ใน packet");
+			const gitEvidencePrefix = buildPendingApplyEvidencePrefix(!!state.pendingApply, humanEdited);
 			let packetFeedback = "";
 			const packetInput = (): string =>
 				buildReviewerPrompt(state.spec?.intent ?? "(no spec)", state.lastEval, state.trajectoryFlags, state.spec?.specDebt ?? [], state.escalations,
-					gitChangeSummary(reviewRoot, state.baselineHead), packetFeedback, freshness, state.spec?.criteria);
+					(gitEvidencePrefix ? gitEvidencePrefix + "\n" : "") + gitChangeSummary(reviewRoot, state.baselineHead), packetFeedback, freshness, state.spec?.criteria);
 			let reviewer = await launchSubagent(ctx, "reviewer", packetInput());
 			let packetParse = parseReviewerPacket(reviewer.output);
 			// A (schema): section ไม่ครบ → retry 1 ครั้งพร้อม feedback (แทน slice ดิบ 900 ตัวอักษรที่ผ่านทุกกรณี)
@@ -2730,6 +2866,43 @@ export default function (pi: ExtensionAPI) {
 				? buildReviewResultText({ ok: true, tlDr: packet.tlDr, trajectoryCount: packet.trajectory.length, escalationCount: packet.escalations.length, logPath: relative(ctx.cwd, reviewer.logPath) })
 				: buildReviewResultText({ ok: false, tlDr: "", trajectoryCount: 0, escalationCount: 0, logPath: relative(ctx.cwd, reviewer.logPath), errorOutput: reviewer.output.slice(-2_000) });
 			return { content: [{ type: "text", text: reviewText }], details: { ...packet, logPath: reviewer.logPath } };
+		},
+	});
+
+	pi.registerTool({
+		name: "zense_discard",
+		label: "Zense Discard Pending Apply",
+		description:
+			"ย้อน change ที่ apply เข้า main แบบ staged หลัง eval PASS (ยังไม่ commit) — unstage + reverse-apply patch ที่เก็บไว้ คืนสภาพ main เหมือนก่อน apply เป๊ะ; เรียกเมื่อมนุษย์ review แล้วไม่พอใจและสั่ง discard/ทิ้งงาน",
+		parameters: Type.Object({}),
+		async execute(_id, _p, _s, _o, ctx) {
+			if (!state.pendingApply)
+				return {
+					content: [{ type: "text", text: "ไม่มี pending apply ให้ discard (change ถูก commit ไปแล้ว หรือยังไม่เคย apply)" }],
+					details: { discarded: false },
+					isError: true,
+				};
+			const v = state.pendingApply.specVersion;
+			const dr = discardPendingApply(ctx.cwd);
+			if (!dr.ok) {
+				escalate("need-decision", `discard: ${dr.msg}`, ctx);
+				return {
+					content: [{ type: "text", text: `⚠️ discard ไม่สำเร็จ: ${dr.msg}\nescalation need-decision ถูกบันทึกแล้ว — มนุษย์จัดการด้วย git เอง` }],
+					details: { discarded: false },
+					isError: true,
+				};
+			}
+			state.pendingApply = undefined;
+			// บันทึกเป็น escalation ด้วย — reject คือ signal สำคัญของวงจร (reviewer packet/telemetry ครั้งหน้าควรเห็น)
+			state.escalations.push({ kind: "discarded", detail: `spec v${v} apply discarded after human review`, at: Date.now() });
+			state.phase = "maintenance";
+			learn(ctx, `spec v${v} discarded after review (reverse-applied patch)`);
+			persist();
+			updateWidget(ctx);
+			return {
+				content: [{ type: "text", text: `🗑 discarded change ของ spec v${v} — ${dr.msg}\nงานรอบนี้ถูกปิด: ถ้าจะทำต่อด้วยแนวทางอื่น → re-spec ด้วย zense_spec version ใหม่` }],
+				details: { discarded: true, specVersion: v },
+			};
 		},
 	});
 
@@ -2814,11 +2987,11 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("zense", {
-		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory | models | ext-config-show",
+		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | discard | agents | gate on|off | memory | models | ext-config-show",
 		getArgumentCompletions: (prefix) =>
 			// pi ส่งมาแค่ prefix ของคำปัจจุบัน (ไม่บอกตำแหน่ง) → union ทุก token: subcommands + roles + actions
 			// ของ ext-config ไว้ใน list เดียว พิมพ์ตำแหน่งไหนก็ complete ได้ (noise เล็กน้อยตำแหน่งแรกแต่คุ้ม)
-			["status", "approve", "agents", "gate", "memory", "models", "ext-config-show", "requirements", "grader", "reviewer", "all", "none", "on", "off"]
+			["status", "approve", "agents", "discard", "gate", "memory", "models", "ext-config-show", "requirements", "grader", "reviewer", "all", "none", "on", "off"]
 				.filter((s) => s.startsWith(prefix))
 				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
@@ -2826,8 +2999,11 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "status") {
 				ctx.ui.notify(
 					`phase=${state.phase} spec=${state.spec ? `v${state.spec.version} approved=${state.spec.approved}` : "—"}\n` +
-						(state.worktree ? `worktree: ${state.worktree.dir}\n  branch ${state.worktree.branch} (active — merge อัตโนมัติเมื่อ eval PASS)\n` : `worktree: (none — ทำงานใน main)\n`) +
+						(state.worktree ? `worktree: ${state.worktree.dir}\n  branch ${state.worktree.branch} (active — apply แบบ staged เมื่อ eval PASS, ไม่ auto-commit)\n` : `worktree: (none — ทำงานใน main)\n`) +
 						`turns=${state.turnsUsed} tokens=${state.tokensUsed}\n` +
+						(state.pendingApply
+							? `⏳ pending apply: spec v${state.pendingApply.specVersion} — ${state.pendingApply.paths.length} ไฟล์ staged รอ commit (จาก ${state.pendingApply.branch})\n  commit: git commit -F .zense/pending-apply.msg · ย้อนทิ้ง: /zense discard (reverse patch)\n`
+							: "") +
 						`trajectory flags:\n${state.trajectoryFlags.join("\n") || "(none)"}\nescalations:\n${state.escalations.map((e) => `${e.kind}: ${e.detail}`).join("\n") || "(none)"}`,
 					"info",
 				);
@@ -2851,6 +3027,20 @@ export default function (pi: ExtensionAPI) {
 				state.gateEnabled = rest[0] !== "off";
 				persist();
 				ctx.ui.notify(`Gate ${state.gateEnabled ? "ON" : "OFF"}`, state.gateEnabled ? "info" : "warning");
+			} else if (sub === "discard") {
+				// ย้อน change ที่ apply ค้างไว้ (reverse patch) — undo path อย่างเป็นทางการหลังมนุษย์ review แล้วไม่พอใจ
+				if (!state.pendingApply) return ctx.ui.notify("ไม่มี pending apply ให้ discard (change ถูก commit ไปแล้ว หรือยังไม่เคย apply)", "info");
+				const dr = discardPendingApply(ctx.cwd);
+				if (!dr.ok) {
+					escalate("need-decision", `discard: ${dr.msg}`, ctx);
+					return ctx.ui.notify(`⚠ discard ไม่สำเร็จ: ${dr.msg}`, "warning");
+				}
+				const v = state.pendingApply.specVersion;
+				state.pendingApply = undefined;
+				learn(ctx, `spec v${v} discarded after review (reverse-applied)`);
+				persist();
+				updateWidget(ctx);
+				ctx.ui.notify(`✅ ${dr.msg} — spec v${v} ถูกย้อนออกจาก main แล้ว`, "info");
 			} else if (sub === "agents") {
 				await openAgentsViewer(ctx);
 			} else if (sub === "memory") {
@@ -2941,7 +3131,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				await runExtConfig(ctx, role, action, vals);
 			} else {
-				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models|ext-config-show", "info");
+				ctx.ui.notify("usage: /zense status|approve|discard|agents|gate on|off|memory|models|ext-config-show", "info");
 			}
 		},
 	});

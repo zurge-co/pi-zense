@@ -1,14 +1,15 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, appendFileSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
 	rewritePathForWorktree,
 	buildWorktreeCommand,
 	createWorktree,
-	mergeWorktreeBack,
+	applyWorktreeBack,
+	discardPendingApply,
 	composeCommitMessage,
 	sanitizeSubject,
 	gitOk,
@@ -48,7 +49,7 @@ test("buildWorktreeCommand: นำหน้าด้วย cd <wtRoot> && (path 
 const SPEC = {
 	version: 1,
 	title: "Add src module",
-	intent: "Implement the src module for testing merge-back.",
+	intent: "Implement the src module for testing apply-back.",
 	scope: [],
 	constraints: [],
 	criteria: [],
@@ -75,6 +76,9 @@ const makeRepo = () => {
 	git(["commit", "-q", "-m", "init"]);
 	return { cwd, base, git };
 };
+
+/** staged paths ใน main (ยกเว้น .zense) — helper ของ assertion */
+const stagedIn = (git) => git(["diff", "--cached", "--name-only", "--", ".", ":!.zense"]).split("\n").map((s) => s.trim()).filter(Boolean);
 
 test("gitOk: returns ok=false ใน dir ที่ไม่ใช่ git repo", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-nogit-"));
@@ -130,70 +134,104 @@ test("createWorktree: ใน dir ที่ไม่ใช่ git repo → คื
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: eval PASS → squash เป็น commit เดียว subject=spec title + ff merge + cleanup worktree/branch", () => {
+// ----- applyWorktreeBack (ADR-003: staged-only, ไม่ commit) -----
+
+test("applyWorktreeBack: eval PASS → change staged ใน main แต่ HEAD ไม่ขยับ (ไม่มี commit ใหม่) + cleanup worktree/branch + เก็บ reverse patch", () => {
 	const { cwd, base, git } = makeRepo();
+	const headBefore = git(["rev-parse", "HEAD"]).trim();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
 	// จำลองการแก้ไฟล์ใน worktree (เหมือน agent เขียน)
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
-	// merge กลับ
-	const mr = mergeWorktreeBack(cwd, SPEC, wt);
-	assert.equal(mr.ok, true, `merge should succeed: ${mr.msg}`);
-	// main ได้ commit เดียว subject = spec title (ไม่ใช่ "zense: impl v... (eval PASS)")
-	const subjects = git(["log", "--format=%s"]).trim().split("\n");
-	assert.deepEqual(subjects, ["Add src module", "init"], `main log subjects: ${subjects.join(" | ")}`);
-	// body มี intent + footer spec version
-	const body = git(["log", "-1", "--format=%B"]);
-	assert.ok(body.includes("Implement the src module for testing merge-back."), `body has intent: ${body}`);
-	assert.ok(body.includes("zense spec v1"), `body has spec footer: ${body}`);
-	// ไฟล์จาก worktree อยู่ใน main แล้ว
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true, `apply should succeed: ${ar.msg}`);
+	// ADR-003 core: main HEAD ไม่ขยับ — ไม่มี commit ใหม่จาก apply
+	assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore, "HEAD must not move (no auto-commit)");
+	assert.deepEqual(git(["log", "--format=%s"]).trim().split("\n"), ["init"], "main log unchanged");
+	// change ถูก stage ไว้ใน index (รอมนุษย์ commit)
+	assert.deepEqual(stagedIn(git), ["src.txt"], "src.txt staged in main");
 	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "impl\n");
-	// worktree ถูก remove แล้ว
+	assert.deepEqual(ar.paths, ["src.txt"]);
+	// commit message สำเร็จรูปจาก squashed commit (subject = spec title)
+	assert.ok(ar.commitMsg.includes("Add src module"), `commitMsg has spec title: ${ar.commitMsg}`);
+	// reverse patch ถูกเก็บไว้สำหรับ discard
+	assert.ok(readFileSync(join(cwd, ".zense", "pending-apply.patch"), "utf8").includes("src.txt"), "reverse patch stored");
+	// worktree + branch ถูก cleanup แล้ว
 	assert.ok(!existsSync(wt.root), "worktree dir removed");
-	const branches = git(["branch", "--list", wt.branch]);
-	assert.equal(branches.trim(), "", "branch deleted");
+	assert.equal(git(["branch", "--list", wt.branch]).trim(), "", "branch deleted");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: interim commits หลายอันใน branch → squash เป็น commit เดียว body มีรายชื่อ interim", () => {
+test("applyWorktreeBack: interim commits หลายอัน + ไฟล์ uncommitted → squash แล้ว stage ครบใน main (log ไม่ขยับ)", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
 	const gwt = gitIn(wt.root);
-	// agent commit ย่อย 2 ครั้ง + ทิ้งไฟล์ uncommitted อีก 1
 	writeFileSync(join(wt.root, "a.txt"), "a\n");
 	gwt(["add", "a.txt"]);
 	gwt(["commit", "-q", "-m", "wip: add a"]);
 	writeFileSync(join(wt.root, "b.txt"), "b\n");
 	gwt(["add", "b.txt"]);
 	gwt(["commit", "-q", "-m", "wip: add b"]);
-	writeFileSync(join(wt.root, "c.txt"), "c\n");
-	const mr = mergeWorktreeBack(cwd, SPEC, wt);
-	assert.equal(mr.ok, true, `merge should succeed: ${mr.msg}`);
-	// main ได้ commit ใหม่ตัวเดียว (squash) — interim commits ไม่ตามเข้า main
-	const subjects = git(["log", "--format=%s"]).trim().split("\n");
-	assert.deepEqual(subjects, ["Add src module", "init"], `main log subjects: ${subjects.join(" | ")}`);
-	// แต่รายชื่อ interim commits ถูกเก็บไว้ใน body เพื่อ traceability
-	const body = git(["log", "-1", "--format=%B"]);
-	assert.ok(body.includes("wip: add a"), `body lists interim a: ${body}`);
-	assert.ok(body.includes("wip: add b"), `body lists interim b: ${body}`);
-	// ไฟล์ทั้งหมด (รวม uncommitted ตัวสุดท้าย) อยู่ใน main ครบ
-	for (const f of ["a.txt", "b.txt", "c.txt"]) assert.ok(existsSync(join(cwd, f)), `${f} merged to main`);
+	writeFileSync(join(wt.root, "c.txt"), "c\n"); // uncommitted ตัวสุดท้าย
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true, `apply should succeed: ${ar.msg}`);
+	// interim commits ไม่ตามเข้า main เลย — log ยังเหมือนเดิม
+	assert.deepEqual(git(["log", "--format=%s"]).trim().split("\n"), ["init"], "main log unchanged (no interim, no merge commit)");
+	// ทุกไฟล์ (รวม uncommitted) staged ครบ
+	assert.deepEqual(stagedIn(git).sort(), ["a.txt", "b.txt", "c.txt"], "all files staged");
+	// commit message สำเร็จรูปต้องเก็บรายชื่อ interim (traceability)
+	assert.ok(ar.commitMsg.includes("wip: add a") && ar.commitMsg.includes("wip: add b"), `commitMsg lists interims: ${ar.commitMsg}`);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: worktree ไม่มีการเปลี่ยนแปลง → ok แต่ไม่สร้าง commit ว่างบน main", () => {
+test("applyWorktreeBack: worktree ไม่มีการเปลี่ยนแปลง → ok=true paths ว่าง, main สะอาด, cleanup ครบ", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
-	const mr = mergeWorktreeBack(cwd, SPEC, wt);
-	assert.equal(mr.ok, true, `merge should succeed: ${mr.msg}`);
-	assert.equal(git(["log", "--format=%s"]).trim(), "init", "main log unchanged (no empty merge commit)");
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true, `apply should succeed: ${ar.msg}`);
+	assert.deepEqual(ar.paths, [], "no paths staged");
+	assert.deepEqual(stagedIn(git), [], "nothing staged in main");
+	assert.deepEqual(git(["log", "--format=%s"]).trim().split("\n"), ["init"], "main log unchanged");
 	assert.ok(!existsSync(wt.root), "worktree cleaned up");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: conflict (อีก session แก้ไฟล์เดียวกันใน main) → ok=false conflict=true + เก็บ worktree", () => {
+test("applyWorktreeBack: guard dirty main — main มี uncommitted change นอก .zense → refuse (ok=false dirtyMain) ไม่แตะ branch/worktree", () => {
+	const { cwd, base, git } = makeRepo();
+	const wt = createWorktree(cwd, SPEC);
+	writeFileSync(join(wt.root, "src.txt"), "impl\n");
+	// human แก้ไฟล์ใน main ค้างไว้ (ไม่ commit)
+	writeFileSync(join(cwd, "README.md"), "# human change\n");
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, false, `apply should be refused: ${ar.msg}`);
+	assert.equal(ar.dirtyMain, true, "flagged as dirtyMain");
+	// worktree + branch ต้องยังอยู่ (retry ได้ ไม่สูญงาน)
+	assert.ok(existsSync(wt.root), "worktree kept");
+	assert.ok(git(["branch", "--list", wt.branch]).trim(), "branch kept");
+	// ของ human ไม่โดนแตะ
+	assert.equal(readFileSync(join(cwd, "README.md"), "utf8"), "# human change\n");
+	assert.deepEqual(stagedIn(git), [], "nothing staged by failed apply");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("applyWorktreeBack: guard ไม่เล็ง .zense — มีเฉพาะ .zense change ใน main ก็ apply ได้ตาม policy", () => {
+	const { cwd, base, git } = makeRepo();
+	const wt = createWorktree(cwd, SPEC);
+	writeFileSync(join(wt.root, "src.txt"), "impl\n");
+	// .zense/ (harness state) dirty ใน main — ต้องไม่ trip guard
+	appendFileSync(join(cwd, ".zense", "x"), "state-dirty");
+	writeFileSync(join(cwd, ".zense", "memory.jsonl"), "{}\n"); // untracked ใน .zense ด้วย
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true, `apply should succeed despite dirty .zense: ${ar.msg}`);
+	assert.deepEqual(stagedIn(git), ["src.txt"]);
+	// .zense ใน main ต้องไม่โดนแตะตอน apply
+	assert.equal(readFileSync(join(cwd, ".zense", "memory.jsonl"), "utf8"), "{}\n");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("applyWorktreeBack: conflict (อีก session แก้ไฟล์เดียวกันใน main) → ok=false conflict=true, main ถูกย้อนสะอาด, เก็บ worktree", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
@@ -203,36 +241,126 @@ test("mergeWorktreeBack: conflict (อีก session แก้ไฟล์เด
 	git(["commit", "-q", "-m", "other session"]);
 	// session นี้แก้ same file ใน worktree
 	writeFileSync(join(wt.root, "src.txt"), "wt-change\n");
-	const mr = mergeWorktreeBack(cwd, SPEC, wt);
-	assert.equal(mr.ok, false);
-	assert.equal(mr.conflict, true);
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, false);
+	assert.equal(ar.conflict, true);
+	// main ต้องถูกย้อนกลับสะอาด (ไม่ค้าง conflict markers / staged junk)
+	assert.equal(git(["status", "--porcelain", "--", ".", ":!.zense"]).trim(), "", "main clean after abort");
+	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "main-change\n");
 	// worktree ยังอยู่ (ให้มนุษย์ resolve)
 	assert.ok(existsSync(wt.root), "worktree kept for manual resolve");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("mergeWorktreeBack: ไม่มี .zense changes ใน merge (harness state ไม่ตามเข้า main) — ทั้งกรณี staged และ commit ย่อย", () => {
+test("applyWorktreeBack: ไม่มี .zense changes ใน staged result (harness state ไม่ตามเข้า main) — ทั้งกรณี staged และ commit ย่อยใน worktree", () => {
 	const { cwd, base, git } = makeRepo();
-	// สร้าง .zense/spec.md tracked ใน main ก่อน (commit)
+	// สร้าง .zense/spec.md tracked ใน main ก่อน
 	mkdirSync(join(cwd, ".zense"), { recursive: true });
 	writeFileSync(join(cwd, ".zense", "spec.md"), "# old\n");
 	git(["add", "-A"]);
 	git(["commit", "-q", "-m", "add spec"]);
 	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt);
 	const gwt = gitIn(wt.root);
-	// แก้ source ใน worktree + commit ย่อยที่แตะ .zense (interim commit มี .zense → ตอน squash ต้องหลุดออก)
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
 	gwt(["add", "src.txt"]);
 	gwt(["commit", "-q", "-m", "wip: src"]);
 	writeFileSync(join(wt.root, ".zense", "spec.md"), "# new\n");
 	gwt(["add", ".zense/spec.md"]);
 	gwt(["commit", "-q", "-m", "wip: zense state"]);
-	const mr = mergeWorktreeBack(cwd, SPEC, wt);
-	assert.equal(mr.ok, true);
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true);
+	// staged ใน main ต้องไม่มี .zense/spec.md
+	const staged = stagedIn(git);
+	assert.ok(!staged.some((p) => p.startsWith(".zense")), `no .zense in staged: ${staged}`);
+	assert.deepEqual(staged, ["src.txt"]);
 	// main spec.md ยังเป็นของเดิม (ไม่ถูกลาก)
 	assert.equal(readFileSync(join(cwd, ".zense", "spec.md"), "utf8"), "# old\n");
-	// แต่ source ยังเข้า main ปกติ
-	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "impl\n");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("applyWorktreeBack: multi-session — A apply ค้าง staged อยู่, B apply ตามหลัง → guard เด้ง refuse (อีกทางเลือกคือปนของ)", () => {
+	const { cwd, base, git } = makeRepo();
+	// session A: apply สำเร็จ (staged ค้างใน main)
+	const wtA = createWorktree(cwd, SPEC);
+	assert.ok(wtA);
+	writeFileSync(join(wtA.root, "a.txt"), "a\n");
+	const arA = applyWorktreeBack(cwd, SPEC, wtA);
+	assert.equal(arA.ok, true);
+	// session B: worktree ใหม่ (branch จาก HEAD เดิม — A ยังไม่ commit) แล้วพยายาม apply
+	const specB = { ...SPEC, version: 2, title: "Add b module" };
+	const wtB = createWorktree(cwd, specB);
+	assert.ok(wtB);
+	writeFileSync(join(wtB.root, "b.txt"), "b\n");
+	const arB = applyWorktreeBack(cwd, specB, wtB);
+	assert.equal(arB.ok, false, "B must be refused while A's staged changes pending");
+	assert.equal(arB.dirtyMain, true);
+	assert.ok(existsSync(wtB.root), "B worktree kept");
+	// staged ของ A ยังอยู่ครบ ไม่ถูกแตะ
+	assert.deepEqual(stagedIn(git), ["a.txt"]);
+	rmSync(base, { recursive: true, force: true });
+});
+
+// ----- discardPendingApply (undo path หลัง review) -----
+
+test("discardPendingApply: ย้อน change ที่ apply ไว้ → ไฟล์ใหม่ถูกลบ, main กลับสะอาดเหมือนก่อน apply เป๊ะ", () => {
+	const { cwd, base, git } = makeRepo();
+	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt);
+	writeFileSync(join(wt.root, "src.txt"), "impl\n");
+	appendFileSync(join(wt.root, "README.md"), "added-line\n"); // แก้ไฟล์ tracked เดิมด้วย
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true);
+	// human review → ไม่พอใจ → discard
+	const dr = discardPendingApply(cwd);
+	assert.equal(dr.ok, true, `discard should succeed: ${dr.msg}`);
+	// ไฟล์ใหม่ที่ apply สร้างต้องหาย / ไฟล์เดิมต้องกลับเนื้อเดิม
+	assert.ok(!existsSync(join(cwd, "src.txt")), "new file removed by reverse patch");
+	assert.equal(readFileSync(join(cwd, "README.md"), "utf8"), "# init\n", "tracked file restored");
+	assert.equal(git(["status", "--porcelain", "--", ".", ":!.zense"]).trim(), "", "main clean as before apply");
+	// patch/msg ถูกเก็บกวาด
+	assert.ok(!existsSync(join(cwd, ".zense", "pending-apply.patch")), "patch cleaned");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("discardPendingApply: human แก้ไฟล์ที่ apply ไว้ → reverse fail ชัดๆ และไม่ลบของ human", () => {
+	const { cwd, base, git } = makeRepo();
+	const wt = createWorktree(cwd, SPEC);
+	assert.ok(wt);
+	writeFileSync(join(wt.root, "src.txt"), "impl\n");
+	const ar = applyWorktreeBack(cwd, SPEC, wt);
+	assert.equal(ar.ok, true);
+	// human แก้ไฟล์ที่ apply มาหลังจากนั้น (ทับเนื้อทั้งก้อน)
+	writeFileSync(join(cwd, "src.txt"), "human edit\n");
+	const dr = discardPendingApply(cwd);
+	assert.equal(dr.ok, false, "reverse must fail when human edited applied files");
+	// ของ human ต้องเหลือครบ — ห้ามลบเงียบๆ
+	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "human edit\n");
+	// patch ยังอยู่ให้มนุษย์ตัดสินใจต่อ
+	assert.ok(existsSync(join(cwd, ".zense", "pending-apply.patch")), "patch kept on failure");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("discardPendingApply: ไม่มี pending patch → ok=false ไม่พัง", () => {
+	const { cwd, base } = makeRepo();
+	const dr = discardPendingApply(cwd);
+	assert.equal(dr.ok, false);
+	assert.ok(dr.msg.includes("ไม่พบ"), `msg explains: ${dr.msg}`);
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("discardPendingApply: patch ว่าง (apply ไม่มี source change) → ok=true unstage-only ไม่พัง", () => {
+	const { cwd, base, git } = makeRepo();
+	mkdirSync(join(cwd, ".zense"), { recursive: true });
+	writeFileSync(join(cwd, ".zense", "pending-apply.patch"), ""); // apply ที่ interim แตะเฉพาะ .zense → patch ว่าง
+	// stage อะไรสักอย่างไว้ก่อน (จำลอง index ค้าง)
+	writeFileSync(join(cwd, "leftover.txt"), "x\n");
+	git(["add", "leftover.txt"]);
+	const dr = discardPendingApply(cwd);
+	assert.equal(dr.ok, true, `discard should succeed: ${dr.msg}`);
+	// index ถูก unstage (ของยังอยู่เป็น untracked — patch ว่างไม่ได้บังคับลบ)
+	assert.equal(git(["diff", "--cached", "--name-only"]).trim(), "", "index unstaged");
+	assert.ok(!existsSync(join(cwd, ".zense", "pending-apply.patch")), "patch cleaned");
 	rmSync(base, { recursive: true, force: true });
 });
 

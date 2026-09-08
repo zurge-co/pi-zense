@@ -2358,6 +2358,11 @@ export default function (pi: ExtensionAPI) {
 				feedback = problems.join("; ");
 				parsed = null;
 			}
+			// section เดียวใช้ร่วมทั้ง FAIL/PASS/deadlock/inconclusive — M: บีบด้วย buildCompactProbeSection
+			// (pass รวมบรรทัดเดียว ลงรายละเอียดเฉพาะ fail/skipped; grade.output ดิบชี้ไป log แทนการฝังใน transcript)
+			// ต้องคำนวณก่อน inconclusive branch ด้านล่าง — เดิมประกาศหลัง branch ทำให้ eval inconclusive
+			// crash TDZ "Cannot access 'probeSection' before initialization" แทนที่จะ escalate ให้มนุษย์
+			const probeSection = buildCompactProbeSection(probes);
 			// W2 (G): inconclusive — เดิม "unknown ไหลเป็น PASS เงียบๆ" (= merge เข้า main ฟรี) → ตอนนี้ escalate
 			// ให้มนุษย์ตัดสินแทน พร้อม probe results (หลักฐานแข็งที่มีแน่ๆ) และทางออกที่ไม่ตัน loop (eval ซ้ำได้)
 			if (!grade.ok || !parsed || !parsed.overall) {
@@ -2366,7 +2371,7 @@ export default function (pi: ExtensionAPI) {
 				learn(ctx, `eval: spec v${state.spec.version} → inconclusive (${reason})`);
 				persist(); updateWidget(ctx);
 				return {
-					content: [{ type: "text", text: `⚠️ Eval INCONCLUSIVE — ${reason}\nprobes: ${probeSummary}${probeSection}\n\nตัดสินไม่ได้อย่างน่าเชื่อถือ: ให้มนุษย์ดู probe results ข้างบนแล้วตัดสินเอง (escalation need-decision ถูกบันทึกแล้ว — /zense status) หรือสั่งเรียก zense_eval อีกครั้ง\n\n🧪 grader output ดิบอยู่ใน log: ${evalView.logPath} — อ่านเองด้วย read ถ้าต้องการ` }],
+					content: [{ type: "text", text: `⚠️ Eval INCONCLUSIVE — ${reason}\nprobes: ${probeSummary}${probeSection}\n\nตัดสินไม่ได้อย่างน่าเชื่อถือ: ให้มนุษย์ดู probe results ข้างบนแล้วตัดสินเอง (escalation need-decision ถูกบันทึกแล้ว — /zense status) หรือสั่งเรียก zense_eval อีกครั้ง\n\n🧪 grader output ดิบอยู่ใน log: ${relative(ctx.cwd, grade.logPath)} — อ่านเองด้วย read ถ้าต้องการ` }],
 					details: { inconclusive: true, reason, probes, logPath: grade.logPath },
 					isError: true,
 				};
@@ -2384,9 +2389,6 @@ export default function (pi: ExtensionAPI) {
 			if (probeOverrides.length) learn(ctx, `grader: probe overrides → FAIL [${probeOverrides.join(",")}]`);
 			const failedCriteria = parsed.failedIds;
 			const verdict = failedCriteria.length || parsed.overall === "FAIL" ? "FAIL" : "PASS";
-			// section เดียวใช้ร่วมทั้ง FAIL/PASS/deadlock/inconclusive — M: บีบด้วย buildCompactProbeSection
-			// (pass รวมบรรทัดเดียว ลงรายละเอียดเฉพาะ fail/skipped; grade.output ดิบชี้ไป log แทนการฝังใน transcript)
-			const probeSection = buildCompactProbeSection(probes);
 			// M: view กลางของทุก branch — pure builder render ข้อความให้ (PASS/FAIL); deadlock/inconclusive ต่อ directives เอง
 			const evalView: EvalResultView = {
 				verdict,

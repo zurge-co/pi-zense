@@ -2741,10 +2741,65 @@ export default function (pi: ExtensionAPI) {
 		handler: (ctx) => openAgentsViewer(ctx),
 	});
 
+	// runExtConfig: logic รวมของ ext-config ต่อ role — ใช้ร่วมกันระหว่าง /zense ext-config <role> (arg เดิม
+// backward compat) กับ per-role commands /zense:ext-config:<role> (autocomplete จากชื่อ command ตรงๆ —
+// pi API ส่งแค่ prefix ของคำปัจจุบัน ทำ positional completion ไม่ได้)
+	const runExtConfig = async (ctx: ExtensionContext, role: string, action?: string, vals: string[] = []): Promise<void> => {
+		const exts = (await listInstalledExtensions(ctx.cwd)).filter((e) => e.enabled);
+		const cur = new Set(subagentExtIncludes(role, ctx.cwd));
+		const apply = (includes: string[]) => {
+			const { globalSeeded } = writeSubagentExtIncludes(ctx.cwd, role, includes);
+			ctx.ui.notify(
+				`✅ ${role}: จะโหลด ${includes.length}/${exts.length} extensions${includes.length ? "" : " (boot เปลือย)"} — save ลง local .zense/config.json แล้ว${globalSeeded ? " (+ seed global ~/.pi/agent/zense/config.json ครั้งแรก)" : ""} · มีผล sub-agent run ถัดไปทันที`,
+				"info",
+			);
+		};
+		if (ctx.mode === "tui" && !action) {
+			const includes = await extConfigDialog(
+				ctx,
+				role,
+				exts.map((e) => ({ path: e.path, label: `${basename(e.path)} · ${e.source}`, checked: cur.has(e.path) })),
+			);
+			if (includes === null) return ctx.ui.notify("ยกเลิก — config เดิมไม่เปลี่ยน", "info");
+			apply(includes);
+			return;
+		}
+		// text actions (non-TUI หรือระบุ action ชัดเจน) — on/off รับเลขลำดับ (1-based จาก list ด้านล่าง) หรือ substring ของ path
+		if (action === "all") apply(exts.map((e) => e.path));
+		else if (action === "none" || action === "default") apply([]);
+		else if (action === "on" || action === "off") {
+			const target = vals.join(" ").trim();
+			if (!target) return ctx.ui.notify(`ขาดเป้าหมาย — /zense ext-config ${role} ${action} <เลขลำดับ|path>`, "warning");
+			const asNum = Number(target);
+			const hit =
+				Number.isInteger(asNum) && asNum >= 1 && asNum <= exts.length ? exts[asNum - 1].path : exts.find((e) => e.path.includes(target))?.path;
+			if (!hit) return ctx.ui.notify(`หา extension "${target}" ไม่เจอ — ดู list ด้วย /zense ext-config ${role} (ไม่ใส่ action)`, "warning");
+			const next = new Set(cur);
+			if (action === "on") next.add(hit);
+			else next.delete(hit);
+			apply([...next]);
+		} else if (!action) {
+			ctx.ui.notify(
+				[
+					`extensions ที่ install ไว้ (enabled) — ${role} โหลด ${cur.size}/${exts.length}:`,
+					...exts.map((e, i) => `  ${i + 1}. ${cur.has(e.path) ? "[x]" : "[ ]"} ${e.path}`),
+					`toggle: /zense ext-config ${role} on|off <เลขลำดับ|path> · all = โหลดทั้งหมด · none = ไม่โหลดเลย (default)`,
+				].join("\n"),
+				"info",
+			);
+		} else {
+			return ctx.ui.notify(`action ไม่รู้จัก: "${action}" — ไม่ใส่ action (TUI=checkbox / non-TUI=list) | all | none | on|off <เลขลำดับ|path>`, "warning");
+		}
+	};
+
 	pi.registerCommand("zense", {
 		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | agents | gate on|off | memory | models | ext-config",
 		getArgumentCompletions: (prefix) =>
-			["status", "approve", "agents", "gate", "memory", "models", "ext-config"].filter((s) => s.startsWith(prefix)).map((value) => ({ value, label: value })),
+			// pi ส่งมาแค่ prefix ของคำปัจจุบัน (ไม่บอกตำแหน่ง) → union ทุก token: subcommands + roles + actions
+			// ของ ext-config ไว้ใน list เดียว พิมพ์ตำแหน่งไหนก็ complete ได้ (noise เล็กน้อยตำแหน่งแรกแต่คุ้ม)
+			["status", "approve", "agents", "gate", "memory", "models", "ext-config", "requirements", "grader", "reviewer", "all", "none", "on", "off"]
+				.filter((s) => s.startsWith(prefix))
+				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			if (sub === "status") {
@@ -2844,9 +2899,8 @@ export default function (pi: ExtensionAPI) {
 				writeModelsConfig(ctx.cwd, role, pattern);
 				ctx.ui.notify(`✅ ${role}: ${pattern} — เขียน ${relative(ctx.cwd, cfgPath)} แล้ว (มีผล sub-agent run ถัดไปทันที)`, "info");
 			} else if (sub === "ext-config") {
-				// ext-config: เลือก extensions ที่ sub-agent จะโหลด ต่อ role — DEFAULT boot เปลือย (unload ทั้งหมด
-				// กัน extension ที่มี gate/ค้างไปบล็อก sub-process) แล้วให้ user tick โหลดเพิ่มเฉพาะที่ต้องการ
-				// persist LOCAL .zense/config.json (key subagentExtInclude) + seed GLOBAL ~/.pi/agent/zense/config.json ครั้งแรกครั้งเดียว
+				// ext-config (arg แบบเดิม — backward compat): ไม่มี role → view รวม; มี role → เดลิเกต runExtConfig
+				// (ทางหลักใหม่ = per-role commands /zense:ext-config:<role> — autocomplete จากชื่อ command ตรงๆ)
 				const roles = ["requirements", "grader", "reviewer"];
 				const [role, action, ...vals] = rest;
 				if (!role || !roles.includes(role)) {
@@ -2858,62 +2912,26 @@ export default function (pi: ExtensionAPI) {
 								return `  ${r}: ${inc.length ? `โหลด ${inc.length} ตัว` : "boot เปลือย (ไม่โหลด extension)"}`;
 							}),
 							`persist: local ${join(zenseDir(ctx.cwd), "config.json")} · global ${join(zenseGlobalConfigDir(), "config.json")} (seed ครั้งแรก + fallback)`,
-							"ตั้งค่า: /zense ext-config <role> (TUI = checkbox) · text: /zense ext-config <role> all | none | on|off <เลขลำดับ|path>",
+							"ตั้งค่า: /zense:ext-config:grader | :requirements | :reviewer (TUI = checkbox ทันที) หรือ /zense ext-config <role> all|none|on|off <เลขลำดับ|path>",
 						].join("\n"),
 						"info",
 					);
 					return;
 				}
-				const exts = (await listInstalledExtensions(ctx.cwd)).filter((e) => e.enabled);
-				const cur = new Set(subagentExtIncludes(role, ctx.cwd));
-				const apply = (includes: string[]) => {
-					const { globalSeeded } = writeSubagentExtIncludes(ctx.cwd, role, includes);
-					ctx.ui.notify(
-						`✅ ${role}: จะโหลด ${includes.length}/${exts.length} extensions${includes.length ? "" : " (boot เปลือย)"} — save ลง local .zense/config.json แล้ว${globalSeeded ? " (+ seed global ~/.pi/agent/zense/config.json ครั้งแรก)" : ""} · มีผล sub-agent run ถัดไปทันที`,
-						"info",
-					);
-				};
-				if (ctx.mode === "tui" && !action) {
-					const includes = await extConfigDialog(
-						ctx,
-						role,
-						exts.map((e) => ({ path: e.path, label: `${basename(e.path)} · ${e.source}`, checked: cur.has(e.path) })),
-					);
-					if (includes === null) return ctx.ui.notify("ยกเลิก — config เดิมไม่เปลี่ยน", "info");
-					apply(includes);
-					return;
-				}
-				// text actions (non-TUI หรือระบุ action ชัดเจน) — on/off รับเลขลำดับ (1-based จาก list ด้านล่าง) หรือ substring ของ path
-				if (action === "all") apply(exts.map((e) => e.path));
-				else if (action === "none" || action === "default") apply([]);
-				else if (action === "on" || action === "off") {
-					const target = vals.join(" ").trim();
-					if (!target) return ctx.ui.notify(`ขาดเป้าหมาย — /zense ext-config ${role} ${action} <เลขลำดับ|path>`, "warning");
-					const asNum = Number(target);
-					const hit =
-						Number.isInteger(asNum) && asNum >= 1 && asNum <= exts.length ? exts[asNum - 1].path : exts.find((e) => e.path.includes(target))?.path;
-					if (!hit) return ctx.ui.notify(`หา extension "${target}" ไม่เจอ — ดู list ด้วย /zense ext-config ${role} (ไม่ใส่ action)`, "warning");
-					const next = new Set(cur);
-					if (action === "on") next.add(hit);
-					else next.delete(hit);
-					apply([...next]);
-				} else if (!action) {
-					ctx.ui.notify(
-						[
-							`extensions ที่ install ไว้ (enabled) — ${role} โหลด ${cur.size}/${exts.length}:`,
-							...exts.map((e, i) => `  ${i + 1}. ${cur.has(e.path) ? "[x]" : "[ ]"} ${e.path}`),
-							`toggle: /zense ext-config ${role} on|off <เลขลำดับ|path> · all = โหลดทั้งหมด · none = ไม่โหลดเลย (default)`,
-						].join("\n"),
-						"info",
-					);
-				} else {
-					return ctx.ui.notify(`action ไม่รู้จัก: "${action}" — ไม่ใส่ action (TUI=checkbox / non-TUI=list) | all | none | on|off <เลขลำดับ|path>`, "warning");
-				}
+				await runExtConfig(ctx, role, action, vals);
 			} else {
 				ctx.ui.notify("usage: /zense status|approve|agents|gate on|off|memory|models|ext-config", "info");
 			}
 		},
 	});
+
+	// per-role ext-config commands (v8): autocomplete จากชื่อ command ตรงๆ ไม่ต้องพิมพ์ role เป็น arg
+	// (pi getArgumentCompletions ส่งแค่ prefix คำปัจจุบัน แยกตำแหน่งไม่ได้ — pattern เดียวกับ skill commands)
+	for (const role of ["requirements", "grader", "reviewer"] as const)
+		pi.registerCommand(`zense:ext-config:${role}`, {
+			description: `sub-agent "${role}" จะโหลด extensions ตัวไหนบ้าง (default boot เปลือย — tick เพิ่ม opt-in; save ลง local .zense + seed global ครั้งแรก)`,
+			handler: async (_args, ctx) => runExtConfig(ctx as ExtensionContext, role),
+		});
 
 	// renderSpecMd อยู่ module scope (export เพื่อ unit-test) — closure นี้เรียกใช้งานตัวนั้นตรงๆ
 }

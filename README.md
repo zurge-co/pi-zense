@@ -1,64 +1,54 @@
 # pi-zense
 
-> **Spec-gated, human-signed SDLC harness for pi.** Human attention is the scarcest resource in AI-driven development — pi-zense concentrates it at exactly two gates (spec approval, review) and automates everything between.
+> **Spec-gated, human-signed SDLC harness for pi.** Human attention is the scarcest resource in AI-driven development — pi-zense concentrates it at exactly two gates: **signing the spec** and **reviewing the result**. Everything in between is automated.
 
-`pi-zense` (pi + **zense** / **เซ็น** / sign — ทุกครั้งที่สั่ง agent ทำงาน มีลายเซ็นของมนุษย์กำกับไว้เสมอ) bundles:
+"Zense" is Thai for **"sign"** — every run ships under a human signature.
 
-1. **`zense-harness`** — implements the AI-SDLC loop โดยมี human signature เป็นแกนกลาง: **spec → criteria → implementation → dual eval → exception review → learn**. Phase tasks are delegated to **isolated pi sub-agents** (`pi -p`, clean context per phase).
-2. **`zense` theme** — dark theme built on the Zense design system (green `#00c55a` → lime `#6cdd25` → gold `#facd04` on near-black surfaces).
+## What you get
+
+- **Spec as a contract** — a requirements sub-agent drafts machine-checkable acceptance criteria (probed for real, not guessed); nothing gets written to your repo until you 🔏 sign — right in the dialog, full spec rendered inline.
+- **Isolated sub-agents per phase** — compile, grade, and review each run in clean `pi -p` contexts; watch them live with `ctrl+_`.
+- **Worktree-per-session** — after signing, work happens in an auto-created `git worktree`; open two pi sessions in the same repo and they never clobber each other.
+- **Dual eval** — deterministic probes + a grader sub-agent judge every criterion; trajectory heuristics catch reward hacking (test edits, out-of-scope writes, retry storms).
+- **Human-in-command merge** — on eval PASS, work is **squashed and applied to `main` staged-but-uncommitted**. You review the staged diff, then `accept` or `discard` — the harness never auto-commits on `main`.
+- **Memory that feeds back** — every flag, escalation, and verdict becomes a lesson that shapes the next spec.
+- **zense theme** — a dark theme on the Zense design system (green → lime → gold over near-black).
 
 ## Install
 
 ```bash
-pi install git:github.com/zurge-co/pi-zense        # git
-pi install npm:pi-zense                          # npm (when published)
-pi -e ./pi-zense                                 # try without installing
+pi install git:github.com/zurge-co/pi-zense   # git
+pi install npm:pi-zense                       # npm (when published)
+pi -e ./pi-zense                              # try without installing
 ```
 
-Enable the theme: `/settings` → theme → `zense`, or set
+Theme (optional): `/settings` → theme → `zense`.
 
-```json
-{ "theme": "zense" }
-```
-
-## zense-harness: what the harness does
-
-| Phase (per PLAN.md) | Mechanism | Artifact |
-|---|---|---|
-| **1. Requirements** — spec is the contract | `zense_spec` tool; `action:"compile_spec"` delegates drafting to the requirements sub-agent | append-only archive `.zense/specs/<timestamp>-v{n}-<slug>.{json,md}` (never overwritten) with machine-checkable criteria & **spec debt**; `.zense/spec.{json,md}` = latest copies |
-| **Gate** — never implement on unsigned spec | `tool_call` interceptor stops `write`/`edit` with a **3-choice signing dialog that renders the full spec inline** (Ctrl+D/U/F/B to read before deciding: 🔏 sign & continue / ⚠ one-off override / ⛔ block) | hard gate + dialog signature |
-| **2. Design** — ADRs prevent architectural drift | `zense_adr` tool; `DENY: <path>` rules enforced live on every write; irreversible ADRs flagged for human approval | `.zense/adr/NNN-*.md` |
-| **3. Implementation** — escalation taxonomy | turn/token usage meter; escalation taxonomy: need-permission / need-decision / something-wrong; **auto worktree-per-session**: on spec approval the harness creates a dedicated `git worktree` for this session and transparently redirects every tool call (`write`/`edit`/`read`/`bash`) into it — so two pi sessions opened in the same repo never clobber each other's working tree | live widget meter (shows `🌳 <worktree>` when active) |
-| **4. Dual eval** — output *and* trajectory | `zense_eval` → the harness first runs each criterion's `check` itself as a **deterministic probe** (see *Spec criteria check forms* below), then the grader sub-agent judges each criterion PASS/FAIL against that evidence — a failing probe overrides the grader (**probe primacy**); grader/reviewer **run inside the active worktree** so they test the real changes; **sub-agent output streams live into the transcript while it runs** — watch it anytime via `ctrl+_` / `/zense agents` (live tail of `.zense/subagents/*.log`); on **eval PASS** all commits on the worktree branch are **squashed into one commit** (message composed from the spec's title/intent, interim commit subjects preserved in the body) and **applied into `main` staged-but-uncommitted** (`git merge --squash` — the harness never auto-commits on `main`: a human reviews the staged diff first, then commits with the ready-made `git commit -F .zense/pending-apply.msg` or asks the agent to commit; happy → **`zense_accept` / `/zense accept` formally closes the pending apply** (soft-verifies the commit happened — warns if the index is empty but HEAD never moved, reports any files the human amended after grading as a lesson into memory; `zense_accept` called with `commitIfStaged` first commits the staged change from the prepared message when asked to "commit for me"; hooks run normally); not happy → `zense_discard` / `/zense discard` reverse-applies the stored patch and restores the exact pre-apply state) — the worktree is then cleaned up, and the pending apply is tracked (`pendingApply`) so `/zense status`, the widget (`⏳staged v<n>`) and the next session's startup reconcile remind you until it's committed — if `main` was dirty outside `.zense/` or another session merged conflicting changes, the apply escalates instead of clobbering; `agent_end` heuristics catch reward hacking: modified test files, out-of-scope writes, retry storms | verdict + trajectory flags |
-| **5. Review** — exception-based, not wall-of-diff | `zense_review` → reviewer sub-agent builds an incident-report-style **review packet** rendered as a transcript card (TL;DR first) | review packet card |
-| **6. Maintenance** — learn every run | every escalation/flag/signing/eval-verdict/sub-agent-failure appended to `.zense/memory.jsonl`; lessons are **fed back into `compile_spec`** so new specs reflect past incidents | `/zense memory` (grouped summary; `/zense memory json` = raw) |
-
-### Spec criteria check forms (what the harness probe can run itself)
-
-Each `criteria[].check` is executed by the harness **before** grading, and a failing probe marks that criterion FAIL no matter what the grader says. Supported forms:
-
-- **`path exists: <p>`** (or `file exists: <p>`) — resolved in-process against the repo/worktree
-- **any shell command** — run verbatim via `sh -c` (e.g. `npm test`, `node --test test/x.mjs`)
-- **compounds joined with `&&`** mixing both — e.g. `path exists: src/a.ts && path exists: src/b.ts && npm test`; every segment must pass (path segments resolve in-process, the rest run via `sh -c`)
-
-Anything that isn't machine-runnable (e.g. "manual visual QA") is **skipped**, not guessed — the criterion becomes forced human review (spec debt). Tip: shell-only checks are run verbatim, so a literal `"&&"` inside quotes is *not* split.
-
-### Human actions (by design: minimal)
+## Quick start
 
 ```text
-/zense status                 # one-glance: phase, gate, flags, escalations
-# gate 1 happens IN the dialog — no command needed
-/zense approve                # 🔏 sign later, only if you skipped the dialog
-ctrl+_                        # watch sub-agent runs LIVE (grader/reviewer) — or /zense agents
-/zense gate on|off            # escape hatch
-/zense memory                 # grouped lesson summary (top flags / escalations / eval history); /zense memory json = raw tail
+1. Tell the agent what to build       → it compiles a spec with checkable criteria
+2. 🔏 Sign in the dialog (gate #1)    → read the spec inline, then sign or send back
+3. Let it run                         → widget shows phase/turns/tokens; ctrl+_ to watch sub-agents
+4. Review the packet (gate #2)        → TL;DR first, spec-debt and trajectory flags highlighted
+5. Commit & `/zense accept` — or `/zense discard` to reverse-apply the patch exactly
 ```
 
-Then just tell the agent what to build; the harness gates, evaluates, and hands you a review packet.
+If the agent tries to write code before the spec is signed, a 3-choice dialog stops it: 🔏 sign & continue / ⚠ one-off override / ⛔ block.
 
-## zense theme
+## Human cheat sheet
 
-Dark theme from the Zense design system: brand gradient green → lime → gold over near-black surfaces (`#0d0d0d` base, `#1a1a1a` panel). No commands — pi auto-discovers it via the package manifest's `pi.themes` entry; pick it in `/settings` → theme.
+You only have two real jobs (🔏 sign, 📋 review). Everything else:
+
+| Command | When | What it does |
+|---|---|---|
+| `/zense approve` | sign later, if you skipped the dialog | sign the current spec |
+| `/zense status` | anytime | phase, gate, flags, pending apply |
+| `ctrl+_` / `/zense agents` | while sub-agents run | live tail of grader/reviewer runs |
+| `/zense accept` | after review & commit | close the pending apply, log post-review edits as lessons |
+| `/zense discard` | review says no | reverse-apply the stored patch, restoring exact pre-apply state |
+| `/zense gate on\|off` | emergency | toggle the spec gate |
+| `/zense memory` | anytime | grouped lesson summary (`json` = raw) |
 
 ## Files
 
@@ -66,18 +56,12 @@ Dark theme from the Zense design system: brand gradient green → lime → gold 
 pi-zense/
 ├── package.json                  # pi manifest
 ├── extensions/
-│   └── zense-harness/ index.ts, README.md
-├── themes/
-│   └── zense.json                # Zense design-system dark theme
-└── docs/
-    └── HUMAN-ACTIONS.md          # คู่มือมุมมองผู้ใช้ (ไทย)
+│   └── zense-harness/ index.ts, README.md   # the harness (full docs here)
+└── themes/
+    └── zense.json                # Zense dark theme
 ```
 
-Per-project runtime artifacts live under each repo's `.zense/` (append-only `specs/` archive, ADRs, memory) — spec-as-code, diffable and auditable.
-
-### Auto worktree-per-session (multi-session safety)
-
-When you sign a spec, zense creates a `git worktree` for that session (branch `zense/impl/v<n>-<stamp>`, nested under `<repo>/.zense/worktree/` inside your workspace — kept out of `git status` via a local entry in `.git/info/exclude`) and transparently redirects every `write`/`edit`/`read`/`bash` tool call into it. You can open **two pi sessions in the same repo** without them overwriting each other's files mid-work — each works in its own worktree. The grader/reviewer sub-agents run inside the worktree too, so they evaluate the real changes. When `zense_eval` **passes**, every commit on the worktree branch is **squashed into a single commit** — subject = the spec's title, body = the spec's intent plus the list of squashed interim commits — and **applied into `main` as staged-but-uncommitted changes** (`git merge --squash`): `main`'s HEAD does not move and **no commit is created for you**. You review the real diff in `main` (`git status` / `git diff --cached`), then make the final commit yourself — conveniently with the ready-made message file: `git commit -F .zense/pending-apply.msg` (or ask the agent to commit). If the review says yes, **`zense_accept` (or `/zense accept`) is the official positive exit**: it closes the pending apply bookkeeping, soft-verifies the commit actually happened (warns — without refusing — if the index is empty yet HEAD never moved, i.e. the change may have been lost silently), and reports the names of any files you amended after the grader passed as a recorded lesson in `/zense memory`. If the review says no, `zense_discard` (or `/zense discard`) unstages and reverse-applies the stored patch (`.zense/pending-apply.patch`), restoring `main` to the exact pre-apply state without touching your other files; if you already edited files the apply touched, the discard fails loudly instead of deleting your work. The pending apply is tracked (`pendingApply`): `/zense status` lists it with the commit/discard commands, the widget shows `⏳staged v<n>`, and a restarted session reconciles it (still staged → reminder; committed or discarded outside the flow → cleared). The worktree is cleaned up after a successful apply. If `main` has uncommitted changes outside `.zense/`, or another session already merged conflicting changes, the apply is **refused/escalated** (`need-decision`) and the worktree is left for you to resolve instead of silently clobbering or mixing changes. If a session ends before eval passes, the worktree is left in place (merge by hand: `git merge zense/impl/...`) — zense never auto-merges unverified work. `/zense status` shows the active worktree; the widget shows `🌳 <worktree>`.
+Per-project runtime artifacts (spec archive, ADRs, memory) live under each repo's `.zense/` — spec-as-code, diffable and auditable.
 
 ## License
 

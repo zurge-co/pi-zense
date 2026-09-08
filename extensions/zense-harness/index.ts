@@ -2989,9 +2989,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("zense", {
 		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | discard | agents | gate on|off | memory | models | ext-config-show",
 		getArgumentCompletions: (prefix) =>
-			// pi ส่งมาแค่ prefix ของคำปัจจุบัน (ไม่บอกตำแหน่ง) → union ทุก token: subcommands + roles + actions
-			// ของ ext-config ไว้ใน list เดียว พิมพ์ตำแหน่งไหนก็ complete ได้ (noise เล็กน้อยตำแหน่งแรกแต่คุ้ม)
-			["status", "approve", "agents", "discard", "gate", "memory", "models", "ext-config-show", "requirements", "grader", "reviewer", "all", "none", "on", "off"]
+			// เสนอเฉพาะ subcommand ของ /zense ตรงๆ — roles (requirements/grader/reviewer) ไม่ใส่เพราะมี
+			// /zense:ext-config:<role> แยกอยู่แล้ว ส่วน actions (all/none/on/off) เป็น arg ชั้นสองของ ext-config-show
+			// ซึ่ง pi แยกตำแหน่งคำไม่ได้ → ถ้ารวมไว้จะเด้งเป็น subcommand ปลอมที่ตำแหน่งแรก
+			["status", "approve", "agents", "discard", "gate", "memory", "models", "ext-config-show"]
 				.filter((s) => s.startsWith(prefix))
 				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {

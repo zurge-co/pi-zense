@@ -368,6 +368,63 @@ export const discardPendingApply = (cwd: string): { ok: boolean; msg: string } =
 	return { ok: true, msg: "discarded — main กลับสภาพเหมือนก่อน apply (reverse patch สำเร็จ)" };
 };
 
+export interface AcceptResult {
+	ok: boolean;
+	msg: string;
+	amendedFiles: string[];      // ไฟล์ที่มนุษย์แก้เองหลัง grader ผ่าน (name-only จาก evalTree → HEAD^{tree})
+	warnings: string[];          // soft-mode anomalies (ไม่ refuse — แค่แนบไว้ใน report)
+	committedOnBehalf: boolean;  // harness commit แทนจาก staged ที่ค้างอยู่ (เฉพาะตอนถูกขอ)
+}
+
+/** accept ของ pendingApply — ทางออกฝั่ง "รับงาน" ของ change ที่ staged ไว้ (คู่กับ discard):
+ *  soft verify (ไม่ refuse ทุกกรณี): index สะอาด = ถือว่ามนุษย์ commit เองแล้ว; index ยัง staged ค้าง
+ *  → ต้อง commitIfStaged=true ถึงจะ commit แทนด้วย message ที่เตรียมไว้ (ห้าม --no-verify: จุดนี้มนุษย์
+ *  ยอมรับแล้ว hook ควรทำงาน); index สะอาดแต่ HEAD ยังเท่า preApplyHead → change น่าจะหาย (reset/stash
+ *  นอก flow) ไม่ใช่ถูก commit → แนบ warning แต่ยัง accept ตาม soft-mode
+ *  human delta: เทียบ evalTree (tree ของ index ตอน apply/grade — lastEval.head ถูก repin ไว้แล้ว) กับ
+ *  HEAD^{tree} → ชื่อไฟล์ที่มนุษย์แก้เพิ่มหลัง grader ผ่าน เอาไป learn เป็น lesson (.zense ตัดออกตาม policy)
+ *  success → ลบ patch+msg ทิ้ง: undo จากนี้คือ git revert ปกติ ไม่ใช่ reverse patch อีกต่อไป */
+export const acceptPendingApply = (
+	cwd: string,
+	opts: { evalTree?: string; preApplyHead?: string; commitIfStaged?: boolean } = {},
+): AcceptResult => {
+	const patchPath = join(zenseDir(cwd), PENDING_PATCH);
+	if (!existsSync(patchPath))
+		return { ok: false, msg: `ไม่มี pending apply ให้ accept (ไม่พบ ${PENDING_PATCH} — อาจ accept/commit ไปแล้ว หรือยังไม่เคย apply)`, amendedFiles: [], warnings: [], committedOnBehalf: false };
+	const warnings: string[] = [];
+	let committedOnBehalf = false;
+	if (!gitOk(["diff", "--cached", "--quiet"], cwd).ok) {
+		// ยัง staged ค้าง = มนุษย์ยังไม่ commit เอง — commit แทนได้ก็ต่อเมื่อถูกขอมาเท่านั้น
+		if (!opts.commitIfStaged)
+			return {
+				ok: false,
+				msg: "ยังมี staged change ค้างอยู่ (มนุษย์ยังไม่ commit) — commit เองด้วย `git commit -F .zense/pending-apply.msg` แล้ว accept อีกครั้ง หรือขอให้ harness commit แทน (commitIfStaged=true / /zense accept commit)",
+				amendedFiles: [],
+				warnings,
+				committedOnBehalf: false,
+			};
+		const cr = gitOk(["commit", "-F", join(zenseDir(cwd), PENDING_MSG)], cwd);
+		if (!cr.ok)
+			return { ok: false, msg: `commit แทนไม่สำเร็จ (hook reject หรือ config ขาด?): ${cr.err}\nตรวจด้วย git status แล้ว commit ด้วยมือ`, amendedFiles: [], warnings, committedOnBehalf: false };
+		committedOnBehalf = true;
+	} else if (opts.preApplyHead && gitOk(["rev-parse", "HEAD"], cwd).out.trim() === opts.preApplyHead) {
+		warnings.push(
+			`index ว่างแต่ HEAD ยังเป็น ${opts.preApplyHead.slice(0, 12)} (จุดก่อน apply) — change น่าจะหายไปโดย reset/stash นอก flow มากกว่าถูก commit; ตรวจ git status / git log ก่อนเชื่อว่างานอยู่ครบ`,
+		);
+	}
+	const amendedFiles: string[] = [];
+	if (opts.evalTree) {
+		const headTree = gitOk(["rev-parse", "HEAD^{tree}"], cwd);
+		if (headTree.ok && headTree.out.trim() && headTree.out.trim() !== opts.evalTree) {
+			const d = gitOk(["diff", "--name-only", opts.evalTree, "HEAD^{tree}", "--", ".", NOT_ZENSE], cwd);
+			if (d.ok) amendedFiles.push(...d.out.split("\n").map((s) => s.trim()).filter(Boolean));
+		}
+	}
+	rmSync(patchPath, { force: true });
+	rmSync(join(zenseDir(cwd), PENDING_MSG), { force: true });
+	return { ok: true, msg: "ปิด pending apply แล้ว — change durable ใน main (undo จากนี้ใช้ git revert ปกติ)", amendedFiles, warnings, committedOnBehalf };
+};
+
 const freshState = (): State => ({
 	phase: "requirements",
 	turnsUsed: 0,
@@ -1736,7 +1793,7 @@ export default function (pi: ExtensionAPI) {
 				persist();
 			} else {
 				ctx.ui.notify(
-					`⏳ zense: มี change จาก spec v${pa.specVersion} (${pa.paths.length} ไฟล์) ค้าง staged ใน main รอ commit — review แล้ว git commit -F .zense/pending-apply.msg (ไม่พอใจ → zense_discard หรือ /zense discard)`,
+					`⏳ zense: มี change จาก spec v${pa.specVersion} (${pa.paths.length} ไฟล์) ค้าง staged ใน main รอ commit — review แล้ว git commit -F .zense/pending-apply.msg · รับงานหลัง commit → /zense accept · ไม่พอใจ → /zense discard (reverse patch)`,
 					"warning",
 				);
 			}
@@ -2772,6 +2829,7 @@ export default function (pi: ExtensionAPI) {
 								`review ได้เลย: git status · git diff --cached\n` +
 								`➡️ เมื่อ review ผ่าน → commit: git commit -F .zense/pending-apply.msg (หรือสั่ง agent commit)\n` +
 								`⚠️ change ยังไม่ durable จนกว่าจะ commit — git stash / reset --hard / checkout . จะลบทิ้ง\n` +
+								`✅ review รับงาน + commit เรียบร้อย → /zense accept — ปิดบัญชี pendingApply + บันทึก lesson ลง memory\n` +
 								`↩️ ไม่พอใจ → zense_discard (หรือ /zense discard) — reverse patch คืนสภาพก่อน apply เป๊ะ`,
 							"info",
 						);
@@ -2906,6 +2964,59 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+		/** accept ของ pendingApply (ใช้ร่วมกันทั้ง /zense accept และ zense_accept tool):
+	 *  ปิดบัญชี → learn outcome ลง memory (accepted cleanly / with amendments / warnings) → maintenance
+	 *  commitIfStaged=true คือ "มนุษย์ขอให้ commit แทน" — helper จะ commit จาก message ที่เตรียมไว้ (hook ทำงานปกติ) */
+	const acceptPending = (ctx: ExtensionContext, commitIfStaged: boolean): { ok: boolean; text: string; specVersion?: number } => {
+		if (!state.pendingApply)
+			return { ok: false, text: "ไม่มี pending apply ให้ accept (change accept/commit ไปแล้ว หรือยังไม่เคย apply)" };
+		const v = state.pendingApply.specVersion;
+		const r = acceptPendingApply(ctx.cwd, { evalTree: state.lastEval?.head, preApplyHead: state.pendingApply.preApplyHead, commitIfStaged });
+		if (!r.ok) return { ok: false, text: `⚠️ accept ไม่สำเร็จ: ${r.msg}` };
+		state.pendingApply = undefined;
+		state.phase = "maintenance";
+		// outcome เชิงบวกก็เป็น signal ของวงจรเช่นกัน — push escalation kind "accepted" (pattern เดียวกับ "discarded")
+		// ให้ reviewer packet/telemetry รอบถัดไปเห็นทั้งฝั่งรับและฝั่งทิ้ง ไม่ใช่เห็นแต่ของพัง
+		state.escalations.push({ kind: "accepted", detail: `spec v${v} accepted by human${r.amendedFiles.length ? ` — amended: ${r.amendedFiles.join(", ")}` : ""}`, at: Date.now() });
+		const headNow = gitOk(["rev-parse", "HEAD"], ctx.cwd).out.trim().slice(0, 12);
+		const amendLine = r.amendedFiles.length
+			? `\n✏️ มนุษย์แก้เพิ่มหลัง grader ผ่าน (${r.amendedFiles.length} ไฟล์): ${r.amendedFiles.join(", ")} — ถ้าแก้โดยไม่ตั้งใจ ตรวจด้วย git show HEAD`
+			: "";
+		learn(
+			ctx,
+			r.amendedFiles.length
+				? `spec v${v} accepted @${headNow} with human amendments: ${r.amendedFiles.join(", ")}`
+				: `spec v${v} accepted @${headNow} cleanly (no human amendments)`,
+		);
+		if (r.committedOnBehalf) learn(ctx, `spec v${v} accepted: harness committed staged change on human request`);
+		for (const w of r.warnings) learn(ctx, `accept warning spec v${v}: ${w}`);
+		persist();
+		updateWidget(ctx);
+		const warnText = r.warnings.length ? `\n⚠️ ${r.warnings.join("\n⚠️ ")}` : "";
+		return {
+			ok: true,
+			specVersion: v,
+			text: `✅ รับงาน spec v${v} — ${r.msg}${r.committedOnBehalf ? " (harness commit แทนด้วย message ที่เตรียมไว้)" : ""}${amendLine}${warnText}\nวงจรปิดแล้ว: งานชิ้นต่อไปเริ่มด้วย zense_spec เวอร์ชันใหม่`,
+		};
+	};
+
+	pi.registerTool({
+		name: "zense_accept",
+		label: "Zense Accept Pending Apply",
+		// ดูเฉพาะเมื่อมี pendingApply ค้าง — ไม่มีคือไม่เกี่ยวกับรอบนี้เลยไม่ต้องเสนอ tool
+		description:
+			"ปิด pending apply ฝั่ง 'รับงาน' (คู่กับ zense_discard ฝั่งทิ้ง) — เรียกเฉพาะเมื่อ (1) มนุษย์บอกชัดว่ารับงานและ commit เรียบร้อยแล้ว หรือ (2) มนุษย์สั่งให้ agent commit แทน (กรณีนี้ยังมี staged change ค้าง → ส่ง commitIfStaged=true เพื่อ commit ด้วย .zense/pending-apply.msg โดยให้ hook ทำงานปกติ); ห้ามเรียกเองถ้ามนุษย์ไม่ได้สั่ง. ผลลัพธ์รายงานไฟล์ที่มนุษย์แก้เพิ่มหลัง grader ผ่าน (ถ้ามี) และบันทึก lesson ลง memory",
+		parameters: Type.Object({
+			commitIfStaged: Type.Optional(
+				Type.Boolean({ description: "true เฉพาะตอนมนุษย์ 'สั่งให้ commit ให้หน่อย': commit staged change ที่ค้างแทนด้วย message ที่เตรียมไว้ แล้วค่อย accept", default: false }),
+			),
+		}),
+		async execute(_id, p, _s, _o, ctx) {
+			const r = acceptPending(ctx as ExtensionContext, !!p.commitIfStaged);
+			return { content: [{ type: "text", text: r.text }], details: { accepted: r.ok, ...(r.specVersion !== undefined ? { specVersion: r.specVersion } : {}) }, isError: !r.ok };
+		},
+	});
+
 	// Review-packet card in the transcript.
 	pi.registerEntryRenderer("zense-review-packet", (entry, { expanded }, theme) => {
 		const d = entry.data as any;
@@ -2987,12 +3098,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("zense", {
-		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | discard | agents | gate on|off | memory | models | ext-config-show",
+		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | accept | discard | agents | gate on|off | memory | models | ext-config-show",
 		getArgumentCompletions: (prefix) =>
 			// เสนอเฉพาะ subcommand ของ /zense ตรงๆ — roles (requirements/grader/reviewer) ไม่ใส่เพราะมี
 			// /zense:ext-config:<role> แยกอยู่แล้ว ส่วน actions (all/none/on/off) เป็น arg ชั้นสองของ ext-config-show
 			// ซึ่ง pi แยกตำแหน่งคำไม่ได้ → ถ้ารวมไว้จะเด้งเป็น subcommand ปลอมที่ตำแหน่งแรก
-			["status", "approve", "agents", "discard", "gate", "memory", "models", "ext-config-show"]
+			["status", "approve", "accept", "agents", "discard", "gate", "memory", "models", "ext-config-show"]
 				.filter((s) => s.startsWith(prefix))
 				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
@@ -3003,7 +3114,7 @@ export default function (pi: ExtensionAPI) {
 						(state.worktree ? `worktree: ${state.worktree.dir}\n  branch ${state.worktree.branch} (active — apply แบบ staged เมื่อ eval PASS, ไม่ auto-commit)\n` : `worktree: (none — ทำงานใน main)\n`) +
 						`turns=${state.turnsUsed} tokens=${state.tokensUsed}\n` +
 						(state.pendingApply
-							? `⏳ pending apply: spec v${state.pendingApply.specVersion} — ${state.pendingApply.paths.length} ไฟล์ staged รอ commit (จาก ${state.pendingApply.branch})\n  commit: git commit -F .zense/pending-apply.msg · ย้อนทิ้ง: /zense discard (reverse patch)\n`
+							? `⏳ pending apply: spec v${state.pendingApply.specVersion} — ${state.pendingApply.paths.length} ไฟล์ staged รอ commit (จาก ${state.pendingApply.branch})\n  commit: git commit -F .zense/pending-apply.msg · รับงานหลัง commit: /zense accept · ย้อนทิ้ง: /zense discard (reverse patch)\n`
 							: "") +
 						`trajectory flags:\n${state.trajectoryFlags.join("\n") || "(none)"}\nescalations:\n${state.escalations.map((e) => `${e.kind}: ${e.detail}`).join("\n") || "(none)"}`,
 					"info",
@@ -3042,6 +3153,27 @@ export default function (pi: ExtensionAPI) {
 				persist();
 				updateWidget(ctx);
 				ctx.ui.notify(`✅ ${dr.msg} — spec v${v} ถูกย้อนออกจาก main แล้ว`, "info");
+			} else if (sub === "accept") {
+				// ฝั่งรับงานของ pendingApply (คู่กับ discard): "/zense accept commit" = มนุษย์ขอให้ harness commit แทน
+				if (!state.pendingApply) return ctx.ui.notify("ไม่มี pending apply ให้ accept (change ถูก commit/accept ไปแล้ว หรือยังไม่เคย apply)", "info");
+				let commitIfStaged = rest[0] === "commit";
+				if (!commitIfStaged && !gitOk(["diff", "--cached", "--quiet"], ctx.cwd).ok) {
+					// ยัง staged ค้าง = มนุษย์ยังไม่ commit เอง — เสนอ commit แทน (soft, ไม่ auto-commit)
+					const ok =
+						ctx.mode === "tui" &&
+						(await ctx.ui.confirm(
+							`✅ accept spec v${state.pendingApply.specVersion} — แต่ยังมี staged change ค้างอยู่ (ยังไม่ commit)`,
+							"ให้ harness commit แทนด้วย .zense/pending-apply.msg แล้ว accept เลยไหม? (hook ทำงานปกติ)\nเลือก No → ยกเลิก: commit เองแล้ว /zense accept อีกครั้ง",
+						));
+					if (!ok)
+						return ctx.ui.notify(
+							"ยังไม่ได้ commit — commit เองด้วย `git commit -F .zense/pending-apply.msg` แล้ว /zense accept หรือให้ harness commit แทน: /zense accept commit",
+							"info",
+						);
+					commitIfStaged = true;
+				}
+				const r = acceptPending(ctx, commitIfStaged);
+				ctx.ui.notify(r.text, r.ok ? "info" : "warning");
 			} else if (sub === "agents") {
 				await openAgentsViewer(ctx);
 			} else if (sub === "memory") {
@@ -3132,7 +3264,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				await runExtConfig(ctx, role, action, vals);
 			} else {
-				ctx.ui.notify("usage: /zense status|approve|discard|agents|gate on|off|memory|models|ext-config-show", "info");
+				ctx.ui.notify("usage: /zense status|approve|accept [commit]|discard|agents|gate on|off|memory|models|ext-config-show", "info");
 			}
 		},
 	});

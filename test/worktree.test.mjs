@@ -10,6 +10,7 @@ import {
 	createWorktree,
 	applyWorktreeBack,
 	discardPendingApply,
+	acceptPendingApply,
 	composeCommitMessage,
 	sanitizeSubject,
 	gitOk,
@@ -377,4 +378,116 @@ test("composeCommitMessage: subject เป็นบรรทัดเดีย�
 	assert.ok(msg.includes("zense spec v1"), `footer: ${msg}`);
 	const bare = composeCommitMessage({ ...SPEC, intent: "" }, []);
 	assert.ok(!bare.includes("Squashed"), "no interim section when empty");
+});
+
+// ----- acceptPendingApply (ทางออกฝั่ง "รับงาน" ของ pendingApply — คู่กับ discard tests ด้านบน) -----
+
+/** จำลองสถานะหลัง applyWorktreeBack: patch+msg ค้างใน .zense + change จาก worktree staged อยู่ใน index */
+const seedPending = ({ cwd, git }) => {
+	writeFileSync(join(cwd, ".zense", "pending-apply.patch"), "dummy reverse patch\n");
+	writeFileSync(join(cwd, ".zense", "pending-apply.msg"), "Add src module\n\nbody from composeCommitMessage\n");
+	writeFileSync(join(cwd, "src.txt"), "from worktree\n");
+	git(["add", "src.txt"]);
+};
+
+const pendingFiles = (cwd) => ({
+	patch: existsSync(join(cwd, ".zense", "pending-apply.patch")),
+	msg: existsSync(join(cwd, ".zense", "pending-apply.msg")),
+});
+
+test("acceptPendingApply: ไม่มี pending patch → ok=false ชัดๆ ไม่แตะ repo", () => {
+	const { cwd, base, git } = makeRepo();
+	const headBefore = git(["rev-parse", "HEAD"]).trim();
+	const r = acceptPendingApply(cwd);
+	assert.equal(r.ok, false);
+	assert.match(r.msg, /ไม่มี pending apply/);
+	assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore);
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("acceptPendingApply: มนุษย์ commit เองแล้ว (index ว่าง, HEAD ขยับ) → ok, patch+msg ถูกลบ, ไม่มี warning", () => {
+	const { cwd, base, git } = makeRepo();
+	const preApplyHead = git(["rev-parse", "HEAD"]).trim();
+	seedPending({ cwd, git });
+	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]); // มนุษย์ commit เอง
+	const r = acceptPendingApply(cwd, { preApplyHead });
+	assert.equal(r.ok, true, r.msg);
+	assert.equal(r.committedOnBehalf, false);
+	assert.deepEqual(r.warnings, []);
+	assert.deepEqual(pendingFiles(cwd), { patch: false, msg: false });
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("acceptPendingApply: soft-mode — index ว่างแต่ HEAD ไม่ขยับ (change หาย?) → ok แต่แนบ warning ไม่ refuse", () => {
+	const { cwd, base, git } = makeRepo();
+	const preApplyHead = git(["rev-parse", "HEAD"]).trim();
+	seedPending({ cwd, git });
+	git(["reset", "-q", "--hard", "HEAD"]); // จำลอง change โดน reset ทิ้งนอก flow (index ว่าง ไม่มี commit ใหม่)
+	const r = acceptPendingApply(cwd, { preApplyHead });
+	assert.equal(r.ok, true, "soft-mode ต้อง accept ต่อแม้อันตราย");
+	assert.equal(r.warnings.length, 1);
+	assert.match(r.warnings[0], /HEAD/);
+	assert.deepEqual(pendingFiles(cwd), { patch: false, msg: false });
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("acceptPendingApply: ยัง staged ค้าง + ไม่ได้ขอ commit แทน → ok=false พร้อมบอกวิธี commit เอง/ขอแทน", () => {
+	const { cwd, base, git } = makeRepo();
+	seedPending({ cwd, git });
+	const headBefore = git(["rev-parse", "HEAD"]).trim();
+	const r = acceptPendingApply(cwd);
+	assert.equal(r.ok, false);
+	assert.match(r.msg, /commitIfStaged=true \/ \/zense accept commit/);
+	assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore, "ห้าม commit เองโดยไม่ได้ขอ");
+	assert.deepEqual(pendingFiles(cwd), { patch: true, msg: true }, "ยังไม่ accept → patch+msg ต้องอยู่");
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("acceptPendingApply: commitIfStaged=true (เคสสั่ง agent commit ให้หน่อย) → commit แทนด้วย message ที่เตรียมไว้ แล้วล้าง patch+msg", () => {
+	const { cwd, base, git } = makeRepo();
+	seedPending({ cwd, git });
+	const r = acceptPendingApply(cwd, { commitIfStaged: true });
+	assert.equal(r.ok, true, r.msg);
+	assert.equal(r.committedOnBehalf, true);
+	assert.equal(git(["log", "-1", "--format=%s"]).trim(), "Add src module", "subject มาจาก pending-apply.msg");
+	// commit ต้องมี src.txt (staged ตอน seed) แต่ห้ามมี .zense/
+	assert.deepEqual(git(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).split("\n").filter(Boolean), ["src.txt"]);
+	assert.deepEqual(pendingFiles(cwd), { patch: false, msg: false });
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("acceptPendingApply: human amendments — evalTree ต่างจาก HEAD^{tree} → คืนเฉพาะชื่อไฟล์ที่มนุษย์แก้", () => {
+	const { cwd, base, git } = makeRepo();
+	seedPending({ cwd, git });
+	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]);
+	const evalTree = git(["rev-parse", "HEAD^{tree}"]).trim(); // tree ตอน apply (repin เหมือน lastEval.head)
+	writeFileSync(join(cwd, "src.txt"), "human tweak\n"); // มนุษย์แก้เพิ่มหลัง grader ผ่าน
+	writeFileSync(join(cwd, "extra.md"), "human notes\n");
+	git(["add", "src.txt", "extra.md"]);
+	git(["commit", "-q", "-m", "human adjustments after review"]);
+	const r = acceptPendingApply(cwd, { evalTree });
+	assert.equal(r.ok, true, r.msg);
+	assert.deepEqual(r.amendedFiles.sort(), ["extra.md", "src.txt"]);
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("acceptPendingApply: evalTree เท่ากับ HEAD^{tree} (มนุษย์ไม่แก้อะไรเลย) → amendedFiles ว่าง", () => {
+	const { cwd, base, git } = makeRepo();
+	seedPending({ cwd, git });
+	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]);
+	const evalTree = git(["rev-parse", "HEAD^{tree}"]).trim();
+	const r = acceptPendingApply(cwd, { evalTree });
+	assert.equal(r.ok, true, r.msg);
+	assert.deepEqual(r.amendedFiles, []);
+	rmSync(base, { recursive: true, force: true });
+});
+
+test("acceptPendingApply: ไม่ส่ง evalTree → ข้าม delta เงียบๆ (amendedFiles ว่าง)", () => {
+	const { cwd, base, git } = makeRepo();
+	seedPending({ cwd, git });
+	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]);
+	const r = acceptPendingApply(cwd, {});
+	assert.equal(r.ok, true, r.msg);
+	assert.deepEqual(r.amendedFiles, []);
+	rmSync(base, { recursive: true, force: true });
 });

@@ -49,6 +49,7 @@ You only have two real jobs (🔏 sign, 📋 review). Everything else:
 | `/zense discard` | review says no | reverse-apply the stored patch, restoring exact pre-apply state |
 | `/zense gate on\|off` | emergency | toggle the spec gate |
 | `/zense memory` | anytime | grouped lesson summary (`json` = raw) |
+| `/zense distill` | anytime | compact `.zense`: confirm y/n (impact summary) → read-only distiller sub-agent condenses all of `memory.jsonl` into one lesson set (same JSONL format, parser untouched) → deletes `specs/` + `subagents/` history; never touches `adr/`, configs, or current spec; aborts without deleting if distillation fails |
 
 ## Files
 

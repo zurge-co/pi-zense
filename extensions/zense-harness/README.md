@@ -43,6 +43,7 @@ finished artifact — exactly the harness design plan.md recommends.
 | `ctrl+_` / `/zense agents` | watch sub-agent runs **live** — picker + auto-refreshing tail of `.zense/subagents/*.log` (written live while they run) |
 | `/zense gate off` | disable the spec gate (escape hatch) |
 | `/zense memory` | grouped lesson summary (top recurring flags, escalations by kind, eval history, sub-agent failures); `/zense memory json` for the raw JSONL tail |
+| `/zense distill` | compact `.zense` history: shows impact summary → confirm y/n → read-only **distiller** sub-agent condenses `memory.jsonl` into one lesson set written back in the same `{at,phase,note}` format (no parser change), then deletes `specs/` + `subagents/` (keeps the distiller log); `adr/`, `config.json`, `models.json`, `spec.json`, `spec.md` are never touched; any failure aborts before anything is deleted |
 
 ## Agent-facing tools
 

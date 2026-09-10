@@ -18,6 +18,8 @@ import {
 	parseGraderOutput,
 	parseReviewerPacket,
 	runCheckProbes,
+	lintSpecChecks,
+	CHECK_FORMAT_CONTRACT,
 	SUBAGENT_EXCLUDE_TOOLS,
 	SUBAGENT_STRIP_FLAGS,
 	buildCompactProbeSection,
@@ -124,6 +126,51 @@ test("runCheckProbes: malformed/usage-error check commands classify as skipped (
 	assert.match(probes[0].detail, /probe command error/);
 	assert.match(probes[2].detail, /probe command error/);
 	assert.equal(probes[3].exitCode, 1);
+});
+
+test("lintSpecChecks: spec-side broken checks (127 / not-runnable / placeholder) flagged, artifact-fails silent", () => {
+	const dir = mkdtempSync(join(tmpdir(), "zense-lint-"));
+	try {
+		const r = lintSpecChecks(dir, [
+			{ id: "b1", text: "t", check: "bash -c no-such-cmd-qqq" }, // exit 127 → cmdErr → skipped → broken
+			{ id: "b2", text: "t", check: "definitely-not-a-real-cmd-xyz --version" }, // not machine-runnable → skipped → broken
+			{ id: "b3", text: "t", check: "path exists: src/<module>/x" }, // unsubstituted placeholder → skipped → broken
+			{ id: "k1", text: "t", check: "path exists: no-such-artifact-abc" }, // artifact ยังไม่ implement → fail → ไม่เตือน
+			{ id: "k2", text: "t", check: "test 1 -eq 2" }, // คำสั่งดี รัน fail จริง → ไม่เตือน
+			{ id: "k3", text: "t", check: "node --version" }, // pass → ไม่เตือน
+		]);
+		assert.deepEqual(r.broken.sort(), ["b1", "b2", "b3"]);
+		assert.ok(r.notes.some((n) => n.includes("b1")), "note ต้องระบุ id ที่ broken");
+		assert.ok(r.notes.every((n) => n.startsWith("check-lint:")), "ทุก note ต้องขึ้นต้น check-lint:");
+		// criteria ว่าง/ผ่านหมด → ไม่มีอะไรเตือน
+		assert.deepEqual(lintSpecChecks(dir, []), { broken: [], notes: [] });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("CHECK_FORMAT_CONTRACT + requirements prompt: contract markers (sh -c / path exists: / && / ** / specDebt / npm test)", () => {
+	for (const marker of ["sh -c", "path exists:", "&&", "**", "specDebt", "npm test"])
+		assert.ok(CHECK_FORMAT_CONTRACT.includes(marker), `contract ขาด marker "${marker}"`);
+	const p = buildRequirementsPrompt("probe", []);
+	for (const marker of ["sh -c", "path exists:", "specDebt", "&&", "**", "npm test"])
+		assert.ok(p.includes(marker), `requirements prompt ขาด marker "${marker}"`);
+	// prompt ต้อง embed contract ก้อนเดียวกัน (single source of truth) — ห้าม fork คำสั่ง
+	assert.ok(p.includes(CHECK_FORMAT_CONTRACT.slice(0, 120)), "prompt ต้อง embed CHECK_FORMAT_CONTRACT");
+});
+
+test("zense_spec schema: criteria.check description ใช้ CHECK_FORMAT_CONTRACT (single source of truth)", async () => {
+	const { readFileSync } = await import("node:fs");
+	const { join, dirname } = await import("node:path");
+	const { fileURLToPath } = await import("node:url");
+	const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "zense-harness", "index.ts"), "utf8");
+	assert.match(src, /check:\s*Type\.String\(\{ description: CHECK_FORMAT_CONTRACT \}\)/, "schema ต้อง reference contract ก้อนเดียวกัน");
+	// commitSpec (choke point ของทั้ง set และ compile) ต้องเรียก lint ก่อนสร้าง state.spec
+	const i = src.indexOf("const commitSpec");
+	const j = src.indexOf("pi.registerTool", i);
+	assert.ok(j > i, "หา registerTool หลัง commitSpec ไม่เจอ");
+	assert.ok(src.slice(i, j).includes("lintSpecChecks"), "commitSpec ต้อง wire lintSpecChecks");
+	assert.ok(src.slice(i, src.indexOf("state.spec = {", i)).includes("lintSpecChecks"), "lint ต้องรันก่อน state.spec ถูกสร้าง");
 });
 
 test("SUBAGENT_EXCLUDE_TOOLS: grader and reviewer are read-only like requirements", () => {

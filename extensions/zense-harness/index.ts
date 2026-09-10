@@ -902,7 +902,10 @@ export const buildRequirementsPrompt = (intent: string, lessons: string[], facts
 Rules:
 - scope: the minimal list of path prefixes the main agent may modify.
 - approach: 3–7 short bullets describing the planned work — main steps, which files will be created or modified, and expected outcomes — grounded in your Step 1 exploration (no guessing). This is presentational info shown to the human signer so they can see what will actually happen; it is NOT a machine-checked criterion.
-- criteria: few and atomic. Each "check" MUST be an executable command verified in Step 1 (e.g. "npm test"), "path exists: <p>", or a compound of those joined with "&&" (e.g. "path exists: src/a.ts && npm test"). Anything you cannot verify by running a command belongs in specDebt instead (it becomes forced human review).
+- criteria: few and atomic. Each "check" MUST obey this contract:
+  ${CHECK_FORMAT_CONTRACT}
+  Good checks: "npm test" · "path exists: src/a.ts" · "path exists: src/a.ts && npm test"
+  Bad checks (never write these — they die for infra reasons at eval): "ls apps/**/dev.yaml" (sh does not expand **) · "[[ -f src/a.ts ]]" (bashism) · "grep -q x {file}" (unsubstituted placeholder) · "path exists: src/<module>/x" (placeholder). Anything you cannot verify by running a command belongs in specDebt instead (it becomes forced human review).
 - Output ONLY the JSON object — no markdown fences, no commentary.
 
 ` +
@@ -1077,6 +1080,12 @@ export const hasUnsubstitutedPlaceholder = (check: string): string | null => {
 	return m ? m[0] : null;
 };
 
+/** format contract เดียวของ criteria[].check — source of truth ก้อนเดียว ใช้ทั้ง requirements prompt
+ *  (buildRequirementsPrompt — blockquote ลง rules) และ zense_spec tool schema (action=set เขียน check เอง)
+ *  เป้าหมาย: agent gen probe ที่ harness (sh -c) รันได้จริงตั้งแต่ครั้งแรก ไม่ใช่เจอพังตอน eval แล้วลูปแก้ spec */
+export const CHECK_FORMAT_CONTRACT =
+	"Check format contract (the harness executes this verbatim at eval — a broken command wastes whole eval rounds): each check runs under POSIX sh via `sh -c` with cwd=repo root; exit 0 = pass, non-zero = fail. Allowed forms ONLY: (1) a single-line runnable shell command (e.g. \"npm test\", \"npx tsc --noEmit\", \"grep -q foo src/a.ts\"); (2) \"path exists: <relative-path>\"; (3) a one-level compound of those joined with \" && \" (e.g. \"path exists: src/a.ts && npm test\"). BANNED (sh will not run them and the check dies for infra reasons): globstar ** (e.g. apps/**/dev.yaml — use find/rg or spell the path out), brace expansion, [[ ]], process substitution and other bashisms, && / || inside string literals, and unsubstituted placeholders like <module> or {file}. Every path/token must exist in the repo TODAY and you must have actually run each candidate command (Step 1) and seen it execute — it need not pass yet, but it must not die with command-not-found/usage/syntax errors. Anything you cannot verify by running belongs in specDebt, not in criteria.";
+
 type CheckSegment = { kind: "exists"; path: string } | { kind: "shell"; command: string };
 
 const PATH_EXISTS_SEG_RE = /^\s*(?:path|file)\s+exists:\s*(.+?)\s*$/i;
@@ -1184,6 +1193,26 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 			detail: r.cmdErr ? `probe command error (not artifact failure, → human review): ${r.detail}` : r.detail,
 		};
 	});
+
+const CHECK_LINT_TIMEOUT_MS = 10_000; // lint ตอน commit ต้องเร็ว — cap แข็งที่ PROBE_TIMEOUT_MS (30s)
+
+/** deterministic commit-time check lint (W: กัน probe คำสั่งเสียหลุดไปถึง eval แล้วลูปแก้ spec):
+ *  รันแต่ละ check ครั้งเดียวผ่าน runCheckProbes ตรงๆ (cwd=repo root, timeout สั้น) → lint เห็นเหมือนที่ eval จะเห็นเป๊ะ
+ *  classify: skipped เท่านั้นที่เป็น spec-side broken (placeholder / คำสั่งไม่ machine-runnable / cmdErr 126-127-
+ *  usage-syntax — ตัดสิน artifact ไม่ได้เลย ต้อง fix the check) → คืน broken ids + notes บอกสาเหตุ;
+ *  pass/fail = artifact-side (รวม fail เพราะของยังไม่ implement และ timeout จากคำสั่งช้า) → ไม่เตือน เพราะปกติก่อนเซ็น
+ *  ไม่เปลี่ยน semantics ของ runCheckProbes/probe primacy — เป็นเพียงชั้นเตือนตอน spec ก่อนเซ็น */
+export const lintSpecChecks = (cwd: string, criteria: Criterion[], timeoutMs = CHECK_LINT_TIMEOUT_MS): { broken: string[]; notes: string[] } => {
+	const results = runCheckProbes(cwd, criteria, Math.min(timeoutMs, PROBE_TIMEOUT_MS));
+	const broken: string[] = [];
+	const notes: string[] = [];
+	for (const r of results) {
+		if (r.status !== "skipped") continue;
+		broken.push(r.id);
+		notes.push(`check-lint: ${r.id} ใช้ check ที่ probe รันไม่ได้ (${r.detail.slice(0, 120)}) — ต้องแก้ check ใน spec ให้รันได้จริง (fix the check, not the artifact) หรือย้ายไป specDebt`);
+	}
+	return { broken, notes };
+};
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -2614,8 +2643,22 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		fields: { title?: string; intent?: string; approach?: string[]; scope?: string[]; constraints?: string[]; criteria?: Criterion[]; specDebt?: string[] },
 		source: "set" | "compile",
-	): Promise<{ version: number; signed: boolean; mdPath: string; changes?: string[] }> => {
+	): Promise<{ version: number; signed: boolean; mdPath: string; changes?: string[]; lint?: string[] }> => {
 		const version = (state.spec?.version ?? 0) + 1;
+		// deterministic commit-time check lint (chooser เดียวของทั้ง action=set และ compile_spec):
+		// check เสียฝั่ง spec (คำสั่งพัง/placeholder/ไม่ runnable) ต้องไม่หลุดไปถึง eval (probe-primacy ลูป)
+		// → บังคับลง specDebt ให้มนุษย์เห็นตอนเซ็น; artifact-fail (คำสั่งดีแต่ของยังไม่ implement) = ปกติ → เงียบ
+		let lintNotes: string[] = [];
+		if (fields.criteria?.length) {
+			const lint = lintSpecChecks(ctx.cwd, fields.criteria);
+			if (lint.broken.length) {
+				const existing = fields.specDebt ?? [];
+				// dedupe กับ applyQualityGate ที่ลง debt ให้ id เดียวกันไปแล้ว (placeholder/manual-check)
+				const covered = (id: string): boolean => existing.some((d) => d.startsWith("quality-gate:") && d.includes(id));
+				lintNotes = lint.notes.filter((_, i) => !covered(lint.broken[i]));
+				fields = { ...fields, specDebt: [...existing, ...lintNotes] };
+			}
+		}
 		// resolve prev spec ก่อนหน้าก่อน overwrite — state ใน session ถ้ามี; reload/resume แล้ว state หาย
 		// → fallback อ่าน .zense/spec.json (latest copy ตอนนี้ยังเป็น version เก่า) แบบ best-effort
 		let prevSpec: Spec | undefined = state.spec;
@@ -2692,7 +2735,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		persist();
 		updateWidget(ctx);
-		return { version, signed, mdPath, ...(state.spec.changesFrom?.length ? { changes: state.spec.changesFrom } : {}) };
+		return { version, signed, mdPath, ...(state.spec.changesFrom?.length ? { changes: state.spec.changesFrom } : {}), ...(lintNotes.length ? { lint: lintNotes } : {}) };
 	};
 
 	/** suffix ของ tool result ของ zense_spec: re-spec (v>=2) ต้องแนบ change summary ให้ agent/มนุษย์เห็นใน
@@ -2726,7 +2769,7 @@ export default function (pi: ExtensionAPI) {
 					Type.Object({
 						id: Type.String(),
 						text: Type.String(),
-						check: Type.String({ description: "How eval verifies it: bash probe, path exists, manual" }),
+						check: Type.String({ description: CHECK_FORMAT_CONTRACT }),
 					}),
 				),
 			),
@@ -2835,25 +2878,26 @@ export default function (pi: ExtensionAPI) {
 					// B: parse ผ่าน → commit + เด้ง sign dialog ในขั้นตอนเดียว (ตัด round-trip action=set)
 					const r = await commitSpec(ctx, gated.draft, "compile");
 					// H: telemetry สรุป 1 บรรทัดต่อ compile — loop เรียนรู้เองได้ว่าช้าไหม/ถามกี่รอบ/gate เจออะไร
-					learn(ctx, `spec-compile: v${r.version} launches=${launches} clarify=${clarifyRounds} gate=[${gated.notes.join(",")}] ${Date.now() - t0}ms signed=${r.signed}`);
+					learn(ctx, `spec-compile: v${r.version} launches=${launches} clarify=${clarifyRounds} gate=[${gated.notes.join(",")}] check-lint=${r.lint?.length ?? 0} ${Date.now() - t0}ms signed=${r.signed}`);
 					const verb = r.signed
 						? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
 						: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 					return {
-						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}` + changesText(r) + preSpecNote }],
-						details: { version: r.version, approved: r.signed, clarifyRounds, qualityGate: gated.notes, logPath: draft.logPath },
+						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}${r.lint?.length ? ` check-lint: ${r.lint.length} check(s) probe รันไม่ได้ — แก้ check แล้ว re-spec (รายละเอียดใน specDebt).` : ""}` + changesText(r) + preSpecNote }],
+						details: { version: r.version, approved: r.signed, clarifyRounds, qualityGate: gated.notes, logPath: draft.logPath, ...(r.lint?.length ? { checkLint: r.lint } : {}) },
 					};
 				}
 				return { content: [{ type: "text", text: `compile_spec ใช้ครบ ${launches} launches แล้วยังได้แต่ clarify/error — ระบุ intent ให้ชัดขึ้นแล้วเรียกใหม่` }], details: {}, isError: true };
 			}
 			// action=set: agent เขียน spec เองแล้ว commit — commitSpec เดียวกับ compile (B) → behavior เหมือนกันเป๊ะ
 			const r = await commitSpec(ctx, params, "set");
+			if (r.lint?.length) learn(ctx, `spec-set: v${r.version} check-lint → ${r.lint.length} broken check(s) ลง specDebt`);
 			const verb = r.signed
 				? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
 				: "NOT approved — เซ็นทีหลังด้วย /zense approve";
 			return {
-				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.` + changesText(r) }],
-				details: { version: r.version, approved: r.signed },
+				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${r.lint?.length ? ` check-lint: ${r.lint.length} check(s) probe รันไม่ได้ — แก้ check แล้ว re-spec (รายละเอียดใน specDebt).` : ""}` + changesText(r) }],
+				details: { version: r.version, approved: r.signed, ...(r.lint?.length ? { checkLint: r.lint } : {}) },
 			};
 		},
 	});

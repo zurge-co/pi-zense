@@ -695,6 +695,8 @@ export const applyQualityGate = (cwd: string, draft: SpecDraft): { draft: SpecDr
 // และไม่โดน agent_end heuristics ของ main agent → ปล่อย write ไว้ = grader แก้ test ให้ผ่านเองได้เงียบๆ)
 export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
 	requirements: ["write", "edit"],
+	// planner ต้อง explore repo เบาๆ/คิดแผน ไม่ใช่แก้โค้ด — read-only เท่า requirements
+	planner: ["write", "edit"],
 	grader: ["write", "edit"],
 	reviewer: ["write", "edit"],
 	// distiller อ่าน memory.jsonl ไฟล์เดียวแล้วคืน JSON — ไม่ต้องเขียน/รันคำสั่งเลย (harness เป็นคนเขียนทับเองหลัง validate)
@@ -709,6 +711,8 @@ export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
  *  sub-agent ด้วย PI_ZENSE_SUBAGENT=1 อยู่แล้ว — ปิดเฉพาะ extension อื่นของผู้ใช้ ไม่ทำ zense หลุด */
 export const SUBAGENT_STRIP_FLAGS: Record<string, string[]> = {
 	requirements: ["--no-themes", "--no-prompt-templates"],
+	// planner เหมือน requirements: อาจต้อง context จาก skills/extensions ของ repo ระหว่างแตก subtasks
+	planner: ["--no-themes", "--no-prompt-templates"],
 	grader: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
 	reviewer: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
 	distiller: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
@@ -722,6 +726,8 @@ export const SUBAGENT_STRIP_FLAGS: Record<string, string[]> = {
  *  (ส่ง cwd ก่อนแล้ว fallbackCwd: worktree ไม่มี .zense ของตัวเองเพราะ gitignored → fallback ไป main repo) */
 export const SUBAGENT_TIMEOUT_MS: Record<string, number> = {
 	requirements: 600_000,
+	// planner แค่อ่าน intent + ดู layout คร่าวๆ แล้วแตก subtasks — เบากว่า requirements มาก
+	planner: 300_000,
 	grader: 600_000,
 	reviewer: 480_000,
 	distiller: 300_000,
@@ -918,6 +924,145 @@ Rules:
 		? `\n\nPast lessons from this project's memory (reflect relevant ones in scope/constraints/criteria when they apply):\n${lessons.join("\n")}`
 		: "") +
 	`\n\nRequest: ${intent}`;
+
+// ----------------------------------------------------------------------------- decompose-then-compile (module scope — export เพื่อ unit-test ได้)
+
+/** subtask หนึ่งตัวจาก planner — id ต้อง unique ภายใน plan; intent ต้อง self-contained
+ *  (requirements sub-agent ของรอบนั้นจะเห็นแค่ intent นี้ ไม่เห็น intent เดิม ไม่เห็น subtask อื่น) */
+export interface PlannerSubtask { id: string; title: string; intent: string; scope?: string }
+
+/** threshold เชิง deterministic ของการแตกงาน: นับทั้งจำนวนคำ (ภาษาที่เว้นวรรค) และความยาวตัวอักษร
+ *  (ภาษาไทย/จีนไม่เว้นวรรค — นับคำอย่างเดียวจะไม่เคยถึง threshold ทั้งที่ intent ใหญ่จริง)
+ *  ค่าเป็น heuristic ที่ปรับคุณภาพได้ทีหลัง — ต้องการแค่ deterministic เพื่อ test assert boundary ได้ */
+export const DECOMPOSE_MAX_WORDS = 100;
+export const DECOMPOSE_MAX_CHARS = 800;
+export const wordCount = (s: string): number => s.trim().split(/\s+/).filter(Boolean).length;
+export const needsDecompose = (intent: string): boolean =>
+	wordCount(intent) > DECOMPOSE_MAX_WORDS || intent.trim().length > DECOMPOSE_MAX_CHARS;
+
+/** prompt ของ planner sub-agent — หน้าที่เดียวคือแตก intent ใหญ่เป็น subtasks (JSON เดียว);
+ *  ไม่ explore ลึก (งบเวลาให้ requirements ของแต่ละ subtask ไปใช้เอง) และไม่ draft spec */
+export const buildPlannerPrompt = (intent: string, timeoutMs = 300_000): string =>
+	`You are the PLANNER sub-agent for a spec-gated SDLC harness. The task below is too large to hand to a single requirements agent (it would exceed its time budget), so your ONLY job is to decompose it into subtasks. You do NOT draft the spec yourself — a separate requirements agent will handle each subtask, seeing ONLY that subtask's "intent" text (never this message, never the other subtasks).
+
+` +
+	`Output exactly ONE JSON object — no markdown fences, no commentary:
+{"subtasks": [{"id": "t1", "title": "short title", "intent": "self-contained description — repeat any shared context the requirements agent will need", "scope": "optional path prefix this subtask may touch"}]}
+` +
+	`Rules:
+- 2 to 8 subtasks. If the task does not split naturally, split by layer instead (core logic vs wiring vs tests/docs).
+- Execution is SEQUENTIAL in your array order — earlier subtasks must never depend on later ones.
+- Each "intent" must stand alone; never write "same as above" or reference other subtasks by name.
+- ids must be unique, short, stable (t1, t2, …).
+- You run under a HARD wall-clock limit of about ${Math.max(1, Math.round(timeoutMs / 60_000))} minutes and you are READ-ONLY — you may skim README/package layout briefly to ground the split, but do not run test suites and do not modify anything.
+
+Task: ${intent}`;
+
+/** parse + validate output ของ planner: JSON object เดียวที่มี subtasks 2–8 ตัว [{id,title,intent,scope?}],
+ *  id ห้ามซ้ำ — throw Error ข้อความเจาะจง (ใช้เป็น feedback ใน log/fallback) แทนที่จะคืน plan ครึ่งๆ */
+export const parsePlannerSubtasks = (text: string): PlannerSubtask[] => {
+	const raw = extractJsonObject(text);
+	if (raw === undefined || typeof raw !== "object" || raw === null || Array.isArray(raw))
+		throw new Error("planner output ไม่ใช่ JSON object (หา JSON ที่ parse ได้ไม่เจอ — สั่ง output ONLY JSON ไว้)");
+	const o = (raw as Record<string, unknown>).subtasks;
+	if (!Array.isArray(o) || o.length < 2 || o.length > 8)
+		throw new Error(`planner output: subtasks ต้องเป็น array 2–8 ตัว (ได้ ${Array.isArray(o) ? o.length : "non-array"})`);
+	const seen = new Set<string>();
+	const out: PlannerSubtask[] = [];
+	for (let i = 0; i < o.length; i++) {
+		const s = o[i] as Record<string, unknown> | null;
+		if (!s || typeof s !== "object") throw new Error(`planner output: subtasks[${i}] ไม่ใช่ object`);
+		const id = typeof s.id === "string" ? s.id.trim() : "";
+		const title = typeof s.title === "string" ? s.title.trim() : "";
+		const intent = typeof s.intent === "string" ? s.intent.trim() : "";
+		if (!id) throw new Error(`planner output: subtasks[${i}].id ว่างหรือไม่ใช่ string`);
+		if (seen.has(id)) throw new Error(`planner output: subtask id "${id}" ซ้ำ`);
+		if (!title) throw new Error(`planner output: subtasks[${i}].title ว่าง`);
+		if (!intent) throw new Error(`planner output: subtasks[${i}].intent ว่าง — requirements agent เห็นแค่ field นี้ ห้ามว่าง`);
+		seen.add(id);
+		const scope = typeof s.scope === "string" && s.scope.trim() ? s.scope.trim() : undefined;
+		out.push({ id, title, intent, ...(scope ? { scope } : {}) });
+	}
+	return out;
+};
+
+/** รวม draft spec ของทุก subtask เป็น SpecDraft เดียว: criteria ต่อกันแล้ว re-id เป็น c1..cN
+ *  (กัน id ชนระหว่าง subtask — ทุก sub-agent draft id ของตัวเองจาก c1), scope/constraints/specDebt
+ *  dedupe, approach ติด prefix [subtask] ให้คนเซ็นเห็นว่าแต่ละ bullet มาจาก subtask ไหน */
+export const mergeSubtaskDrafts = (title: string, intent: string, drafts: { subtask: string; draft: SpecDraft }[]): SpecDraft => ({
+	title,
+	intent,
+	approach: drafts.flatMap((d) => d.draft.approach.map((a) => `[${d.subtask}] ${a}`)),
+	scope: [...new Set(drafts.flatMap((d) => d.draft.scope))],
+	constraints: [...new Set(drafts.flatMap((d) => d.draft.constraints))],
+	criteria: drafts.flatMap((d) => d.draft.criteria).map((c, i) => ({ ...c, id: `c${i + 1}` })),
+	specDebt: [...new Set(drafts.flatMap((d) => d.draft.specDebt))],
+});
+
+/** orchestration decompose-then-compile แบบ pure: runTask เป็น injected dependency (prod = launchSubagent,
+ *  test = fake) → unit-test ครอบ flow ทั้งหมดโดยไม่ spawn pi. ล้มตรงไหน throw ทันที (ห้ามเสนอ spec ครึ่งๆ):
+ *  planner fail/ผิดรูป, subtask fail, draft parse ไม่ผ่าน หรือ sub-agent ดันถาม clarify (decompose path
+ *  ไม่รองรับ clarify ต่อ subtask — caller เป็นคน fallback ไป single compile) */
+export const compileDecomposed = async (
+	intent: string,
+	runTask: (role: "planner" | "requirements", task: string) => Promise<{ ok: boolean; output: string }>,
+	mkRequirementsPrompt: (subtask: PlannerSubtask) => string,
+	plannerTimeoutMs = 300_000,
+): Promise<{ subtasks: PlannerSubtask[]; drafts: { subtask: string; draft: SpecDraft }[] }> => {
+	const plan = await runTask("planner", buildPlannerPrompt(intent, plannerTimeoutMs));
+	if (!plan.ok) throw new Error(`planner sub-agent failed: ${plan.output.split("\n")[0].slice(0, 200)}`);
+	const subtasks = parsePlannerSubtasks(plan.output);
+	const drafts: { subtask: string; draft: SpecDraft }[] = [];
+	for (const st of subtasks) { // sequential-only: ห้าม parallel (rate-limit + งบเวลารวม)
+		const r = await runTask("requirements", mkRequirementsPrompt(st));
+		if (!r.ok) throw new Error(`requirements sub-agent failed on subtask ${st.id} ("${st.title}"): ${r.output.split("\n")[0].slice(0, 200)}`);
+		const parsed = parseSpecDraft(r.output);
+		if (parsed.kind === "clarify")
+			throw new Error(`subtask ${st.id}: requirements ขอ clarify (${parsed.questions.length} ข้อ) — decompose path ไม่รองรับ clarify ต่อ subtask; caller fallback ไป single compile`);
+		if (parsed.kind === "error")
+			throw new Error(`subtask ${st.id}: draft invalid — ${parsed.error}`);
+		drafts.push({ subtask: st.id, draft: parsed.draft });
+	}
+	return { subtasks, drafts };
+};
+
+// ----------------------------------------------------------------------------- esc-guard (module scope — export เพื่อ unit-test ได้)
+
+/** B (ESC): global input guard สำหรับ dialog ของ zense — pi ส่ง key ให้แค่ focused component;
+ *  ถ้า focus หลุดจาก overlay (เช่นตอน agent streaming) ESC จะไปตกที่ main editor → onEscape
+ *  abort คำตอบของ agent แทนที่จะปิด dialog. guard นี้นั่งอยู่ระดับ terminal input (ก่อนถึง component
+ *  ทุกตัว) ผ่าน ctx.ui.onTerminalInput: ทุก dialog ของ zense register ตัวเองเข้า stack ตอนเปิด/ถอดตอนปิด
+ *  — ขณะ stack ไม่ว่าง ESC ถูก consume + ปิด dialog บนสุดด้วย semantics เดิม (done(null)), key อื่นผ่านปกติ;
+ *  เมื่อไม่มี dialog เปิด guard คืน undefined เสมอ (ไม่แตะ key ใดๆ ของระบบ) */
+export type EscGuardHandler = (data: string) => { consume?: boolean } | undefined;
+export interface EscGuardHandle { close: () => void }
+export const createEscGuard = (): { open: (close: () => void) => EscGuardHandle; handleInput: EscGuardHandler; reset: () => void; depth: () => number } => {
+	const stack: Array<() => void> = [];
+	return {
+		open: (close) => {
+			stack.push(close);
+			let alive = true;
+			return {
+				close: () => {
+					if (!alive) return;
+					alive = false;
+					const i = stack.lastIndexOf(close);
+					if (i >= 0) stack.splice(i, 1);
+				},
+			};
+		},
+		handleInput: (data) => {
+			if (!stack.length) return undefined; // ไม่มี dialog เปิด → ห้าม consume อะไรเลย
+			if (data === "\x1b" || matchesKey(data, Key.escape)) {
+				stack[stack.length - 1](); // ปิดบนสุด — dialog ถอดตัวเองออกจาก stack ผ่าน handle.close()
+				return { consume: true };  // key ไม่ถึง component ไหนอีก รวมถึง main editor (abort ไม่เกิด)
+			}
+			return undefined; // key อื่นผ่านให้ component ที่ focused จัดการเหมือนเดิมทุกประการ
+		},
+		reset: () => { stack.length = 0; }, // session ใหม่: overlay เก่าถูก pi pop ไปแล้ว — ล้าง entry ค้าง
+		depth: () => stack.length,
+	};
+};
 
 // ----------------------------------------------------------------------------- eval/review evidence helpers (module scope — export เพื่อ unit-test ได้)
 
@@ -2006,6 +2151,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_ev, ctx) => {
 		ensureFullscreenDefault(ctx);
+		// ESC guard: (re-)register ทุก session_start — pi ล้าง extension input listeners ตอน session
+		// invalidate/reload (resetExtensionUI) ทำให้ listener เก่าหาย; unsubscribe ref เดิมก่อนเป็น no-op
+		// ที่ปลอดภัย (pi-tui เก็บ listeners เป็น Set + หัว function เดิม → ไม่ซ้ำ/ไม่พัง)
+		escGuard.reset(); // overlay ของ session ก่อนถูก pi pop ทิ้งไปแล้ว — อย่าให้ entry ค้างกิน ESC ของ session ใหม่
+		if (ctx.mode === "tui") {
+			escGuardUnsubscribe?.();
+			escGuardUnsubscribe = ctx.ui.onTerminalInput(escGuard.handleInput);
+		}
 		for (const e of ctx.sessionManager.getEntries())
 			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
@@ -2257,6 +2410,38 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	};
 
+	// ----- ESC guard: instance เดียวต่อ extension — dialog ทุกตัวของ zense เปิด/ปิดผ่าน zenseCustom ข้างล่าง
+
+	const escGuard = createEscGuard();
+	let escGuardUnsubscribe: (() => void) | undefined;
+
+	/** ครอบ ctx.ui.custom ของ dialog ทุกตัวใน harness — track เปิด/ปิดเข้า escGuard เพื่อให้ ESC ขณะ dialog
+	 *  เปิดอยู่ถูก consume โดย guard (ซึ่งสั่งปิด dialog บนสุด = ตัวนี้) แทนที่จะรั่วไปชน defaultEditor.onEscape
+	 *  ของ pi (abort streaming) ในกรณี focus หลุดจาก overlay; dialog ไม่ต้องเปลี่ยน handleInput เดิมของตัวเอง —
+	 *  เมื่อ focus อยู่ที่ dialog จริง ESC ก็เข้า guard ก่อนอยู่ดี (input listener ทำงานก่อน component routing) */
+	const zenseCustom = <T>(
+		ctx: ExtensionContext,
+		options: unknown, // pi เก็บ options เป็น overlay/non-overlay 2 shapes — cast ผ่านเข้าไปตรงๆ
+		factory: (tui: any, theme: any, kb: any, done: (v: T) => void) => any,
+	): Promise<T> =>
+		ctx.ui.custom<T>((tui, theme, kb, done) => {
+			let closed = false;
+			// ปิดด้วย null semantics = cancel เหมือน ESC เดิมของทุก dialog (callsite ทุกตัวรับ T ที่มี null อยู่แล้ว)
+			const trackedDone = (v: T) => {
+				if (closed) return; // กัน done ซ้ำ (เช่น factory throw หลัง resolve แล้ว)
+				closed = true;
+				handle.close();
+				done(v);
+			};
+			const handle = escGuard.open(() => trackedDone(null as T));
+			try {
+				return factory(tui, theme, kb, trackedDone);
+			} catch (e) {
+				trackedDone(null as T); // factory พังก่อนคืน component — ถอด guard entry ไม่ให้ค้าง
+				throw e;
+			}
+		}, options as never);
+
 	// ----- spec presentation: dialog ต้องโชว์ spec เต็มๆ ให้อ่านก่อนตัดสินใจเซ็น
 	// (ScrollView ของ pi-tui ต้องการ layout integration เลย scroll เองด้วย offset + slice)
 
@@ -2282,7 +2467,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const specSignDialog = (ctx: ExtensionContext, spec: Spec, question: string, items: SelectItem[]): Promise<string | null> =>
-		ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		zenseCustom<string | null>(ctx, OVERLAY_LG, (tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 			const title = new Text(theme.fg("accent", theme.bold(`🔏 ${question}`)), 1, 0);
 			const hint = new Text(
@@ -2365,12 +2550,12 @@ export default function (pi: ExtensionAPI) {
 					tui.requestRender();
 				},
 			};
-		}, OVERLAY_LG);
+		});
 
 	/** ext-config: checkbox dialog เลือก extensions ที่ sub-agent จะโหลด — default all-ticked (user tick ออก)
 	 *  คืน array ของ path ที่ tick ไว้ = จะโหลด (includes) หรือ null เมื่อ cancel; ไม่ใช้ SelectList เพราะเป็น single-select */
 	const extConfigDialog = (ctx: ExtensionContext, role: string, items: { path: string; label: string; checked: boolean }[]): Promise<string[] | null> =>
-		ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
+		zenseCustom<string[] | null>(ctx, OVERLAY_MD, (tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 			let cursor = 0;
 			const checked = items.map((i) => i.checked);
@@ -2412,12 +2597,12 @@ export default function (pi: ExtensionAPI) {
 					tui.requestRender();
 				},
 			};
-		}, OVERLAY_MD);
+		});
 
 	// ----- picker กลางของ zense: title + search filter + SelectList (ใช้ซ้ำได้ทั้งเลือก role/model)
 
 	const zensePick = (ctx: ExtensionContext, title: string, items: SelectItem[], hint = ""): Promise<string | null> =>
-		ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		zenseCustom<string | null>(ctx, OVERLAY_MD, (tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 			const selectList = new SelectList(items, Math.min(items.length, 12), {
 				selectedPrefix: (t) => theme.fg("accent", t),
@@ -2456,7 +2641,7 @@ export default function (pi: ExtensionAPI) {
 					tui.requestRender();
 				},
 			};
-		}, OVERLAY_MD);
+		});
 
 	// ----- คำถาม clarify ของ requirements: มี choices → picker (เลือกจากตัวเลือก หรือ "อื่นๆ (พิมพ์เอง)"), ไม่มี → input ตรง
 
@@ -2477,7 +2662,7 @@ export default function (pi: ExtensionAPI) {
 	// ----- live sub-agent observability: ดู output สดระหว่างรัน (กันลังเลว่าค้างหรือเปล่า)
 
 	const tailViewer = (ctx: ExtensionContext, run: SubagentRun): Promise<null> =>
-		ctx.ui.custom<null>((tui, theme, _kb, done) => {
+		zenseCustom<null>(ctx, OVERLAY_XL, (tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 			const tick = setInterval(() => tui.requestRender(), 1_000); // auto-refresh ทุก 1s
 			// wrap log เต็มไฟล์ด้วย wrapTextWithAnsi (รักษา ANSI) แทน truncate — บรรทัดยาวอ่านครบ ไม่โดนตัดเป็น "…"
@@ -2541,7 +2726,7 @@ export default function (pi: ExtensionAPI) {
 				},
 				dispose: () => clearInterval(tick),
 			};
-		}, OVERLAY_XL);
+		});
 
 	const runLabel = (r: SubagentRun) =>
 		`${r.status === "running" ? "▶" : r.ok ? "✅" : "❌"} ${r.role} @ ${new Date(r.startedAt ?? r.at).toLocaleTimeString()}`;
@@ -2560,7 +2745,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			return;
 		}
-		const picked = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		const picked = await zenseCustom<string | null>(ctx, OVERLAY_MD, (tui, theme, _kb, done) => {
 			const container = new Container();
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 			container.addChild(new Text(theme.fg("accent", theme.bold("🧪 Zense sub-agent runs (เลือกเพื่อดู live tail)")), 1, 0));
@@ -2593,7 +2778,7 @@ export default function (pi: ExtensionAPI) {
 					tui.requestRender();
 				},
 			};
-		}, OVERLAY_MD);
+		});
 		const runIdx = picked == null ? -1 : Number(picked);
 		if (runIdx < 0 || !state.subagentRuns[runIdx]) return;
 		await tailViewer(ctx, state.subagentRuns[runIdx]);
@@ -3538,7 +3723,7 @@ export default function (pi: ExtensionAPI) {
 				const cfgPath = join(zenseDir(ctx.cwd), "models.json");
 				const cfg = readModelsConfig(ctx.cwd);
 				const mainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no active model)";
-				const roles = ["requirements", "grader", "reviewer", "distiller"];
+				const roles = ["requirements", "planner", "grader", "reviewer", "distiller"];
 				if (ctx.mode !== "tui") {
 					// non-TUI (rpc/print): แสดง summary ให้แก้เองเหมือนเดิม
 					const lines = [
@@ -3590,7 +3775,7 @@ export default function (pi: ExtensionAPI) {
 			} else if (sub === "ext-config-show" || sub === "ext-config") {
 				// ext-config-show (ชื่อใหม่; ext-config เดิมรับเป็น alias): ไม่มี role → view รวมทุก role;
 				// มี role → เดลิเกต runExtConfig (ทางหลัก = per-role commands /zense:ext-config:<role>)
-				const roles = ["requirements", "grader", "reviewer", "distiller"];
+				const roles = ["requirements", "planner", "grader", "reviewer", "distiller"];
 				const [role, action, ...vals] = rest;
 				if (!role || !roles.includes(role)) {
 					ctx.ui.notify(
@@ -3616,7 +3801,7 @@ export default function (pi: ExtensionAPI) {
 
 	// per-role ext-config commands (v8): autocomplete จากชื่อ command ตรงๆ ไม่ต้องพิมพ์ role เป็น arg
 	// (pi getArgumentCompletions ส่งแค่ prefix คำปัจจุบัน แยกตำแหน่งไม่ได้ — pattern เดียวกับ skill commands)
-	for (const role of ["requirements", "grader", "reviewer", "distiller"] as const)
+	for (const role of ["requirements", "planner", "grader", "reviewer", "distiller"] as const)
 		pi.registerCommand(`zense:ext-config:${role}`, {
 			description: `sub-agent "${role}" จะโหลด extensions ตัวไหนบ้าง (default boot เปลือย — tick เพิ่ม opt-in; save ลง local .zense + seed global ครั้งแรก)`,
 			handler: async (_args, ctx) => runExtConfig(ctx as ExtensionContext, role),

@@ -16,7 +16,7 @@
   "scripts": {
     "release": "bash scripts/release.sh",
     "typecheck": "tsc --noEmit --skipLibCheck extensions/zense-harness/index.ts",
-    "test": "node --no-warnings --test test/index.test.mjs test/adr-deny.test.mjs test/worktree.test.mjs test/spec-draft.test.mjs test/eval-review.test.mjs test/fullscreen-default.test.mjs test/subagent-timeout.test.mjs test/reviewer-grounding.test.mjs test/spec-changes.test.mjs test/ext-config.test.mjs test/prespec-dirty.test.mjs test/distill.test.mjs"
+    "test": "node --no-warnings --test test/index.test.mjs test/adr-deny.test.mjs test/worktree.test.mjs test/spec-draft.test.mjs test/eval-review.test.mjs test/fullscreen-default.test.mjs test/subagent-timeout.test.mjs test/reviewer-grounding.test.mjs test/spec-changes.test.mjs test/ext-config.test.mjs test/prespec-dirty.test.mjs test/distill.test.mjs test/esc-guard.test.mjs test/decompose.test.mjs"
   },
   "repository": {
     "type": "git",

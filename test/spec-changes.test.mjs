@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
-import { buildSpecChanges, renderSpecMd } from "../extensions/zense-harness/index.ts";
+import { buildSpecChanges, groupSpecChanges, renderSpecMd } from "../extensions/zense-harness/index.ts";
 
 const baseSpec = (over = {}) => ({
 	version: 1,
@@ -88,7 +88,11 @@ test("renderSpecMd: มี Changes section ก็ต่อเมื่อ spec �
 	const withChanges = baseSpec({ version: 10, changesFrom: changes });
 	const md = renderSpecMd(withChanges);
 	assert.ok(md.includes("## Changes in v10 (vs v9)"));
-	assert.ok(md.includes("- scope +: src/session"));
+	// จัดกลุ่มเป็น sub-heading + numbered list (ไม่ใช่ flat bullet แบบเดิม)
+	assert.ok(md.includes("### Scope\n1. scope +: src/session"));
+	assert.ok(!md.includes("- scope +: src/session"));
+	// บรรทัดเตือน ⚠️ แสดง verbatim ไม่มี heading
+	assert.ok(md.includes("⚠️ ไม่มีการเปลี่ยนแปลงจาก v9"));
 	// section changes ต้องอยู่ก่อน Intent — ผู้เซ็นเห็น change ก่อนอ่านเนื้อเต็ม
 	assert.ok(md.indexOf("## Changes in v10") < md.indexOf("## Intent"));
 
@@ -97,4 +101,50 @@ test("renderSpecMd: มี Changes section ก็ต่อเมื่อ spec �
 	assert.ok(!renderSpecMd(old).includes("## Changes"));
 	const empty = baseSpec({ version: 10, changesFrom: [] });
 	assert.ok(!renderSpecMd(empty).includes("## Changes"));
+});
+
+test("groupSpecChanges: จัดกลุ่มตามหมวดด้วยลำดับคงที่ + numbering เริ่ม 1 ใหม่ทุกหมวด + marker +/−/~ ครบ", () => {
+	const lines = buildSpecChanges(
+		baseSpec({ version: 1 }),
+		baseSpec({
+			version: 2,
+			title: "New title",
+			intent: "new intent",
+			approach: ["read auth code", "patch guard", "add regression test"],
+			scope: ["src/auth", "src/session"],
+			constraints: [],
+			criteria: [
+				{ id: "c1", text: "login test passes", check: "npm test" },
+				{ id: "c2", text: "guard renders", check: "path exists: src/auth/guard.tsx" },
+				{ id: "c3", text: "session persists", check: "npx vitest run" },
+			],
+			specDebt: [],
+		}),
+	);
+	const md = groupSpecChanges(lines);
+	// ลำดับหมวดคงที่: Title & intent → Approach → Scope → Constraints → Criteria → Spec debt
+	const order = ["### Title & intent", "### Approach", "### Scope", "### Constraints", "### Criteria", "### Spec debt"]
+		.filter((h) => md.includes(h))
+		.map((h) => md.indexOf(h));
+	assert.deepEqual([...order].sort((a, b) => a - b), order);
+	// แต่ละหมวดเป็น numbered list นับ 1 ใหม่ + item verbatim (คง marker +/−/~)
+	assert.ok(md.includes("### Approach\n1. approach +: add regression test"));
+	assert.ok(md.includes("1. scope +: src/session"));
+	assert.ok(md.includes("1. constraints −: no new deps"));
+	assert.ok(md.includes('1. specDebt −: verify UX by eye'));
+	assert.ok(md.includes("1. criteria ~: c2"));
+	assert.ok(md.includes("2. criteria +: c3: session persists (check: npx vitest run)"));
+	// title change อยู่ในหมวด Title & intent
+	assert.ok(md.includes('### Title & intent\n1. title: "Fix login redirect" → "New title"\n2. intent:'));
+});
+
+test("groupSpecChanges: บรรทัด ⚠️ identical แสดง verbatim ไม่มี heading", () => {
+	const md = groupSpecChanges(["⚠️ ไม่มีการเปลี่ยนแปลงจาก v3 — spec ใหม่เหมือน version ก่อนทุกประการ"]);
+	assert.equal(md, "⚠️ ไม่มีการเปลี่ยนแปลงจาก v3 — spec ใหม่เหมือน version ก่อนทุกประการ");
+});
+
+test("groupSpecChanges: บรรทัดที่จับกลุ่มไม่ได้ลง ### Other ท้ายสุด (ห้ามทิ้ง change)", () => {
+	const md = groupSpecChanges(["approach +: x", "ไม่รู้จักบรรทัดนี้"]);
+	assert.ok(md.indexOf("### Approach") < md.indexOf("### Other"));
+	assert.ok(md.includes("### Other\n1. ไม่รู้จักบรรทัดนี้"));
 });

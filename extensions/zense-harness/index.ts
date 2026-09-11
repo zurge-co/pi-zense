@@ -137,13 +137,56 @@ export const buildSpecChanges = (prev: Spec, next: Spec): string[] => {
 		: [`⚠️ ไม่มีการเปลี่ยนแปลงจาก v${prev.version} — spec ใหม่เหมือน version ก่อนทุกประการ`];
 };
 
+/**
+ * จัดกลุ่มบรรทัด changesFrom (flat ที่ buildSpecChanges ผลิต) เป็นหมวดอ่านง่ายสำหรับ render
+ *  — parse จาก prefix บรรทัดเดิมเท่านั้น (ไม่แตะ format ที่ persist) → หมวดละ `### <ชื่อ>` +
+ *  ordered list นับ 1 ใหม่ทุกหมวด, item = บรรทัดเดิม verbatim (คง +/−/~).
+ *  ลำดับหมวดคงที่ตาม CHANGE_GROUPS; หมวดที่ไม่มี change ไม่แสดง; บรรทัดเตือน ⚠️
+ *  (identical spec) แสดง verbatim ไม่มี heading; บรรทัดที่จับกลุ่มไม่ได้ลง `### Other` ท้ายสุด */
+export const CHANGE_GROUPS: ReadonlyArray<[string, (line: string) => boolean]> = [
+	["Title & intent", (l) => l.startsWith("title:") || l.startsWith("intent:")],
+	["Approach", (l) => l.startsWith("approach ")],
+	["Scope", (l) => l.startsWith("scope ")],
+	["Constraints", (l) => l.startsWith("constraints ")],
+	["Criteria", (l) => l.startsWith("criteria ")],
+	["Spec debt", (l) => l.startsWith("specDebt ")],
+];
+
+export const groupSpecChanges = (lines: string[]): string => {
+	const buckets = new Map<string, string[]>();
+	const warns: string[] = [];
+	const other: string[] = [];
+	for (const line of lines) {
+		if (line.startsWith("⚠️")) {
+			warns.push(line);
+			continue;
+		}
+		const group = CHANGE_GROUPS.find(([, match]) => match(line));
+		if (group) {
+			const bucket = buckets.get(group[0]) ?? [];
+			bucket.push(line);
+			buckets.set(group[0], bucket);
+		} else other.push(line);
+	}
+	const numbered = (items: string[]) => items.map((x, i) => `${i + 1}. ${x}`).join("\n");
+	const parts: string[] = [];
+	if (warns.length) parts.push(warns.join("\n"));
+	for (const [heading] of CHANGE_GROUPS) {
+		const items = buckets.get(heading);
+		if (items?.length) parts.push(`### ${heading}\n${numbered(items)}`);
+	}
+	if (other.length) parts.push(`### Other\n${numbered(other)}`);
+	return parts.join("\n\n");
+};
+
 /** render spec เป็น markdown — ใช้ทั้ง archive .md และ sign dialog (dialog เรนเดอร์ตัวนี้อยู่แล้ว)
  *  v>=2 ที่มี changesFrom จะมี section "## Changes in v{N} (vs v{N-1})" คั่นก่อน Intent เสมอ
- *  → ผู้เซ็นเห็น change ของ version ใหม่ชัดก่อนอ่านเนื้อเต็ม; spec เก่าที่ไม่มี field เรนเดอร์เหมือนเดิม */
+ *  → ผู้เซ็นเห็น change ของ version ใหม่ชัดก่อนอ่านเนื้อเต็ม; spec เก่าที่ไม่มี field เรนเดอร์เหมือนเดิม.
+ *  บรรทัด change ถูกจัดกลุ่มเป็นหมวด (groupSpecChanges) แทน flat bullet — ผู้เซ็นอ่านง่ายกว่า */
 export const renderSpecMd = (s: Spec): string =>
 	`# Spec v${s.version}: ${s.title}\napproved: ${s.approved}\n\n` +
 	(s.changesFrom?.length
-		? `## Changes in v${s.version} (vs v${s.version - 1})\n${s.changesFrom.map((x) => `- ${x}`).join("\n")}\n\n`
+		? `## Changes in v${s.version} (vs v${s.version - 1})\n${groupSpecChanges(s.changesFrom)}\n\n`
 		: "") +
 	`## Intent\n${s.intent}\n\n${s.approach?.length ? "## Approach\n" + s.approach.map((x) => `- ${x}`).join("\n") + "\n\n" : ""}## Scope\n${s.scope.map((x) => `- ${x}`).join("\n")}\n\n## Constraints\n${s.constraints.map((x) => `- ${x}`).join("\n")}\n\n## Acceptance criteria\n${s.criteria.map((c) => `- [ ] ${c.id}: ${c.text} *(check: ${c.check})*`).join("\n")}\n\n## Spec debt (human-verified only)\n${s.specDebt.map((x) => `- ${x}`).join("\n")}\n`;
 

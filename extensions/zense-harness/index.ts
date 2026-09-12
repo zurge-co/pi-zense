@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { Box, Container, Key, Markdown, matchesKey, SelectList, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type SelectItem } from "@earendil-works/pi-tui";
-import { DefaultPackageManager, SettingsManager, getAgentDir, DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, SettingsManager, getAgentDir, DynamicBorder, type ExtensionAPI, type ExtensionContext, type ThemeColor } from "@earendil-works/pi-coding-agent";
 
 // ----------------------------------------------------------------------------- types
 
@@ -152,7 +152,9 @@ export const CHANGE_GROUPS: ReadonlyArray<[string, (line: string) => boolean]> =
 	["Spec debt", (l) => l.startsWith("specDebt ")],
 ];
 
-export const groupSpecChanges = (lines: string[]): string => {
+/** แยกบรรทัด change ลง bucket ตาม CHANGE_GROUPS (ลำดับคงที่) — ใช้ร่วมกันระหว่าง groupSpecChanges
+ *  (archive .md plain text) กับ renderSpecChangesTui (sign dialog ทาสี) เพื่อไม่ให้ตรรกะจัดกลุ่ม drift */
+const bucketSpecChanges = (lines: string[]) => {
 	const buckets = new Map<string, string[]>();
 	const warns: string[] = [];
 	const other: string[] = [];
@@ -168,6 +170,11 @@ export const groupSpecChanges = (lines: string[]): string => {
 			buckets.set(group[0], bucket);
 		} else other.push(line);
 	}
+	return { buckets, warns, other };
+};
+
+export const groupSpecChanges = (lines: string[]): string => {
+	const { buckets, warns, other } = bucketSpecChanges(lines);
 	const numbered = (items: string[]) => items.map((x, i) => `${i + 1}. ${x}`).join("\n");
 	const parts: string[] = [];
 	if (warns.length) parts.push(warns.join("\n"));
@@ -177,6 +184,36 @@ export const groupSpecChanges = (lines: string[]): string => {
 	}
 	if (other.length) parts.push(`### Other\n${numbered(other)}`);
 	return parts.join("\n\n");
+};
+
+/** role สีของทิศทาง change — map กับ theme ของ pi: + เพิ่ม = success (เขียว) / − ลบ = error (แดง) / ~ แก้ = warning (เหลือง) */
+export type ChangeMarkRole = Extract<ThemeColor, "success" | "error" | "warning">;
+
+/**
+ * render section "## Changes in v{N}" สำหรับ sign dialog (TUI เท่านั้น — archive .md
+ * ยังใช้ groupSpecChanges ที่เป็น plain text คง label+marker เดิม เพราะสีใช้ไม่ได้ในไฟล์):
+ * item ใต้ heading ตัด label ที่ซ้ำกับ heading ทิ้ง ("approach +: x" → "1. x") แล้วแสดงทิศทาง
+ * ด้วยสีแทนเครื่องหมายผ่าน color(role, text) — บรรทัดที่ไม่มี marker (title:/intent:/Other/⚠️) เป็น neutral.
+ * จัดกลุ่มด้วย bucketSpecChanges ตัวเดียวกับ archive (ลำดับหมวด/⚠️ verbatim/Other ท้ายสุด เหมือนกันเป๊ะ).
+ * คืน array บรรทัด (ยังไม่ wrap — caller wrap ตามความกว้างจริงด้วย wrapTextWithAnsi ตอน render);
+ * spec ไม่มี changesFrom → คืน [] (ไม่มี section Changes) */
+export const renderSpecChangesTui = (spec: Spec, color: (role: ChangeMarkRole, text: string) => string): string[] => {
+	if (!spec.changesFrom?.length) return [];
+	const { buckets, warns, other } = bucketSpecChanges(spec.changesFrom);
+	const ROLE = { "+": "success", "−": "error", "~": "warning" } as const;
+	// item รูป "<label> <marker>: <detail>" → "N. <detail>" ทาสีตาม marker; ไม่ match pattern → neutral verbatim
+	const renderItem = (line: string, n: number): string => {
+		const m = /^(\S+) ([+−~]): (.*)$/.exec(line);
+		return m ? color(ROLE[m[2] as keyof typeof ROLE], `${n}. ${m[3]}`) : `${n}. ${line}`;
+	};
+	const groups: string[][] = [];
+	if (warns.length) groups.push([...warns]); // ⚠️ verbatim ไม่มี heading (ตรง groupSpecChanges)
+	for (const [heading] of CHANGE_GROUPS) {
+		const items = buckets.get(heading);
+		if (items?.length) groups.push([`### ${heading}`, ...items.map((x, i) => renderItem(x, i + 1))]);
+	}
+	if (other.length) groups.push(["### Other", ...other.map((x, i) => `${i + 1}. ${x}`)]);
+	return [`## Changes in v${spec.version} (vs v${spec.version - 1})`, "", ...groups.flatMap((g, i) => (i ? ["", ...g] : g))];
 };
 
 /** render spec เป็น markdown — ใช้ทั้ง archive .md และ sign dialog (dialog เรนเดอร์ตัวนี้อยู่แล้ว)
@@ -2522,7 +2559,9 @@ export default function (pi: ExtensionAPI) {
 				1,
 				0,
 			);
-			const md = new Markdown(renderSpecMd(spec), 0, 0, {
+			// เนื้อ spec ผ่าน Markdown เดิม แต่ตัด section Changes ออก (changesFrom: undefined) —
+			// section Changes render แยกผ่าน renderSpecChangesTui (ตัด label ซ้ำ heading + สีแทน +/−)
+			const md = new Markdown(renderSpecMd({ ...spec, changesFrom: undefined }), 0, 0, {
 				heading: (t) => theme.fg("accent", theme.bold(t)),
 				link: (t) => theme.fg("accent", t),
 				linkUrl: (t) => theme.fg("dim", t),
@@ -2551,7 +2590,12 @@ export default function (pi: ExtensionAPI) {
 				render: (w: number) => {
 					if (w !== cachedWidth) {
 						cachedWidth = w;
-						lines = md.render(Math.max(20, w - 6));
+						const wBody = Math.max(20, w - 6);
+						// section Changes (สี +/−/~) ก่อน ตามด้วยเนื้อ spec จาก Markdown — wrap ทั้งคู่ที่ความกว้างเดียวกัน
+						const changeLines = renderSpecChangesTui(spec, (role, t) => theme.fg(role, t)).flatMap((ln) =>
+							ln ? wrapTextWithAnsi(ln, wBody) : [""],
+						);
+						lines = [...changeLines, ...(changeLines.length ? [""] : []), ...md.render(wBody)];
 					}
 					offset = Math.max(0, Math.min(offset, maxOffset()));
 					const h = bodyRows();

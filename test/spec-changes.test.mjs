@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
-import { buildSpecChanges, groupSpecChanges, renderSpecMd } from "../extensions/zense-harness/index.ts";
+import { buildSpecChanges, groupSpecChanges, renderSpecChangesTui, renderSpecMd } from "../extensions/zense-harness/index.ts";
 
 const baseSpec = (over = {}) => ({
 	version: 1,
@@ -147,4 +147,63 @@ test("groupSpecChanges: บรรทัดที่จับกลุ่มไ�
 	const md = groupSpecChanges(["approach +: x", "ไม่รู้จักบรรทัดนี้"]);
 	assert.ok(md.indexOf("### Approach") < md.indexOf("### Other"));
 	assert.ok(md.includes("### Other\n1. ไม่รู้จักบรรทัดนี้"));
+});
+
+const tag = (role, t) => `<${role}>${t}</>`; // colorFn จำลอง — โยง marker → role ให้ assert ได้
+
+test("renderSpecChangesTui: ตัด label ซ้ำ heading + ทาสีตาม marker (+ → success / − → error / ~ → warning)", () => {
+	const lines = buildSpecChanges(
+		baseSpec({ version: 1 }),
+		baseSpec({
+			version: 2,
+			title: "New title",
+			intent: "new intent",
+			approach: ["read auth code", "patch guard", "add regression test"],
+			scope: ["src/auth", "src/session"],
+			constraints: [],
+			criteria: [
+				{ id: "c1", text: "login test passes", check: "npm test" },
+				{ id: "c2", text: "guard renders", check: "path exists: src/auth/guard.tsx" },
+				{ id: "c3", text: "session persists", check: "npx vitest run" },
+			],
+			specDebt: [],
+		}),
+	);
+	const out = renderSpecChangesTui(baseSpec({ version: 2, changesFrom: lines }), tag);
+	const md = out.join("\n");
+	// header ก่อนเสมอ + หมวดจัดกลุ่มเหมือน archive (ลำดับคงที่)
+	assert.equal(out[0], "## Changes in v2 (vs v1)");
+	const order = ["### Title & intent", "### Approach", "### Scope", "### Constraints", "### Criteria", "### Spec debt"]
+		.filter((h) => md.includes(h))
+		.map((h) => md.indexOf(h));
+	assert.deepEqual([...order].sort((a, b) => a - b), order);
+	// item ตัด label ซ้ำ heading แล้ว ("1. <detail>") — marker +/−/~ กลายเป็นสี ไม่เหลือในบรรทัด
+	assert.ok(md.includes("### Approach\n<success>1. add regression test</>"));
+	assert.ok(md.includes("### Scope\n<success>1. src/session</>"));
+	assert.ok(md.includes("### Constraints\n<error>1. no new deps</>"));
+	assert.ok(md.includes("### Spec debt\n<error>1. verify UX by eye</>"));
+	assert.ok(!/(^|\n)\d+\. [+−~]/.test(md), "ห้ามเหลือ marker หลังเลขลำดับ");
+	assert.ok(!md.includes("approach +") && !md.includes("scope +"), "ห้ามเหลือ label ซ้ำ heading");
+	// criteria: ~ → warning (พร้อมรายละเอียด text/check คบ) และ + → success
+	const c2 = out.find((l) => l.startsWith("<warning>"));
+	assert.ok(c2, "ต้องมี criteria ~ สี warning");
+	assert.ok(c2.includes('1. c2 text: "guard exists" → "guard renders"'));
+	assert.ok(md.includes("<success>2. c3: session persists (check: npx vitest run)</>"));
+	// title/intent เป็น neutral (ไม่ถูกห่อด้วยสี)
+	assert.ok(out.includes('1. title: "Fix login redirect" → "New title"'));
+	assert.ok(out.some((l) => l.startsWith("2. intent:")));
+});
+
+test("renderSpecChangesTui: ⚠️ identical เป็น neutral verbatim ไม่มี heading; ไม่มี changesFrom → คืน []", () => {
+	const warn = "⚠️ ไม่มีการเปลี่ยนแปลงจาก v3 — spec ใหม่เหมือน version ก่อนทุกประการ";
+	const out = renderSpecChangesTui(baseSpec({ version: 4, changesFrom: [warn] }), tag);
+	assert.deepEqual(out, ["## Changes in v4 (vs v3)", "", warn]);
+	assert.deepEqual(renderSpecChangesTui(baseSpec({ version: 4 }), tag), []);
+	assert.deepEqual(renderSpecChangesTui(baseSpec({ version: 4, changesFrom: [] }), tag), []);
+});
+
+test("renderSpecChangesTui: บรรทัด Other เป็น neutral ลงท้ายสุดเหมือน archive", () => {
+	const out = renderSpecChangesTui(baseSpec({ version: 2, changesFrom: ["scope +: x", "ไม่รู้จักบรรทัดนี้"] }), tag);
+	const md = out.join("\n");
+	assert.ok(md.indexOf("### Scope\n<success>1. x</>") < md.indexOf("### Other\n1. ไม่รู้จักบรรทัดนี้"));
 });

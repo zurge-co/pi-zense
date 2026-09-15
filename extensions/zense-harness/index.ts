@@ -3686,7 +3686,7 @@ export default function (pi: ExtensionAPI) {
 		const logPath = subagentLogPath(ctx.cwd, "distiller");
 		const mainModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 		// รันใน main cwd เสมอ (ไม่ใช่ worktree — memory ในนั้นเป็นสำเนาตอน checkout) จึงเรียก runSubagent ตรงๆ ไม่ผ่าน launchSubagent
-		const r = await runSubagent("distiller", distillTaskPrompt(memoryContent, impact.memoryLines), ctx.cwd, subagentTimeout("distiller", ctx.cwd), undefined, logPath, resolveModelPattern(ctx.cwd, "distiller", mainModel), SUBAGENT_EXCLUDE_TOOLS.distiller, SUBAGENT_STRIP_FLAGS.distiller);
+		const r = await runSubagent("distiller", distillTaskPrompt(memoryContent, impact.memoryLines), ctx.cwd, subagentTimeout("distiller", ctx.cwd), undefined, logPath, resolveModelPattern(ctx.cwd, "distiller", mainModel), SUBAGENT_EXCLUDE_TOOLS.distiller, await subagentStripFlagsAsync("distiller", ctx.cwd));
 		if (!r.ok) {
 			learn(ctx, `distill aborted: distiller sub-agent failed — ${r.output.split("\n")[0].slice(0, 160)}`);
 			ctx.ui.notify(`⚠ distiller ล้มเหลว — abort ไม่ลบ/เขียนทับอะไรเลย (log: ${relative(ctx.cwd, logPath)})`, "warning");

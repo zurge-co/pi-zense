@@ -215,3 +215,17 @@ test("fmtBytes: หน่วยอ่านง่ายสำหรับ confir
 	assert.equal(fmtBytes(2048), "2.0KB");
 	assert.equal(fmtBytes(2 * 1_048_576), "2.0MB");
 });
+
+test("regression: runDistill ต้อง resolve strip flags ผ่าน subagentStripFlagsAsync (ไม่ใช่ static map) — มิฉะนั้น subagentExtInclude.distiller โดนเมิน ทำ provider extension ไม่โหลด → model not found", async () => {
+	const { readFileSync: rf } = await import("node:fs");
+	const { fileURLToPath } = await import("node:url");
+	const { dirname } = await import("node:path");
+	const src = rf(join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "zense-harness", "index.ts"), "utf8");
+	const i = src.indexOf("const runDistill");
+	assert.ok(i >= 0, "หา runDistill ไม่เจอ");
+	const j = src.indexOf("runSubagent(", i);
+	assert.ok(j > i, "runDistill ต้องเรียก runSubagent");
+	const call = src.slice(j, src.indexOf(";", j));
+	assert.ok(call.includes('await subagentStripFlagsAsync("distiller"'), "call site ต้องใช้ await subagentStripFlagsAsync(\"distiller\", ...) เพื่อให้ include list จาก config.json ถูก re-add เป็น -e flags");
+	assert.ok(!call.includes("SUBAGENT_STRIP_FLAGS.distiller"), "ห้าม pass static SUBAGENT_STRIP_FLAGS.distiller (bare boot ทิ้ง extension ทั้งหมด)");
+});

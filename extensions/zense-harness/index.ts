@@ -227,6 +227,33 @@ export const renderSpecMd = (s: Spec): string =>
 		: "") +
 	`## Intent\n${s.intent}\n\n${s.approach?.length ? "## Approach\n" + s.approach.map((x) => `- ${x}`).join("\n") + "\n\n" : ""}## Scope\n${s.scope.map((x) => `- ${x}`).join("\n")}\n\n## Constraints\n${s.constraints.map((x) => `- ${x}`).join("\n")}\n\n## Acceptance criteria\n${s.criteria.map((c) => `- [ ] ${c.id}: ${c.text} *(check: ${c.check})*`).join("\n")}\n\n## Spec debt (human-verified only)\n${s.specDebt.map((x) => `- ${x}`).join("\n")}\n`;
 
+/** sync ลายเซ็นของ spec กลับลงไฟล์บน disk หลัง approve:
+ *  ไฟล์ถูกเขียนตอน commitSpec ด้วย approved:false — approveCurrentSpec เปลี่ยนเฉพาะ state ใน
+ *  memory + session log (persist) → .zense/spec.{json,md} และ archive copies ที่ specJsonPath/
+ *  specMdPath ชี้อยู่ต้อง sync ด้วย ไม่งั้น grader/script ที่อ่านไฟล์เห็น approved:false ตลอด.
+ *  best-effort: เขียนไม่ได้/ไฟล์หาย → ข้ามเงียบๆ ไม่ให้การเซ็นพัง */
+export const syncApprovedSpecFiles = (cwd: string, spec: Spec, paths?: { json?: string; md?: string }): boolean => {
+	const json = JSON.stringify(spec, null, 2);
+	const md = renderSpecMd(spec);
+	const targets: Array<[string | undefined, string]> = [
+		[join(zenseDir(cwd), "spec.json"), json],
+		[join(zenseDir(cwd), "spec.md"), md],
+		[paths?.json, json],
+		[paths?.md, md],
+	];
+	let wroteAny = false;
+	for (const [p, content] of targets) {
+		try {
+			if (!p || !existsSync(p)) continue;
+			writeFileSync(p, content);
+			wroteAny = true;
+		} catch {
+			/* best-effort */
+		}
+	}
+	return wroteAny;
+};
+
 /**
  * merge "tuiMode": "fullscreen" เข้า settings.json — เฉพาะตอนที่ key ยังไม่มีเท่านั้น (ผู้ใช้ยังไม่เคยเลือก)
  * public extension API ของ pi ไม่มี tuiMode setter (SettingsManager.setTuiMode ไม่ถูก expose ให้ extension)
@@ -2898,6 +2925,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`🌳 worktree สร้างไม่ได้ — ทำงานใน main ตามปกติ (ไม่มี isolation ระหว่าง session)`, "warning");
 			}
 		}
+		// spec.json/spec.md + archive บน disk ยังเขียนเป็น approved:false อยู่ (ตอน commit) — sync ลายเซ็นลงไฟล์ก่อนจบ
+		syncApprovedSpecFiles(ctx.cwd, state.spec, { json: state.specJsonPath, md: state.specMdPath });
 		// guard: ยังมี change ของ spec ก่อนค้าง staged รอ commit → เตือนล่วงหน้า (apply ครั้งถัดไปจะเจอ dirty-main guard อยู่ดี)
 		if (state.pendingApply)
 			ctx.ui.notify(`⚠ spec v${state.pendingApply.specVersion} ยังค้าง staged รอ commit อยู่ใน main — ควร commit หรือ discard ก่อนเริ่มงานใหม่ (ไม่เช่นนั้น apply ของ spec v${state.spec.version} จะถูก guard ปฏิเสธ)`, "warning");
@@ -3740,15 +3769,22 @@ export default function (pi: ExtensionAPI) {
 					"No spec to approve: ยังไม่มี spec ที่ commit เข้าระบบ — approve ใช้ได้เฉพาะ spec ที่ agent เรียก zense_spec (tool) ในเซสชันนี้เท่านั้น; spec ที่ถูก present เป็น chat text registers nothing. ขั้นถัดไป: ให้ agent เรียก zense_spec (แนะนำ action=compile_spec) แล้ว sign จาก dialog ที่เด้งขึ้น", 
 					"warning",
 				);
+				// ปลุก agent ทำงานต่อหลังเซ็นผ่าน /zense approve — path นี้ user เซ็นจาก slash command ตอน agent idle
+				// → ไม่มี turn ใหม่เกิดเอง (ต่างจาก flow เซ็นใน tool_dialog ที่ agent กำลัง stream อยู่) ต้อง sendUserMessage
+				const kickoff = `Zense: spec v${state.spec.version} ถูกเซ็นแล้ว — implementation gate เปิด\nเริ่ม implement ตาม spec ได้เลย (อ่าน .zense/spec.md; อย่าเขียนนอก scope)`;
+				const nudgeAgent = () => {
+					try { pi.sendUserMessage(kickoff); return; } catch { /* agent กำลัง stream — เลือก followUp แทน */ }
+					try { pi.sendUserMessage(kickoff, { deliverAs: "followUp" }); } catch { /* non-fatal: user สั่งต่อเองได้ */ }
+				};
 				if (ctx.mode === "tui") {
 					const choice = await specSignDialog(ctx, state.spec, `เซ็น approve spec v${state.spec.version}: ${state.spec.title}?`, [
 						{ value: "sign", label: "🔏 เซ็นอนุมัติ — เปิด implementation gate", description: "ลายเซ็นมนุษย์ = agent เริ่ม implement ได้" },
 						{ value: "cancel", label: "ยกเลิก (ยังไม่เซ็น)", description: "spec ยังค้างไว้ — approve ใหม่ได้ทุกเมื่อ" },
 					]);
-					if (choice === "sign") approveCurrentSpec(ctx);
+					if (choice === "sign" && approveCurrentSpec(ctx)) nudgeAgent();
 				} else {
 					const ok = await ctx.ui.confirm("🔏 เซ็น approve spec?", `${state.spec.title} v${state.spec.version}\nIntent: ${state.spec.intent.slice(0, 300)}\n(อ่านเต็มที่ .zense/spec.md)`);
-					if (ok) approveCurrentSpec(ctx);
+					if (ok && approveCurrentSpec(ctx)) nudgeAgent();
 				}
 			} else if (sub === "gate") {
 				state.gateEnabled = rest[0] !== "off";

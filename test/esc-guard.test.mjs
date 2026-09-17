@@ -2,60 +2,61 @@ import { strict as assert } from "node:assert";
 import test from "node:test";
 import { createEscGuard } from "../extensions/zense-harness/index.ts";
 
-// B (ESC): global input guard ของ dialog zense — กัน ESC รั่วไปชน defaultEditor.onEscape ของ pi
-// (abort streaming) แทนที่จะปิด dialog. test ครอบ logic ของ guard ระดับ pure (routing ของ TUI จริง = specDebt)
+// B (ESC): the global input guard for zense dialogs — keeps ESC from leaking into pi's
+// defaultEditor.onEscape (streaming abort) instead of closing a dialog. Tests cover the
+// guard's pure logic (real TUI routing = specDebt)
 
-test("esc-guard: ไม่มี dialog เปิด → คืน undefined ทุก key (ห้าม consume/แตะอะไรเลย)", () => {
+test("esc-guard: no dialog open → undefined for every key (never consumes/touches anything)", () => {
 	const g = createEscGuard();
-	assert.equal(g.handleInput("\x1b"), undefined); // ESC ก็ผ่าน เพราะไม่มี dialog
+	assert.equal(g.handleInput("\x1b"), undefined); // even ESC passes — no dialog
 	assert.equal(g.handleInput("a"), undefined);
 	assert.equal(g.handleInput("\x1b[A"), undefined); // arrow up
 	assert.equal(g.depth(), 0);
 });
 
-test("esc-guard: มี dialog เปิด → ESC consume + ปิด dialog นั้นด้วย close(), key อื่นผ่าน", () => {
+test("esc-guard: dialog open → ESC consumed + that dialog closed via close(), other keys pass", () => {
 	const g = createEscGuard();
 	let closed = 0;
 	const h = g.open(() => {
 		closed++;
-		h.close(); // จำลองพฤติกรรมจริง: dialog ถอดตัวเองออกจาก stack ตอนปิด
+		h.close(); // real behavior: the dialog unregisters itself from the stack on close
 	});
 	assert.equal(g.depth(), 1);
-	// key อื่นต้องผ่านปกติ (ให้ component ที่ focused จัดการเอง)
+	// other keys must pass normally (the focused component handles them)
 	assert.equal(g.handleInput("a"), undefined);
 	assert.equal(g.handleInput("\x1b[A"), undefined);
 	assert.equal(closed, 0);
-	// ESC → consume + ปิด
+	// ESC → consumed + closed
 	assert.deepEqual(g.handleInput("\x1b"), { consume: true });
 	assert.equal(closed, 1);
 	assert.equal(g.depth(), 0);
-	// stack ว่างแล้ว → key ถัดไปผ่าน (รวม ESC ของ editor เอง — เช่น user กดเพื่อ abort ตั้งใจ)
+	// stack empty → later keys pass (incl. the editor's own ESC — e.g. an intentional user abort)
 	assert.equal(g.handleInput("\x1b"), undefined);
 });
 
-test("esc-guard: stack ซ้อน — ESC ปิดเฉพาะ dialog บนสุด แล้วไล่ตัวถัดไป", () => {
+test("esc-guard: nested stack — ESC closes only the topmost dialog, then the next in line", () => {
 	const g = createEscGuard();
 	const order = [];
 	const h1 = g.open(() => { order.push("d1"); h1.close(); });
 	const h2 = g.open(() => { order.push("d2"); h2.close(); });
 	assert.deepEqual(g.handleInput("\x1b"), { consume: true });
-	assert.deepEqual(order, ["d2"]); // ตัวบนสุด (เปิดทีหลัง) ปิดก่อน
+	assert.deepEqual(order, ["d2"]); // the topmost (opened last) closes first
 	assert.deepEqual(g.handleInput("\x1b"), { consume: true });
 	assert.deepEqual(order, ["d2", "d1"]);
-	assert.equal(g.handleInput("\x1b"), undefined); // ว่างแล้ว → ผ่าน
+	assert.equal(g.handleInput("\x1b"), undefined); // empty again → passes
 });
 
-test("esc-guard: handle.close() ด้วยมือถอดออกจาก stack (ปิดผ่านปุ่มอื่น) → ESC ไม่ consume", () => {
+test("esc-guard: manual handle.close() unregisters the dialog (closed via another key) → ESC not consumed", () => {
 	const g = createEscGuard();
 	let closed = 0;
 	const h = g.open(() => { closed++; h.close(); });
-	h.close(); // dialog ปิดเองผ่านเส้นทางอื่น (y/n/enter) — entry ต้องหายจาก stack
+	h.close(); // the dialog closed itself via another path (y/n/enter) — its entry must leave the stack
 	assert.equal(g.depth(), 0);
 	assert.equal(g.handleInput("\x1b"), undefined);
 	assert.equal(closed, 0);
 });
 
-test("esc-guard: kitty-protocol escape (\x1b[27u) ก็ถือเป็น ESC เช่นเดียวกับ \x1b ดิบ", () => {
+test("esc-guard: kitty-protocol escape (\x1b[27u) counts as ESC, same as a raw \x1b", () => {
 	const g = createEscGuard();
 	let closed = 0;
 	const h = g.open(() => { closed++; h.close(); });
@@ -63,7 +64,7 @@ test("esc-guard: kitty-protocol escape (\x1b[27u) ก็ถือเป็น ES
 	assert.equal(closed, 1);
 });
 
-test("esc-guard: reset() ล้าง stack ทั้งหมด (session ใหม่ — overlay เก่าถูก pi pop ไปแล้ว)", () => {
+test("esc-guard: reset() clears the whole stack (new session — old overlays were popped by pi)", () => {
 	const g = createEscGuard();
 	g.open(() => {});
 	g.open(() => {});

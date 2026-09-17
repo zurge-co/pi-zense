@@ -17,12 +17,13 @@ import {
 } from "../extensions/zense-harness/index.ts";
 
 // provider-missing diagnosis + auto-heal (spec 2026-09-17): sub-agent boot bare (--no-extensions)
-// ตัด extension ผู้ลง provider (เช่น @aliou/pi-synthetic) → วินิจฉัย post-run เพราะ provider ที่ role
-// ต้องการรู้แน่ได้แค่ตอนรัน (models.json ต่อ role อาจต่างจาก main agent) — auto-heal retry + persist
-// หรือ mark failed พร้อม guidance ชี้ /zense:ext-config:<role>
+// strips the provider extension (e.g. @aliou/pi-synthetic) → post-run diagnosis, because
+// the provider a role needs is only knowable at run time (per-role models.json may differ
+// from the main agent's) — auto-heal retry + persist, or mark failed with guidance pointing
+// at /zense:ext-config:<role>
 const mkTmp = () => mkdtempSync(join(tmpdir(), "zense-provdiag-"));
 
-test("providerIdOfModelPattern / usedProviderOf: แยก provider ก่อน '/', ไม่มี '/' = undefined", () => {
+test("providerIdOfModelPattern / usedProviderOf: provider is everything before '/', no '/' = undefined", () => {
 	assert.equal(providerIdOfModelPattern("synthetic/hf:x:free"), "synthetic");
 	assert.equal(providerIdOfModelPattern("Anthropic/Claude-Sonnet"), "anthropic");
 	assert.equal(providerIdOfModelPattern("sonnet:high"), undefined);
@@ -32,7 +33,7 @@ test("providerIdOfModelPattern / usedProviderOf: แยก provider ก่อน
 	assert.equal(usedProviderOf("noSlash"), undefined);
 });
 
-test("findProviderExtension: เจอ extension ที่มี registerProvider + provider id; prefer segment /provider/", () => {
+test("findProviderExtension: finds the extension with registerProvider + the provider id; prefers a /provider/ path segment", () => {
 	const exts = [
 		{ path: "/x/pkg/extensions/quota/index.ts", enabled: true, source: "npm:pkg", scope: "user" },
 		{ path: "/x/pkg/extensions/provider/index.ts", enabled: true, source: "npm:pkg", scope: "user" },
@@ -46,17 +47,17 @@ test("findProviderExtension: เจอ extension ที่มี registerProvide
 	assert.ok(hit.label.length > 0);
 });
 
-test("findProviderExtension: ข้าม disabled / ไฟล์อ่านไม่ได้ / ไม่มี registerProvider", () => {
+test("findProviderExtension: skips disabled / unreadable files / no registerProvider", () => {
 	const exts = [
-		{ path: "/x/a/provider/index.ts", enabled: false, source: "", scope: "user" }, // disabled → ข้าม
-		{ path: "/x/b/provider/index.ts", enabled: true, source: "", scope: "user" }, // อ่านไม่ได้ → ข้าม
-		{ path: "/x/c/other/index.ts", enabled: true, source: "", scope: "user" }, // มี id แต่ไม่มี registerProvider → ข้าม
+		{ path: "/x/a/provider/index.ts", enabled: false, source: "", scope: "user" }, // disabled → skipped
+		{ path: "/x/b/provider/index.ts", enabled: true, source: "", scope: "user" }, // unreadable → skipped
+		{ path: "/x/c/other/index.ts", enabled: true, source: "", scope: "user" }, // has the id but no registerProvider → skipped
 	];
 	const reader = (p) => (p === "/x/b/provider/index.ts" ? undefined : "synthetic synthetic\n");
 	assert.equal(findProviderExtension("synthetic", exts, reader), undefined);
 });
 
-test("findProviderExtension: หลายตัวคะแนนสูงสุดเท่ากัน = ambiguous → undefined (ไม่เดา)", () => {
+test("findProviderExtension: multiple top-score ties = ambiguous → undefined (never guesses)", () => {
 	const exts = [
 		{ path: "/x/pkgA/extensions/provider/index.ts", enabled: true, source: "", scope: "user" },
 		{ path: "/x/pkgB/extensions/provider/index.ts", enabled: true, source: "", scope: "user" },
@@ -65,64 +66,64 @@ test("findProviderExtension: หลายตัวคะแนนสูงสุ
 	assert.equal(findProviderExtension("synthetic", exts, reader), undefined);
 });
 
-test("mergeExtInclude: append ครั้งเดียว (idempotent — มีแล้วคืนตัวเดิมเป๊ะ)", () => {
+test("mergeExtInclude: appends once (idempotent — an existing path returns the same identity)", () => {
 	const cur = ["/x/a.ts"];
 	const merged = mergeExtInclude(cur, "/x/b.ts");
 	assert.deepEqual(merged, ["/x/a.ts", "/x/b.ts"]);
-	assert.equal(mergeExtInclude(merged, "/x/b.ts"), merged); // identity — caller ใช้ !== ดัก 'ไม่ต้องเขียน'
+	assert.equal(mergeExtInclude(merged, "/x/b.ts"), merged); // identity — the caller uses !== to detect 'nothing to write'
 });
 
-test("diagnoseProviderMissing: silent fallback (usedModel คนละ provider) → provider-mismatch", () => {
+test("diagnoseProviderMissing: silent fallback (usedModel has a different provider) → provider-mismatch", () => {
 	const d = diagnoseProviderMissing("synthetic/hf:x:free", { ok: true, output: "...", usedModel: "openai/gpt-4o" });
 	assert.equal(d?.kind, "provider-mismatch");
 	assert.equal(d?.patternProvider, "synthetic");
 });
 
-test("diagnoseProviderMissing: run ok + provider ตรง pattern → ไม่เข้า heal", () => {
+test("diagnoseProviderMissing: ok run + provider matches the pattern → no heal", () => {
 	assert.equal(diagnoseProviderMissing("synthetic/hf:x:free", { ok: true, output: "", usedModel: "synthetic/hf:x:free" }), undefined);
 	assert.equal(diagnoseProviderMissing("synthetic/hf:x", { ok: false, output: "boom", usedModel: "synthetic/hf:x" }), undefined);
 });
 
-test("diagnoseProviderMissing: built-in provider ข้าม heal (id ผิด/auth หาย ไม่ใช่ bare-boot)", () => {
+test("diagnoseProviderMissing: built-in provider skips the heal (wrong id/missing auth isn't bare-boot)", () => {
 	assert.ok(BUILTIN_PROVIDER_IDS.has("anthropic"));
 	assert.equal(diagnoseProviderMissing("anthropic/claude-55", { ok: true, output: "", usedModel: "openai/gpt-4o" }), undefined);
 });
 
-test("diagnoseProviderMissing: hard error ตอน usedModel จับไม่ได้ → hard-missing ตาม PROVIDER_MISSING_RX", () => {
+test("diagnoseProviderMissing: hard error with usedModel uncaptured → hard-missing per PROVIDER_MISSING_RX", () => {
 	const out = "sub-agent exited code=1\nError: no models found matching 'synthetic/hf:x:free'\n";
 	const d = diagnoseProviderMissing("synthetic/hf:x:free", { ok: false, output: out });
 	assert.equal(d?.kind, "hard-missing");
-	// ความล้มเหลวทั่วไป (timeout/tool noise) ห้าม false-positive
+	// ordinary failures (timeout/tool noise) must not false-positive
 	assert.ok(!PROVIDER_MISSING_RX.test("sub-agent exited code=143 signal=null (timeout SIGTERM)"));
 	assert.equal(diagnoseProviderMissing("synthetic/hf:x", { ok: false, output: "sub-agent exited code=143 (TIMEOUT)" }), undefined);
-	// ไม่มี pattern / ไม่มี provider ใน pattern → ไม่วินิจฉัย
+	// no pattern / no provider in pattern → no diagnosis
 	assert.equal(diagnoseProviderMissing(undefined, { ok: false, output: "no models found matching x" }), undefined);
 	assert.equal(diagnoseProviderMissing("sonnet:high", { ok: false, output: "no models found matching x" }), undefined);
 });
 
-test("buildProviderMissingGuidance: มี hit → ชี้ /zense:ext-config:<role> + non-interactive on <path>", () => {
+test("buildProviderMissingGuidance: with a hit → points at /zense:ext-config:<role> + non-interactive on <path>", () => {
 	const g = buildProviderMissingGuidance("grader", "synthetic", { hit: { path: "/x/pkg/extensions/provider/index.ts", label: "provider/index.ts" } });
 	assert.ok(g.includes("grader"));
-	assert.ok(g.includes("/zense:ext-config:grader"), "ต้องชี้คำสั่ง per-role ไม่ใช่ generic ext-config");
+	assert.ok(g.includes("/zense:ext-config:grader"), "must point at the per-role command, not a generic ext-config");
 	assert.ok(g.includes("/zense ext-config-show grader on /x/pkg/extensions/provider/index.ts"));
-	assert.ok(g.includes("pi login synthetic"), "กรณี include แล้วยังพัง = auth");
+	assert.ok(g.includes("pi login synthetic"), "broken despite inclusion = auth");
 	const retried = buildProviderMissingGuidance("grader", "synthetic", { hit: { path: "/x/p/index.ts", label: "p" }, autoRetried: true });
-	assert.ok(retried.includes("auto-include"), "auto-retry พังต้องบอกว่าลองแล้ว");
+	assert.ok(retried.includes("auto-include"), "a failed auto-retry must say it tried");
 });
 
-test("buildProviderMissingGuidance: include อยู่แล้วแต่ fallback → ชี้ auth; ไม่มี hit → ชี้ติดตั้ง/เปลี่ยน model", () => {
+test("buildProviderMissingGuidance: already included but falling back → points at auth; no hit → points at installing / changing the model", () => {
 	const inc = buildProviderMissingGuidance("reviewer", "synthetic", {
 		hit: { path: "/x/pkg/extensions/provider/index.ts", label: "provider/index.ts" },
 		alreadyIncluded: true,
 	});
 	assert.ok(inc.includes("auth") && inc.includes("pi login synthetic"));
-	assert.ok(!inc.includes("tick"), "include อยู่แล้ว ไม่ควรสั่ง tick ซ้ำ");
+	assert.ok(!inc.includes("tick"), "already included → must not order another tick");
 	const none = buildProviderMissingGuidance("grader", "acme-llm");
-	assert.ok(none.includes("/zense models"), "หา ext ไม่เจอ → เสนอเปลี่ยน model ของ role");
-	assert.ok(!none.includes("ext-config-show grader on"), "ไม่มี path = ไม่ควรสั่ง on <path>");
+	assert.ok(none.includes("/zense models"), "no extension found → offer changing the role's model");
+	assert.ok(!none.includes("ext-config-show grader on"), "no path = never orders on <path>");
 });
 
-test("persist path: writeSubagentExtIncludes เขียน merged include (local + seed global) อ่านกลับตรง", () => {
+test("persist path: writeSubagentExtIncludes writes the merged include list (local + global seed) and reads back correctly", () => {
 	const dir = mkTmp();
 	const globalDir = mkTmp();
 	try {
@@ -133,12 +134,12 @@ test("persist path: writeSubagentExtIncludes เขียน merged include (loc
 		const merged = mergeExtInclude(cur, hitPath);
 		writeSubagentExtIncludes(dir, "grader", merged, globalDir);
 		assert.deepEqual(subagentExtIncludes("grader", dir, undefined, globalDir), [hitPath]);
-		// global seed ครั้งแรก — global มี include เดียวกัน
+		// first-time global seed — global holds the same include
 		assert.deepEqual(subagentExtIncludes("grader", undefined, undefined, globalDir), [hitPath]);
-		// merge ซ้ำ (idempotent) แล้วเขียนซ้ำ ไม่ซ้อน path
+		// merging again (idempotent) + rewriting — no path duplication
 		writeSubagentExtIncludes(dir, "grader", mergeExtInclude([hitPath], hitPath), globalDir);
 		assert.deepEqual(subagentExtIncludes("grader", dir, undefined, globalDir), [hitPath]);
-		// ไฟล์ local คง key อื่น (contract เดิมของ writer)
+		// the local file keeps its other keys (the writer's standing contract)
 		const raw = JSON.parse(readFileSync(join(dir, ".zense", "config.json"), "utf8"));
 		assert.ok(raw.subagentExtInclude.grader.includes(hitPath));
 	} finally {

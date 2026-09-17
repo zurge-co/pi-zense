@@ -19,45 +19,45 @@ const CRITERIA = [
 	{ id: "c2", text: "guard exists", check: "path exists: src/a.ts" },
 ];
 
-// r2: evidence ต้องถึงมือ reviewer แบบ verbatim — probe detail + criteria text (เดิมย่อเหลือ id:status)
+// r2: evidence must reach the reviewer verbatim — probe detail + criteria text (used to be compressed to id:status)
 test("buildReviewerPrompt: probes + criteria fed verbatim", () => {
 	const p = buildReviewerPrompt("do x", LASTEVAL, [], [], [], "git log ...", "", undefined, CRITERIA);
-	assert.match(p, /npm test → PASS \(exit 0, 71 tests\)/); // probe detail เต็ม
+	assert.match(p, /npm test → PASS \(exit 0, 71 tests\)/); // full probe detail
 	assert.match(p, /tests pass \[check: npm test\]/); // criteria text + check
 	assert.match(p, /c1: PASS/);
 	assert.match(p, /VERBATIM|verbatim/); // r3: grounding contract
 	assert.match(p, /Human actions/);
-	assert.match(p, /zense_eval/); // r3: pipeline tools ground ชื่อ tool
-	assert.match(p, /must not contradict/); // r3: TL;DR ห้ามขัด verdict
+	assert.match(p, /zense_eval/); // r3: pipeline tools ground the tool names
+	assert.match(p, /must not contradict/); // r3: the TL;DR must not contradict the verdict
 });
 
-// r4: จับ token ที่แต่งขึ้น (เคสจริง: ENTROPY_TIMEOUT_MINS / SUB_AGENT_KILLED / hash ปลอม)
-test("findUngroundedTokens: จับ identifier/hash/backtick นอก evidence", () => {
+// r4: catch invented tokens (real case: ENTROPY_TIMEOUT_MINS / SUB_AGENT_KILLED / a fake hash)
+test("findUngroundedTokens: catches identifiers/hashes/backticks absent from the evidence", () => {
 	const packet = [
-		"env `ENTROPY_TIMEOUT_MINS` และ flag `SUB_AGENT_KILLED` ที่ index.ts:289",
-		"commit `8f8b1f2` ยังไม่ merge",
-		"ส่วน `npm test` ผ่าน",
+		"env var `ENTROPY_TIMEOUT_MINS` and flag `SUB_AGENT_KILLED` at index.ts:289",
+		"commit `8f8b1f2` is still unmerged",
+		"and `npm test` passed",
 	].join("\n");
 	const evidence = "constants: subagentTimeout, timedOut / commit 3879624 / npm test";
 	const bad = findUngroundedTokens(packet, evidence, () => false);
 	assert.ok(bad.includes("ENTROPY_TIMEOUT_MINS"));
 	assert.ok(bad.includes("SUB_AGENT_KILLED"));
 	assert.ok(bad.includes("8f8b1f2"));
-	assert.ok(!bad.includes("npm test")); // backtick หลายคำ = การเน้นประโยค → ข้าม (กัน noise)
+	assert.ok(!bad.includes("npm test")); // multi-word backticks = prose emphasis → skipped (noise guard)
 });
 
-// r4: ไม่จับคำ section ปกติ + token ที่ evidence มี + path ที่มีไฟล์จริง (pathExists injectable)
-test("findUngroundedTokens: ไม่จับ PASS/OVERALL, token ใน evidence และ path จริง", () => {
+// r4: doesn't catch ordinary section words / tokens present in evidence / paths with real files (pathExists injectable)
+test("findUngroundedTokens: ignores PASS/OVERALL, evidence tokens and real paths", () => {
 	const dir = mkdtempSync(join(tmpdir(), "zense-ground-"));
 	try {
 		writeFileSync(join(dir, "real.ts"), "x");
-		const packet = "ดู `real.ts:12` กับ `ghost.ts` แล้วสรุป PASS ตาม OVERALL";
-		const evidence = "verdict PASS จาก OVERALL line";
+		const packet = "reviewed `real.ts:12` and `ghost.ts`, judgement is PASS per OVERALL";
+		const evidence = "verdict PASS from the OVERALL line";
 		const bad = findUngroundedTokens(packet, evidence, (p) => p === "real.ts");
-		assert.ok(!bad.includes("real.ts:12")); // path มีจริง (ตัด :line ก่อนเช็ค)
-		assert.ok(bad.includes("ghost.ts")); // path ไม่มีจริง → จับ
-		assert.ok(!bad.includes("PASS") && !bad.includes("OVERALL")); // ไม่มี _ → ไม่จับ
-		// default pathExists = existsSync (relative กับ cwd) — ไฟล์ใน tmp มองไม่เห็น → จับ
+		assert.ok(!bad.includes("real.ts:12")); // real path (:line dropped before checking)
+		assert.ok(bad.includes("ghost.ts")); // nonexistent path → caught
+		assert.ok(!bad.includes("PASS") && !bad.includes("OVERALL")); // no underscore → not caught
+		// default pathExists = existsSync (relative to cwd) — can't see the tmp file → caught
 		assert.ok(findUngroundedTokens(packet, evidence).includes("real.ts:12"));
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

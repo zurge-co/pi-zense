@@ -20,7 +20,7 @@ const GOOD_SPEC = {
 	constraints: ["no new deps"],
 	criteria: [
 		{ id: "c1", text: "login test passes", check: "npm test" },
-		{ text: "guard exists", check: "path exists: src/auth/guard.ts" }, // id หาย → auto c2
+		{ text: "guard exists", check: "path exists: src/auth/guard.ts" }, // missing id → auto c2
 	],
 	specDebt: [],
 };
@@ -37,9 +37,9 @@ test("parseSpecDraft: valid spec (plain/fenced) → kind spec with normalized id
 	const parsed = parseSpecDraft(JSON.stringify(GOOD_SPEC));
 	assert.equal(parsed.kind, "spec");
 	assert.equal(parsed.draft.criteria[1].id, "c2"); // id auto-assign
-	const fenced = parseSpecDraft("draft ครับ:\n```json\n" + JSON.stringify({ title: "T", criteria: [{ text: "x", check: "npm test" }] }) + "\n```");
+	const fenced = parseSpecDraft("here's the draft:\n```json\n" + JSON.stringify({ title: "T", criteria: [{ text: "x", check: "npm test" }] }) + "\n```");
 	assert.equal(fenced.kind, "spec");
-	assert.deepEqual(fenced.draft.scope, []); // array หาย → []
+	assert.deepEqual(fenced.draft.scope, []); // missing array → []
 	assert.equal(fenced.draft.title, "T");
 });
 
@@ -52,7 +52,7 @@ test("parseSpecDraft: approach normalize — missing/invalid → [], valid array
 	assert.deepEqual(missing.draft.approach, []); // missing → []
 	const invalid = parseSpecDraft(JSON.stringify({ ...GOOD_SPEC, approach: 42 }));
 	assert.deepEqual(invalid.draft.approach, []); // invalid → []
-	// clarify/error contract ไม่พัง: clarify ยังชนะเฉพาะตอนไม่มี criteria
+	// the clarify/error contract holds: clarify wins only when no criteria exist
 	assert.equal(parseSpecDraft(JSON.stringify({ questions: ["q"], approach: ["x"] })).kind, "clarify");
 });
 
@@ -70,38 +70,38 @@ test("parseSpecDraft: clarify shape (questions only) → kind clarify; questions
 		{ question: "which env?", choices: [] },
 		{ question: "which db?", choices: [] },
 	]);
-	// มี criteria แล้ว = draft จริง ไม่ใช่ clarification
+	// with criteria present it's a real draft, not a clarification
 	const withCriteria = parseSpecDraft(JSON.stringify({ questions: ["q"], ...GOOD_SPEC }));
 	assert.equal(withCriteria.kind, "spec");
 });
 
 test("parseSpecDraft: clarify questions normalize — choices shape, mixed legacy, junk skipped, cap 5", () => {
-	// shape ใหม่: sub-agent แนบ choices มาให้มนุษย์เลือกเร็ว
+	// new shape: the sub-agent attaches choices for quick human picking
 	const withChoices = parseSpecDraft(JSON.stringify({ questions: [{ question: "pick env?", choices: ["dev", "prod"] }] }));
 	assert.equal(withChoices.kind, "clarify");
 	assert.deepEqual(withChoices.questions, [{ question: "pick env?", choices: ["dev", "prod"] }]);
-	// ปนกันใน array เดียวได้: legacy string + object ใหม่
+	// both shapes may mix in one array: legacy string + new object
 	const mixed = parseSpecDraft(JSON.stringify({ questions: ["plain?", { question: "with choice?", choices: ["a"] }] }));
 	assert.deepEqual(mixed.questions, [
 		{ question: "plain?", choices: [] },
 		{ question: "with choice?", choices: ["a"] },
 	]);
-	// item ที่ไม่มีคำถามจริงถูกข้าม
+	// items without a real question are skipped
 	const junky = parseSpecDraft(JSON.stringify({ questions: [{ foo: 1 }, "real?"] }));
 	assert.deepEqual(junky.questions, [{ question: "real?", choices: [] }]);
-	// เหลือ 0 ข้อ → ไม่ใช่ clarify (ตกเป็น error criteria-missing ตาม contract เดิม)
+	// zero questions left → not clarify (falls back to the criteria-missing error per contract)
 	assert.equal(parseSpecDraft(JSON.stringify({ questions: [{ foo: 1 }] })).kind, "error");
-	// cap 5 ข้อเหมือนเดิม (กันคำถามล้น dialog)
+	// the cap of 5 stays (keeps dialogs short)
 	const many = parseSpecDraft(JSON.stringify({ questions: ["1", "2", "3", "4", "5", "6"] }));
 	assert.equal(many.questions.length, 5);
 });
 
 test("parseSpecDraft: invalid outputs → kind error with a specific reason (retry feedback)", () => {
 	assert.equal(parseSpecDraft("sure, let me think about it").kind, "error");
-	assert.match(parseSpecDraft(JSON.stringify({ title: "T" })).error, /criteria/); // criteria หาย
+	assert.match(parseSpecDraft(JSON.stringify({ title: "T" })).error, /criteria/); // criteria missing
 	const badItem = parseSpecDraft(JSON.stringify({ criteria: [{ text: "x" }] }));
 	assert.equal(badItem.kind, "error");
-	assert.match(badItem.error, /\[0\]\.check/); // บอก index ให้ model แก้ตรงจุด
+	assert.match(badItem.error, /\[0\]\.check/); // names the index so the model fixes the right spot
 });
 
 test("isMachineCheckable: runnable commands / path-exists pass, manual/ambiguous fail", () => {
@@ -111,7 +111,7 @@ test("isMachineCheckable: runnable commands / path-exists pass, manual/ambiguous
 	assert.ok(isMachineCheckable("run `vitest run`"));
 	assert.ok(!isMachineCheckable("manual review by the team"));
 	assert.ok(!isMachineCheckable("ask the human to verify it works"));
-	assert.ok(!isMachineCheckable("GET /health returns 200")); // ไม่มี command token → forced human review
+	assert.ok(!isMachineCheckable("GET /health returns 200")); // no command token → forced human review
 });
 
 test("applyQualityGate: empty scope and non-machine checks are forced into specDebt with notes", () => {
@@ -131,15 +131,15 @@ test("applyQualityGate: empty scope and non-machine checks are forced into specD
 		assert.deepEqual(gated.notes, ["empty-scope", "manual-check:c2"]);
 		assert.equal(gated.draft.specDebt.length, 2);
 
-		// scope ที่ชี้ path ไม่มีจริง → quality gate ดัก (gate ไร้ฟันถ้า scope พิมพ์ผิด)
+		// a scope pointing at a nonexistent path → the quality gate catches it (a typo'd scope is toothless)
 		const ghost = applyQualityGate(dir, { ...gated.draft, scope: ["ghost/path-xyz"], specDebt: [] });
 		assert.ok(ghost.notes.some((n) => n.startsWith("scope-missing:ghost/path-xyz")));
 		assert.ok(ghost.draft.specDebt.some((d) => d.includes("ghost/path-xyz")));
 		assert.match(gated.draft.specDebt[0], /scope/);
 		assert.match(gated.draft.specDebt[1], /c2/);
-		assert.equal(gated.draft.criteria.length, 2); // criteria ไม่ถูกลบ แค่ flagged
+		assert.equal(gated.draft.criteria.length, 2); // criteria untouched, only flagged
 
-		// draft ดี (scope มี path จริงใน repo ด้วย — กฎ scope-missing ของ wave 2/3) → ไม่แตะ specDebt เพิ่ม
+		// a good draft (scope hits a real repo path — the wave 2/3 scope-missing rule) → specDebt untouched
 		mkdirSync(join(dir, "src", "auth"), { recursive: true });
 		const clean = applyQualityGate(dir, { ...GOOD_SPEC, title: "Unique title xyz", intent: "unrelated intent qrs" });
 		assert.deepEqual(clean.notes, []);
@@ -152,7 +152,7 @@ test("applyQualityGate: empty scope and non-machine checks are forced into specD
 test("findSimilarSpec: archived spec with overlapping title+intent is flagged (Jaccard ≥ 0.5)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "zense-sim-"));
 	try {
-		assert.equal(findSimilarSpec(dir, { ...GOOD_SPEC }), null); // ยังไม่มี specs dir → null
+		assert.equal(findSimilarSpec(dir, { ...GOOD_SPEC }), null); // no specs dir yet → null
 		const specsDir = join(dir, ".zense", "specs");
 		mkdirSync(specsDir, { recursive: true });
 		writeFileSync(
@@ -160,7 +160,7 @@ test("findSimilarSpec: archived spec with overlapping title+intent is flagged (J
 			JSON.stringify({ title: "fix login redirect", intent: "users hit the login page twice" }),
 		);
 		const hit = findSimilarSpec(dir, { ...GOOD_SPEC, title: "fix login redirect bug", intent: "users hit the login page twice" });
-		assert.ok(hit, "ต้องจับ spec ที่คล้ายกันได้");
+		assert.ok(hit, "must catch the similar spec");
 		assert.match(hit.file, /fix-login-redirect/);
 		const miss = findSimilarSpec(dir, { ...GOOD_SPEC, title: "database migration tooling", intent: "add schema versioning for postgres" });
 		assert.equal(miss, null);
@@ -175,7 +175,7 @@ test("buildSubagentArgv: requirements role is read-only (--exclude-tools write,e
 	const xt = ro.indexOf("--exclude-tools");
 	assert.ok(xt > 0 && ro[xt + 1] === "write,edit");
 	const md = ro.indexOf("--model");
-	assert.ok(md > xt, "--exclude-tools ต้องมาก่อน --model");
+	assert.ok(md > xt, "--exclude-tools must come before --model");
 	assert.equal(ro.at(-1), "draft a spec");
 
 	const plain = buildSubagentArgv("grade it");
@@ -183,24 +183,24 @@ test("buildSubagentArgv: requirements role is read-only (--exclude-tools write,e
 	assert.equal(plain.at(-1), "grade it");
 });
 
-test("buildSubagentArgv: per-role strip flags — grader/reviewer boot bare เต็มตัว, requirements เก็บ skills/extensions", () => {
+test("buildSubagentArgv: per-role strip flags — grader/reviewer boot fully bare, requirements keep skills/extensions", () => {
 	const FULL = ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"];
 	for (const role of ["grader", "reviewer"]) {
 		const a = buildSubagentArgv(`task-${role}`, undefined, undefined, role);
-		for (const f of FULL) assert.ok(a.includes(f), `${role} ต้องมี ${f}`);
-		assert.equal(a.at(-1), `task-${role}`, "task ต้องอยู่ท้าย argv เสมอ");
-		// strip flags ต้องอยู่หลัง --no-session และก่อน task (ก่อน --exclude-tools/--model ถ้ามี)
-		assert.ok(a.indexOf("--no-themes") > a.indexOf("--no-session"), `${role}: strip flags ต้องหลัง --no-session`);
+		for (const f of FULL) assert.ok(a.includes(f), `${role} must have ${f}`);
+		assert.equal(a.at(-1), `task-${role}`, "the task must always be argv's last element");
+		// strip flags sit after --no-session and before the task (before --exclude-tools/--model when present)
+		assert.ok(a.indexOf("--no-themes") > a.indexOf("--no-session"), `${role}: strip flags must come after --no-session`);
 	}
-	// grader ใช้คู่กับ --exclude-tools + --model → ordering: strip นำก่อนทั้งคู่
+	// grader combined with --exclude-tools + --model → ordering: strip flags lead both
 	const g = buildSubagentArgv("grade", "sonnet", ["write", "edit"], "grader");
-	assert.ok(g.indexOf("--no-skills") < g.indexOf("--exclude-tools"), "strip flags ต้องมาก่อน --exclude-tools");
-	assert.ok(g.indexOf("--exclude-tools") < g.indexOf("--model"), "--exclude-tools ต้องมาก่อน --model (contract เดิม)");
-	// requirements: explore repo ต้องเห็น skills/extensions — ตัดเฉพาะ themes/prompt-templates
+	assert.ok(g.indexOf("--no-skills") < g.indexOf("--exclude-tools"), "strip flags must come before --exclude-tools");
+	assert.ok(g.indexOf("--exclude-tools") < g.indexOf("--model"), "--exclude-tools must come before --model (standing contract)");
+	// requirements: repo exploration needs skills/extensions visible — strip only themes/prompt-templates
 	const req = buildSubagentArgv("draft", undefined, undefined, "requirements");
 	assert.ok(req.includes("--no-themes") && req.includes("--no-prompt-templates"));
-	assert.ok(!req.includes("--no-skills") && !req.includes("--no-extensions"), "requirements ห้าม strip skills/extensions");
-	// ไม่ส่ง role / role ไม่รู้จัก → ไม่มี strip flags (เช็คเฉพาะ strip flag จริง — argv มี --no-session อยู่แล้ว)
+	assert.ok(!req.includes("--no-skills") && !req.includes("--no-extensions"), "requirements must not strip skills/extensions");
+	// no role / unknown role → no strip flags (checking only real strip flags — argv always contains --no-session)
 	const STRIP_ONLY = ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"];
 	assert.ok(!STRIP_ONLY.some((f) => buildSubagentArgv("x").includes(f)));
 	assert.ok(!STRIP_ONLY.some((f) => buildSubagentArgv("x", undefined, undefined, "mystery").includes(f)));
@@ -211,9 +211,9 @@ test("buildRequirementsPrompt: enforces explore-first, JSON-only output and the 
 	assert.match(p, /EXPLORE \(read-only/);
 	assert.match(p, /NO write\/edit tools/);
 	assert.match(p, /"questions"/);
-	assert.match(p, /"choices"/); // grilling loop: sub-agent แนบตัวเลือกคำตอบได้
-	assert.match(p, /type their own/); // ผู้ใช้พิมพ์เองได้เสมอ
-	assert.match(p, /1–2 most decision-critical/); // ถามทีละน้อยข้อ วนหลายรอบ
+	assert.match(p, /"choices"/); // grilling loop: the sub-agent may attach answer options
+	assert.match(p, /type their own/); // the user can always type their own answer
+	assert.match(p, /1–2 most decision-critical/); // few questions per round, several rounds
 	assert.match(p, /Request: add dark mode$/);
 	assert.doesNotMatch(p, /Past lessons/);
 	const withLessons = buildRequirementsPrompt("x", ["📚 lesson one"]);
@@ -236,7 +236,7 @@ test("applyQualityGate: unsubstituted placeholder in check → specDebt + notes 
 		});
 		assert.ok(gated.notes.includes("placeholder:c2"));
 		assert.ok(!gated.notes.some((n) => n.startsWith("placeholder:c1")));
-		assert.ok(gated.draft.specDebt.some((d) => d.includes("มี placeholder ที่ไม่ได้ substitute ใน check") && d.includes("<module>")));
+		assert.ok(gated.draft.specDebt.some((d) => d.includes("unsubstituted placeholder in its check") && d.includes("<module>")));
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

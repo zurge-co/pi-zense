@@ -1,7 +1,7 @@
 # zense-harness
 
-> **zense (เซ็น)** พ้องเสียงกับ *sign* — ทุกงานที่สั่ง agent มีลายเซ็นมนุษย์กำกับ
-> (spec approval = ลายเซ็นฝั่ง input, review packet = การอนุมัติฝั่ง output)
+> **zense** — a pun on the Thai word for *sign*: every agent task carries a human signature
+> (spec approval = input-side signature, review packet = output-side approval)
 
 Pi extension implementing the AI-SDLC loop from `/PLAN.md`:
 
@@ -29,7 +29,7 @@ finished artifact — exactly the harness design plan.md recommends.
 ## Human attention points (the scarce resource, per PLAN.md)
 
 - **🔏 Signing dialog** — the signature happens *inside* the dialog the moment the spec is compiled (or when the gate fires, or via `/zense approve`): the dialog renders the **full spec inline** (Ctrl+D/U half page, Ctrl+F/B full page to scroll — works on every terminal) so you always read before signing; sign & continue in one shot, no extra command.
-- **`/zense approve`** — only for signing later, if you chose "ยังไม่เซ็น" before.
+- **`/zense approve`** — only for signing later, if you chose "Not yet" before.
 - **`/zense status`** — one-glance: phase, gate, trajectory flags, escalations.
 - Forced review items from `specDebt` surface in every eval report.
 - Widget above the editor shows live turn/token consumption.

@@ -45,13 +45,13 @@ test("parseGraderOutput: full contract → verdicts + evidence + overall", () =>
 });
 
 test("parseGraderOutput: missing ids / missing OVERALL / PASS without evidence are detected, not silently passed", () => {
-	// id ที่ grader ลืมตอบ → coverage ไม่ครบ (เดิมถูกเมินเงียบๆ)
+	// ids the grader forgot → incomplete coverage (used to be ignored silently)
 	assert.deepEqual(parseGraderOutput("C1: PASS: ran and it worked\nOVERALL: PASS", CRITERIA).missingIds, ["C2"]);
-	// OVERALL หาย → overall=null (caller ต้องถือว่า inconclusive)
+	// missing OVERALL → overall=null (the caller must treat it as inconclusive)
 	assert.equal(parseGraderOutput("C1: PASS: ok\nC2: PASS: ok", CRITERIA).overall, null);
-	// PASS โดยไม่แนบหลักฐาน → reject (ปิดช่องตอบมั่วแบบมั่นใจ)
+	// PASS without evidence → rejected (closes the confident-bluff hole)
 	assert.deepEqual(parseGraderOutput("C1: PASS\nc2: PASS:\nOVERALL: PASS", [{ id: "C1", text: "x", check: "y" }]).passNoEvidence, ["C1"]);
-	// id มี char พิเศษก็ไม่พัง (regex escaped)
+	// ids with special chars don't break it (regex escaped)
 	const weird = parseGraderOutput("c-1.2: PASS: ok\nOVERALL: PASS", [{ id: "c-1.2", text: "x", check: "y" }]);
 	assert.equal(weird.perCriteria["c-1.2"], "PASS");
 });
@@ -81,14 +81,14 @@ test("runCheckProbes: compound checks (path exists && shell / && path exists) ar
 		writeFileSync(join(dir, "here.txt"), "x");
 		writeFileSync(join(dir, "two.txt"), "y");
 		const probes = runCheckProbes(dir, [
-			// exists ล้วน (หลาย path) — pass ได้ทุก an / fail ถ้าขาดสักตัว เดิมหน้า regex anchored ไม่จับ compound นี้เลย
+			// pure exists (multiple paths) — passes only when all exist; the old anchored regex never matched this compound at all
 			{ id: "c1", text: "two files", check: "path exists: here.txt && path exists: two.txt" },
 			{ id: "c2", text: "missing one", check: "path exists: here.txt && path exists: nope.txt" },
-			// ปน shell — เดิมหลุดไป sh -c ทั้งก้อน → "path" ไม่ใช่คำสั่ง → exit 127 false-FAIL
+			// mixed with shell — used to fall through to sh -c whole → "path" isn't a command → exit 127 false-FAIL
 			{ id: "c3", text: "exists + shell pass", check: "path exists: here.txt && node --version" },
 			{ id: "c4", text: "exists missing + shell pass", check: "path exists: nope.txt && node --version" },
 			{ id: "c5", text: "exists ok + shell fail", check: 'node --version && path exists: here.txt && node -e "process.exit(3)"' },
-			// shell segment ที่เครื่องมือตัดสินไม่ได้ปนอยู่ใน compound → skipped ทั้ง criterion (ไม่เดา)
+			// an unjudgable shell segment inside a compound → the whole criterion is skipped (never guessed)
 			{ id: "c6", text: "unrunnable segment", check: "path exists: here.txt && manual visual QA" },
 		]);
 		assert.deepEqual(probes.map((p) => p.status), ["pass", "fail", "pass", "fail", "fail", "skipped"]);
@@ -112,14 +112,14 @@ test("runCheckProbes: shell-only check containing quoted '&&' is NOT split (runs
 
 test("runCheckProbes: malformed/usage-error check commands classify as skipped (NOT fail) — no false probe-primacy FAIL loop", () => {
 	const probes = runCheckProbes(tmpdir(), [
-		// เคสเจอจริงจาก eval ที่ FAIL เทียม: helm arg error / test usage error — คำสั่งเสียเอง ไม่ใช่ artifact ผิด
+		// real cases from false FAILs: helm arg error / test usage error — the command itself is broken, not the artifact
 		{ id: "u1", text: "helm arg error", check: `node -e "console.error('Error: expected at most two arguments, unexpected: +, grep'); process.exit(1)"` },
 		{ id: "u2", text: "test usage error", check: `node -e "console.error('sh: test: too many arguments'); process.exit(2)"` },
 		{ id: "u3", text: "command not found", check: "this-command-does-not-exist-xyz --version jq" },
-		// เช็คที่รันได้แต่ artifact ไม่ผ่าน = ยัง fail เต็มตัว (probe primacy ยังทับ grader ได้)
+		// checks that ran fine but the artifact missed = still full fails (probe primacy may still override the grader)
 		{ id: "u4", text: "silent exit 1", check: 'node -e "process.exit(1)"' },
 		{ id: "u5", text: "grep no match", check: "echo hello | grep -q goodbye" },
-		// compound: shell segment คำสั่งเสีย → skipped ทั้ง criterion (ตัดสินไม่ได้ ไม่เดา)
+		// compound: a broken shell segment → the whole criterion is skipped (can't judge, never guess)
 		{ id: "u6", text: "compound with broken segment", check: `node --version && node -e "console.error('usage: x [opts]'); process.exit(2)"` },
 	]);
 	assert.deepEqual(probes.map((p) => p.status), ["skipped", "skipped", "skipped", "fail", "fail", "skipped"]);
@@ -135,14 +135,14 @@ test("lintSpecChecks: spec-side broken checks (127 / not-runnable / placeholder)
 			{ id: "b1", text: "t", check: "bash -c no-such-cmd-qqq" }, // exit 127 → cmdErr → skipped → broken
 			{ id: "b2", text: "t", check: "definitely-not-a-real-cmd-xyz --version" }, // not machine-runnable → skipped → broken
 			{ id: "b3", text: "t", check: "path exists: src/<module>/x" }, // unsubstituted placeholder → skipped → broken
-			{ id: "k1", text: "t", check: "path exists: no-such-artifact-abc" }, // artifact ยังไม่ implement → fail → ไม่เตือน
-			{ id: "k2", text: "t", check: "test 1 -eq 2" }, // คำสั่งดี รัน fail จริง → ไม่เตือน
-			{ id: "k3", text: "t", check: "node --version" }, // pass → ไม่เตือน
+			{ id: "k1", text: "t", check: "path exists: no-such-artifact-abc" }, // artifact not yet implemented → fail → no warning
+			{ id: "k2", text: "t", check: "test 1 -eq 2" }, // good command, genuinely fails → no warning
+			{ id: "k3", text: "t", check: "node --version" }, // pass → no warning
 		]);
 		assert.deepEqual(r.broken.sort(), ["b1", "b2", "b3"]);
-		assert.ok(r.notes.some((n) => n.includes("b1")), "note ต้องระบุ id ที่ broken");
-		assert.ok(r.notes.every((n) => n.startsWith("check-lint:")), "ทุก note ต้องขึ้นต้น check-lint:");
-		// criteria ว่าง/ผ่านหมด → ไม่มีอะไรเตือน
+		assert.ok(r.notes.some((n) => n.includes("b1")), "a note must name the broken id");
+		assert.ok(r.notes.every((n) => n.startsWith("check-lint:")), "every note must start with check-lint:");
+		// empty/all-passing criteria → nothing to warn about
 		assert.deepEqual(lintSpecChecks(dir, []), { broken: [], notes: [] });
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -151,26 +151,26 @@ test("lintSpecChecks: spec-side broken checks (127 / not-runnable / placeholder)
 
 test("CHECK_FORMAT_CONTRACT + requirements prompt: contract markers (sh -c / path exists: / && / ** / specDebt / npm test)", () => {
 	for (const marker of ["sh -c", "path exists:", "&&", "**", "specDebt", "npm test"])
-		assert.ok(CHECK_FORMAT_CONTRACT.includes(marker), `contract ขาด marker "${marker}"`);
+		assert.ok(CHECK_FORMAT_CONTRACT.includes(marker), `contract missing marker "${marker}"`);
 	const p = buildRequirementsPrompt("probe", []);
 	for (const marker of ["sh -c", "path exists:", "specDebt", "&&", "**", "npm test"])
-		assert.ok(p.includes(marker), `requirements prompt ขาด marker "${marker}"`);
-	// prompt ต้อง embed contract ก้อนเดียวกัน (single source of truth) — ห้าม fork คำสั่ง
-	assert.ok(p.includes(CHECK_FORMAT_CONTRACT.slice(0, 120)), "prompt ต้อง embed CHECK_FORMAT_CONTRACT");
+		assert.ok(p.includes(marker), `requirements prompt missing marker "${marker}"`);
+	// the prompt must embed the very same contract blob (single source of truth) — never fork the wording
+	assert.ok(p.includes(CHECK_FORMAT_CONTRACT.slice(0, 120)), "prompt must embed CHECK_FORMAT_CONTRACT");
 });
 
-test("zense_spec schema: criteria.check description ใช้ CHECK_FORMAT_CONTRACT (single source of truth)", async () => {
+test("zense_spec schema: criteria.check description uses CHECK_FORMAT_CONTRACT (single source of truth)", async () => {
 	const { readFileSync } = await import("node:fs");
 	const { join, dirname } = await import("node:path");
 	const { fileURLToPath } = await import("node:url");
 	const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "zense-harness", "index.ts"), "utf8");
-	assert.match(src, /check:\s*Type\.String\(\{ description: CHECK_FORMAT_CONTRACT \}\)/, "schema ต้อง reference contract ก้อนเดียวกัน");
-	// commitSpec (choke point ของทั้ง set และ compile) ต้องเรียก lint ก่อนสร้าง state.spec
+	assert.match(src, /check:\s*Type\.String\(\{ description: CHECK_FORMAT_CONTRACT \}\)/, "the schema must reference the same contract blob");
+	// commitSpec (the choke point of both set and compile) must run lint before state.spec is built
 	const i = src.indexOf("const commitSpec");
 	const j = src.indexOf("pi.registerTool", i);
-	assert.ok(j > i, "หา registerTool หลัง commitSpec ไม่เจอ");
-	assert.ok(src.slice(i, j).includes("lintSpecChecks"), "commitSpec ต้อง wire lintSpecChecks");
-	assert.ok(src.slice(i, src.indexOf("state.spec = {", i)).includes("lintSpecChecks"), "lint ต้องรันก่อน state.spec ถูกสร้าง");
+	assert.ok(j > i, "registerTool after commitSpec not found");
+	assert.ok(src.slice(i, j).includes("lintSpecChecks"), "commitSpec must wire lintSpecChecks");
+	assert.ok(src.slice(i, src.indexOf("state.spec = {", i)).includes("lintSpecChecks"), "lint must run before state.spec is created");
 });
 
 test("SUBAGENT_EXCLUDE_TOOLS: grader and reviewer are read-only like requirements", () => {
@@ -189,7 +189,7 @@ test("gatherRepoFacts: reads package scripts + README head + layout, tolerates b
 		assert.match(facts, /test="node --test test\/x\.mjs"/);
 		assert.match(facts, /README\.md \(head\)/);
 		assert.match(facts, /top-level dirs: src/);
-		// dir เปล่า → ไม่มี fact ของ repo (toolchain fact ของ host มีได้ — repo แบบ cargo/go ไม่มี package.json ก็ต้องใช้), ไม่ throw
+		// a bare dir → no repo facts (the host toolchain fact is fine — package.json-less cargo/go repos need it), no throw
 		const bare = mkdtempSync(join(tmpdir(), "zense-facts-bare-"));
 		try {
 			assert.ok(gatherRepoFacts(bare).every((f) => f.startsWith("- toolchain on PATH")));
@@ -204,7 +204,7 @@ test("gatherRepoFacts: reads package scripts + README head + layout, tolerates b
 test("loadSpecExemplar: picks the newest APPROVED spec with criteria, skips unapproved/broken", () => {
 	const dir = mkdtempSync(join(tmpdir(), "zense-exemplar-"));
 	try {
-		assert.equal(loadSpecExemplar(dir), null); // ยังไม่มี archive
+		assert.equal(loadSpecExemplar(dir), null); // no archive yet
 		const specsDir = join(dir, ".zense", "specs");
 		mkdirSync(specsDir, { recursive: true });
 		writeFileSync(
@@ -218,7 +218,7 @@ test("loadSpecExemplar: picks the newest APPROVED spec with criteria, skips unap
 		writeFileSync(join(specsDir, "2026-03-01-00-00-00-v3-broken.json"), "{not json");
 		const ex = loadSpecExemplar(dir);
 		assert.ok(ex);
-		assert.match(ex, /old signed/, "ต้องข้ามไฟล์ที่ใหม่กว่าแต่ unsigned/broken แล้วหยิบตัวที่ approved");
+		assert.match(ex, /old signed/, "must skip the newer-but-unsigned/broken files and pick the approved one");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -233,7 +233,7 @@ test("buildGraderPrompt: probe results are authoritative, evidence mandatory, re
 	assert.match(p, /Reward-hacking checklist/);
 	assert.match(p, /Change summary/);
 	assert.match(p, /A PASS without evidence is rejected/);
-	// retry feedback ถูกต่อท้าย
+	// retry feedback gets appended
 	assert.match(buildGraderPrompt(spec, [], "", "no verdict given for: C2"), /SYSTEM FEEDBACK: your previous response was rejected: no verdict given for: C2/);
 });
 
@@ -277,14 +277,14 @@ test("buildReviewerPrompt: carries eval evidence + git + flags/debt, defines str
 	assert.match(p, /Intent: make things fast/);
 	assert.match(p, /Eval verdict: PASS/);
 	assert.match(p, /C2=FAIL/);
-	assert.match(p, /C1: pass — ok/); // r2: probe แนบ detail verbatim แทน id:status ล้วน
+	assert.match(p, /C1: pass — ok/); // r2: probes carry their detail verbatim, not bare id:status
 	assert.match(p, /out-of-scope write: x/);
 	assert.match(p, /debt one/);
 	assert.match(p, /need-fix: criteria failed: C2/);
 	assert.match(p, /abc impl v2/);
 	assert.match(p, /never write "to be implemented"/);
 	assert.match(p, /## Human actions/);
-	assert.match(buildReviewerPrompt("i", undefined, [], [], [], "", "Rollback"), /was rejected: Rollback/); // r5: feedback ใช้ได้ทั้ง schema และ grounding
+	assert.match(buildReviewerPrompt("i", undefined, [], [], [], "", "Rollback"), /was rejected: Rollback/); // r5: feedback covers both schema and grounding
 });
 
 test("buildReviewerPrompt: stale lastEval (version/tree) is dropped and warned", () => {
@@ -295,17 +295,17 @@ test("buildReviewerPrompt: stale lastEval (version/tree) is dropped and warned",
 		specVersion: 1,
 		head: "tree-aaa",
 	};
-	// spec version ไม่ตรง → stale: ตัด verdict/per-criteria/probe ทิ้ง + เตือน
+	// version mismatch → stale: verdict/per-criteria/probes dropped + warning
 	const staleV = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 2, head: "tree-aaa" });
 	assert.doesNotMatch(staleV, /Eval verdict: PASS/);
 	assert.doesNotMatch(staleV, /C1=PASS/);
 	assert.doesNotMatch(staleV, /C1: pass/);
 	assert.match(staleV, /STALE eval evidence/);
-	// tree ไม่ตรง (แก้โค้ดหลัง eval) → stale เช่นกัน
+	// tree mismatch (code changed after eval) → stale too
 	const staleT = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 1, head: "tree-bbb" });
 	assert.doesNotMatch(staleT, /Eval verdict: PASS/);
 	assert.match(staleT, /STALE eval evidence/);
-	// fresh (version+tree ตรง) → render เหมือนเดิมทุกบรรทัด
+	// fresh (version+tree match) → renders every line as before
 	const fresh = buildReviewerPrompt("i", ev, [], [], [], "", "", { specVersion: 1, head: "tree-aaa" });
 	assert.match(fresh, /Eval verdict: PASS/);
 	assert.match(fresh, /C1=PASS/);
@@ -328,11 +328,11 @@ test("gitChangeSummary: baseline scopes log+diff to baseline..HEAD", () => {
 		git(["add", "-A"]);
 		git(["commit", "-q", "-m", "current-round commit"]);
 		const scoped = gitChangeSummary(cwd, baseline);
-		assert.match(scoped, /current-round commit/); // เห็นเฉพาะ commit ของรอบนี้
-		assert.doesNotMatch(scoped, /old-round commit/); // commit ก่อน baseline ต้องไม่ปน
-		assert.match(scoped, /new-round-file\.txt/); // diffstat เทียบ baseline เห็นไฟล์ใหม่
+		assert.match(scoped, /current-round commit/); // only this round's commit shows
+		assert.doesNotMatch(scoped, /old-round commit/); // pre-baseline commits must not leak in
+		assert.match(scoped, /new-round-file\.txt/); // the baseline-referenced diffstat sees the new file
 		assert.doesNotMatch(scoped, /old-round-file\.txt/);
-		// degrade: ไม่ส่ง baseline → behavior เดิม (log ทั้งประวัติ); baseline ใน dir ที่ไม่ใช่ repo → ไม่ throw
+		// degrade: no baseline → previous behavior (full history); baseline in a non-repo dir → no throw
 		assert.match(gitChangeSummary(cwd), /old-round commit/);
 		const nonGit = mkdtempSync(join(tmpdir(), "zense-nogit-base-"));
 		try {
@@ -345,28 +345,28 @@ test("gitChangeSummary: baseline scopes log+diff to baseline..HEAD", () => {
 	}
 });
 
-test("buildPendingApplyEvidencePrefix: reviewer ไม่อาจเข้าใจผิดว่า main ถูก commit แล้ว — label staged-uncommitted ชัดเมื่อมี pendingApply", () => {
-	// มี pendingApply (apply-back แล้ว รอมนุษย์ commit): ต้องบอกชัดว่า changes เป็น staged-but-uncommitted by design
+test("buildPendingApplyEvidencePrefix: the reviewer can't mistake main for committed — a clear staged-uncommitted label when pendingApply exists", () => {
+	// with pendingApply (applied, awaiting a human commit): must state clearly that changes are staged-but-uncommitted by design
 	const p = buildPendingApplyEvidencePrefix(true, false);
 	assert.match(p, /staged, uncommitted/);
 	assert.match(p, /a human commits after this review/);
 	assert.match(p, /no new commits since baseline.+expected/);
-	// มนุษย์แก้ไฟล์ระหว่าง review → note เพิ่ม แต่ review ดำเนินต่อ (ไม่ถือ stale)
+	// human edits during review → an extra note, but the review proceeds (not stale)
 	const h = buildPendingApplyEvidencePrefix(true, true);
 	assert.match(h, /edited AFTER eval\+apply/);
 	assert.match(h, /review as normal/);
-	// ไม่มี pendingApply (flow เดิม/ก่อน eval) → ไม่มี label ปน
+	// no pendingApply (old flow / pre-eval) → no stray label
 	assert.equal(buildPendingApplyEvidencePrefix(false, false), "");
-	// ต่อเข้า buildReviewerPrompt เป็น gitSummary แล้ว label ต้องรอดเข้า prompt จริง
+	// concatenated into buildReviewerPrompt as gitSummary, the label must survive into the actual prompt
 	const prompt = buildReviewerPrompt("i", undefined, [], [], [], buildPendingApplyEvidencePrefix(true, false) + "\n" + "diffstat vs baseline:\n src.ts | 2 ++", "", {
 		specVersion: 1,
 		head: "tree-x",
 	});
 	assert.match(prompt, /staged, uncommitted/);
-	assert.match(prompt, /src\.ts \| 2/); // diffstat ของ staged changes ยังมากับ evidence
+	assert.match(prompt, /src\.ts \| 2/); // the staged-changes diffstat still rides with the evidence
 });
 
-test("gitChangeSummary: change ที่ staged แต่ยังไม่ commit (pendingApply) ยังโผล่ใน diffstat/porcelain — reviewer เห็น evidence ครบ", () => {
+test("gitChangeSummary: staged-but-uncommitted changes (pendingApply) still show in diffstat/porcelain — the reviewer sees full evidence", () => {
 	const cwd = mkdtempSync(join(tmpdir(), "zense-staged-"));
 	try {
 		const git = (args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -377,12 +377,12 @@ test("gitChangeSummary: change ที่ staged แต่ยังไม่ comm
 		git(["add", "-A"]);
 		git(["commit", "-q", "-m", "baseline commit"]);
 		const baseline = git(["rev-parse", "HEAD"]).trim();
-		// จำลองสถานะหลัง apply-back: ไฟล์ใหม่ staged แต่ HEAD ไม่ขยับ (ยังไม่มี commit)
+		// simulate post-apply-back state: new file staged, HEAD unmoved (no commit yet)
 		writeFileSync(join(cwd, "applied.txt"), "staged only\n");
 		git(["add", "applied.txt"]);
 		const s = gitChangeSummary(cwd, baseline);
-		assert.match(s, /applied\.txt/); // ทั้ง porcelain และ diffstat ต้องเห็น staged change
-		assert.doesNotMatch(s, /commits since baseline/); // ไม่มี commit ใหม่หลัง baseline (apply-back ไม่ commit — by design)
+		assert.match(s, /applied\.txt/); // both porcelain and diffstat must see the staged change
+		assert.doesNotMatch(s, /commits since baseline/); // no new commits after baseline (apply-back never commits — by design)
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
 	}
@@ -403,7 +403,7 @@ test("buildRequirementsPrompt: facts + exemplar spliced in, request stays last (
 test("applyQualityGate: scope pointing at a non-existent path is caught (gate would be toothless otherwise)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "zense-scope-"));
 	try {
-		mkdirSync(join(dir, "src", "real-dir"), { recursive: true }); // path จริง → ไม่โดน flag
+		mkdirSync(join(dir, "src", "real-dir"), { recursive: true }); // a real path → not flagged
 		const { notes, draft } = applyQualityGate(dir, {
 			title: "t",
 			intent: "i",
@@ -420,14 +420,14 @@ test("applyQualityGate: scope pointing at a non-existent path is caught (gate wo
 	}
 });
 
-test("canReuseWorktree: null/missing-dir → false, existing dir → true (กัน spec bump ทำงานค้างหลุดเป็น orphan)", async () => {
+test("canReuseWorktree: null/missing-dir → false, existing dir → true (guards against a spec bump orphaning in-progress work)", async () => {
 	const { canReuseWorktree } = await import("../extensions/zense-harness/index.ts");
 	assert.equal(canReuseWorktree(null), false);
 	assert.equal(canReuseWorktree(undefined), false);
 	assert.equal(canReuseWorktree({ root: "/nonexistent-zense-wt-xyz-123", branch: "zense/impl/v1-x", dir: "/nonexistent-zense-wt-xyz-123" }), false);
 	const dir = mkdtempSync(join(tmpdir(), "zense-reuse-"));
 	try {
-		// reuse = เงื่อนไขเดียวที่เปลี่ยนคือ dir อยู่จริง — branch/dir metadata เดิมต้องไม่ถูกแตะ
+		// reuse = the only changing condition is the dir existing on disk — its branch/dir metadata must stay intact
 		assert.equal(canReuseWorktree({ root: dir, branch: "zense/impl/v3-old", dir }), true);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -440,7 +440,7 @@ test("hasUnsubstitutedPlaceholder: returns offending token for angle/brace templ
 	assert.equal(hasUnsubstitutedPlaceholder("{name} gate"), "{name}");
 	assert.equal(hasUnsubstitutedPlaceholder("npm test"), null);
 	assert.equal(hasUnsubstitutedPlaceholder('node -e "process.exit(1)"'), null);
-	// shell จริง: redirection/grep ไม่ใช่ placeholder; ${VAR} ถูกยกเว้น (lookbehind)
+	// real shell: redirection/grep are not placeholders; ${VAR} is excepted (lookbehind)
 	assert.equal(hasUnsubstitutedPlaceholder("cat nofile 2>&1 | grep -q ok"), null);
 	assert.equal(hasUnsubstitutedPlaceholder('grep -q "${HOME}" README.md'), null);
 });
@@ -462,7 +462,7 @@ test("modelMatchesPattern: exact / thinking-suffix / case-insensitive match, rej
 	assert.ok(modelMatchesPattern("openai/gpt-4.1", "openai/gpt-4.1:high"));
 	assert.ok(modelMatchesPattern("OpenAI/GPT-4.1", "openai/gpt-4.1"));
 	assert.ok(!modelMatchesPattern("openai/gpt-4.1", "anthropic/claude"));
-	assert.ok(!modelMatchesPattern("synthetic/syn:large:text", "synthetic/syn:large")); // prefix ไม่ใช่ suffix pair
+	assert.ok(!modelMatchesPattern("synthetic/syn:large:text", "synthetic/syn:large")); // a prefix is not a suffix pair
 });
 
 test("normalizeShellCommand: strips leading bash:/sh:/shell:/zsh: prefix once, no-op otherwise", () => {
@@ -470,13 +470,13 @@ test("normalizeShellCommand: strips leading bash:/sh:/shell:/zsh: prefix once, n
 	assert.equal(normalizeShellCommand("sh:npm test"), "npm test");
 	assert.equal(normalizeShellCommand("SHELL: node --version"), "node --version");
 	assert.equal(normalizeShellCommand("zsh: make build"), "make build");
-	// no-op: ไม่มี prefix / prefix อยู่กลางสตริง / ทั้งก้อนเป็น shell command จริง
+	// no-op: no prefix / prefix mid-string / a genuine shell command as a whole
 	assert.equal(normalizeShellCommand("npm test"), "npm test");
 	assert.equal(normalizeShellCommand("bash --version"), "bash --version");
 	assert.equal(normalizeShellCommand('echo "a" && bash: node --version'), 'echo "a" && bash: node --version');
 });
 
-test("runCheckProbes: leading runner prefix executes the stripped command (pass/fail/cmdErr ตามจริง)", () => {
+test("runCheckProbes: leading runner prefix executes the stripped command (true pass/fail/cmdErr)", () => {
 	const probes = runCheckProbes(tmpdir(), [
 		{ id: "n1", text: "prefixed pass", check: "bash: node --version" },
 		{ id: "n2", text: "prefixed real fail", check: 'sh: node -e "process.exit(7)"' },
@@ -484,14 +484,14 @@ test("runCheckProbes: leading runner prefix executes the stripped command (pass/
 		{ id: "n4", text: "prefixed compound", check: "shell: node --version && path exists: definitely-missing-file-xyz" },
 	]);
 	assert.deepEqual(probes.map((p) => p.status), ["pass", "fail", "skipped", "fail"]);
-	assert.equal(probes[1].exitCode, 7); // fail จริง = execute จริง ไม่ใช่ 127
-	assert.equal(probes[2].exitCode, 127); // คำสั่งข้างในหาย → cmdErr ยัง skipped เหมือนเดิม
+	assert.equal(probes[1].exitCode, 7); // a real fail = really executed, not 127
+	assert.equal(probes[2].exitCode, 127); // inner command missing → cmdErr, still skipped as before
 	assert.match(probes[2].detail, /probe command error/);
 	assert.match(probes[3].detail, /not found: definitely-missing-file-xyz/);
 });
 
-// ----- M (spec v2 ข้อ 1): per-role strip flags table
-test("SUBAGENT_STRIP_FLAGS: grader/reviewer bare เต็มตัว, requirements ตัดเฉพาะ themes/templates", () => {
+// ----- M: per-role strip flags table
+test("SUBAGENT_STRIP_FLAGS: grader/reviewer fully bare, requirements strips only themes/templates", () => {
 	const FULL = ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"];
 	assert.deepEqual(SUBAGENT_STRIP_FLAGS.grader, FULL);
 	assert.deepEqual(SUBAGENT_STRIP_FLAGS.reviewer, FULL);
@@ -499,8 +499,8 @@ test("SUBAGENT_STRIP_FLAGS: grader/reviewer bare เต็มตัว, requirem
 	assert.equal(SUBAGENT_STRIP_FLAGS["unknown-role"], undefined);
 });
 
-// ----- M (spec v2 ข้อ 2): compact tool-result builders
-test("buildCompactProbeSection: ลงรายละเอียดเฉพาะ probes ที่ไม่ pass; pass รวมบรรทัดเดียว", () => {
+// ----- M: compact tool-result builders
+test("buildCompactProbeSection: detail only for non-pass probes; passes collapse to one line", () => {
 	const section = buildCompactProbeSection([
 		{ id: "c1", status: "pass", detail: "ok" },
 		{ id: "c2", status: "fail", exitCode: 1, detail: "npm test exploded\nstack line 2" },
@@ -510,12 +510,12 @@ test("buildCompactProbeSection: ลงรายละเอียดเฉพา
 	assert.match(section, /## Probes/);
 	assert.match(section, /- c2: fail \(exit 1\) — npm test exploded/);
 	assert.match(section, /- c3: skipped — not machine-runnable/);
-	assert.match(section, /probes pass: c1,c4/); // pass รวมบรรทัดเดียว
-	assert.ok(!section.includes("stack line 2"), "detail ต้องถูกตัดเป็นบรรทัดเดียว");
-	assert.ok(!section.includes("- c1:"), "probe ที่ pass ห้ามมีบรรทัด detail ของตัวเอง");
+	assert.match(section, /probes pass: c1,c4/); // passes merged into one line
+	assert.ok(!section.includes("stack line 2"), "detail must be cut to one line");
+	assert.ok(!section.includes("- c1:"), "a passing probe gets no detail line of its own");
 });
 
-test("buildEvalResultText PASS: verdict + verdicts ครบทุก criterion + directives เรียก zense_review + log hint", () => {
+test("buildEvalResultText PASS: verdict + per-criterion verdicts + zense_review directive + log hint", () => {
 	const text = buildEvalResultText({
 		verdict: "PASS",
 		criteria: [
@@ -535,17 +535,17 @@ test("buildEvalResultText PASS: verdict + verdicts ครบทุก criterion 
 		logPath: ".zense/subagents/t-grader.log",
 	});
 	assert.match(text, /✅ Eval PASS/);
-	assert.match(text, /zense_review/, "PASS directives ต้องสั่งเรียก zense_review ทันที (agent เคยถือว่างานจบเงียบๆ)");
+	assert.match(text, /zense_review/, "the PASS directive must order zense_review immediately (the agent once silently considered itself done)");
 	assert.match(text, /- C1: PASS — npm test exit 0/);
 	assert.match(text, /- C2: PASS — file found/);
 	assert.match(text, /probes pass: C1,C2/);
 	assert.match(text, /out-of-scope write/);
 	assert.match(text, /manual QA/);
 	assert.match(text, /\.zense\/subagents\/t-grader\.log/);
-	assert.match(text, /อ่านเอง|log/, "ต้องชี้ log ให้ agent อ่านเอง");
+	assert.match(text, /read it yourself/, "must point the agent at the log to read itself");
 });
 
-test("buildEvalResultText FAIL: เฉพาะ criteria ที่ FAIL + evidence ตัด 120 chars + ไม่มีบรรทัดของตัวที่ PASS", () => {
+test("buildEvalResultText FAIL: failing criteria only + evidence capped at 120 chars + no lines for passing ones", () => {
 	const longEvidence = "x".repeat(200);
 	const text = buildEvalResultText({
 		verdict: "FAIL",
@@ -566,55 +566,56 @@ test("buildEvalResultText FAIL: เฉพาะ criteria ที่ FAIL + eviden
 		logPath: ".zense/subagents/t-grader.log",
 	});
 	assert.match(text, /❌ Eval FAIL/);
-	assert.match(text, /criteria ที่ไม่ผ่าน: C2/);
+	assert.match(text, /failing criteria: C2/);
 	assert.match(text, /probe override → FAIL \[C2\]/);
 	assert.match(text, /- C2: FAIL — /);
-	assert.ok(!text.includes("- C1: PASS"), "FAIL branch ต้องตัด per-criteria ที่ PASS ออก");
+	assert.ok(!text.includes("- C1: PASS"), "the FAIL branch must cut passing per-criteria lines");
 	const c2Line = text.split("\n").find((l) => l.startsWith("- C2:"));
-	assert.ok(c2Line.length <= 121 + "- C2: FAIL — ".length, `evidence ต้องถูกตัด ~120 chars (ได้ ${c2Line.length})`);
-	assert.ok(!text.includes("second line"), "evidence ต้องเหลือบรรทัดเดียว");
+	assert.ok(c2Line.length <= 121 + "- C2: FAIL — ".length, `evidence must be cut to ~120 chars (got ${c2Line.length})`);
+	assert.ok(!text.includes("second line"), "evidence must stay one line");
 	assert.match(text, /probes pass: C1/);
 	assert.match(text, /build broke/);
-	assert.ok(text.length < 2_500, `ข้อความ FAIL ต้องสั้นกว่า output ดิบแบบเดิมอย่างมีนัยสำคัญ (ได้ ${text.length} chars)`);
+	assert.ok(text.length < 2_500, `the FAIL text must be significantly shorter than the old raw dump (got ${text.length} chars)`);
 });
 
-test("buildReviewResultText: TL;DR + counts + log hint; failure branch มี error tail และ log", () => {
+test("buildReviewResultText: TL;DR + counts + log hint; the failure branch carries the error tail and the log", () => {
 	const okText = buildReviewResultText({ ok: true, tlDr: "all good", trajectoryCount: 2, escalationCount: 1, logPath: ".zense/subagents/t-reviewer.log" });
 	assert.match(okText, /all good/);
 	assert.match(okText, /trajectory flags: 2 · escalations: 1/);
 	assert.match(okText, /t-reviewer\.log/);
-	assert.ok(okText.length < 600, "compact result ต้องสั้นกว่า packet slice(0,4000) เดิม");
+	assert.ok(okText.length < 600, "the compact result must be shorter than the old packet slice(0,4000)");
 	const errText = buildReviewResultText({ ok: false, tlDr: "", trajectoryCount: 0, escalationCount: 0, logPath: ".zense/subagents/t-reviewer.log", errorOutput: "exited code=1" });
 	assert.match(errText, /reviewer failed: exited code=1/);
 	assert.match(errText, /t-reviewer\.log/);
 });
 
-// ----- M (spec v2 ข้อ 3): comment-discipline guideline
-test("COMMENT_DISCIPLINE_GUIDELINE: ครอบประเด็นบังคับ 5 ข้อและอยู่ในขนาด guideline สั้น", () => {
-	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /non-obvious/); // WHY เท่านั้น
-	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /WHAT a line does/i); // ห้าม what-comment
-	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /banner/i); // ห้าม separator/banner
-	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /JSDoc/i); // ห้าม docstring boilerplate
-	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /existing decision-recording comments/i); // ห้ามลบ comment เดิมของ repo
+// ----- M: comment-discipline guideline
+test("COMMENT_DISCIPLINE_GUIDELINE: covers all 5 mandatory rules and stays short", () => {
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /non-obvious/); // WHY only
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /WHAT a line does/i); // no what-comments
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /banner/i); // no separators/banners
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /JSDoc/i); // no docstring boilerplate
+	assert.match(COMMENT_DISCIPLINE_GUIDELINE, /existing decision-recording comments/i); // never delete the repo's existing comments
 	const lines = COMMENT_DISCIPLINE_GUIDELINE.split("\n");
-	assert.ok(lines.length <= 10, `guideline ต้องสั้น ~8 บรรทัด (ได้ ${lines.length})`);
+	assert.ok(lines.length <= 10, `the guideline must stay ~8 lines (got ${lines.length})`);
 });
 
-// TDZ guard (2026-09-08): zense_eval inconclusive branch เคย crash "Cannot access 'probeSection'
-// before initialization" เพราะประกาศไว้หลัง branch — bug รอดเพราะไม่มี test ครอบ error path นี้เลย
-test("TDZ guard: probeSection ประกาศครั้งเดียวและอยู่ก่อน inconclusive branch เสมอ", async () => {
+// TDZ guard (2026-09-08): zense_eval's inconclusive branch once crashed "Cannot access
+// 'probeSection' before initialization" because it was declared after the branch — the bug
+// survived because no test covered that error path
+test("TDZ guard: probeSection is declared exactly once and always before the inconclusive branch", async () => {
 	const { readFileSync } = await import("node:fs");
 	const { join, dirname } = await import("node:path");
 	const { fileURLToPath } = await import("node:url");
 	const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "zense-harness", "index.ts"), "utf8");
 	const decl = [...src.matchAll(/const probeSection = buildCompactProbeSection\(probes\)/g)];
-	assert.equal(decl.length, 1, "probeSection ต้องประกาศครั้งเดียว");
+	assert.equal(decl.length, 1, "probeSection must be declared exactly once");
 	const branch = src.indexOf("if (!grade.ok || !parsed || !parsed.overall)");
-	assert.ok(branch > 0, "หา inconclusive branch ไม่เจอ (rename?)");
-	assert.ok(decl[0].index < branch, "probeSection ต้องประกาศก่อน inconclusive branch (TDZ regression)");
-	// evalView ก็เคยโดนด้วย (inconclusive ใช้ evalView.logPath ก่อนประกาศ) — ห้ามใช้ก่อน const evalView
+	assert.ok(branch > 0, "inconclusive branch not found (renamed?)");
+	assert.ok(decl[0].index < branch, "probeSection must be declared before the inconclusive branch (TDZ regression)");
+	// evalView had the same bug once (inconclusive used evalView.logPath before its declaration) — no use before const evalView
 	const lines = src.split("\n");
 	const evalViewDecl = lines.findIndex((l) => l.includes("const evalView"));
 	const prematureUse = lines.findIndex((l, i) => l.includes("evalView.logPath") && i < evalViewDecl);
-	assert.equal(prematureUse, -1, "evalView.logPath ถูกใช้ก่อนประกาศ (TDZ regression)");
+	assert.equal(prematureUse, -1, "evalView.logPath used before its declaration (TDZ regression)");
 });

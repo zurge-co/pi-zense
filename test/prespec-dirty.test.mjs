@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { uncommittedChanges, snapshotUncommitted, composeSnapshotMessage, isGitRepo, gitAddButZense } from "../extensions/zense-harness/index.ts";
 
-/** สร้าง temp git repo พร้อม initial commit (tracked: README.md + .zense/x) */
+/** temp git repo with an initial commit (tracked: README.md + .zense/x) */
 const makeRepo = () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-dirty-"));
 	const cwd = join(base, "repo");
@@ -23,16 +23,16 @@ const makeRepo = () => {
 	return { cwd, base, git };
 };
 
-test("uncommittedChanges: repo สะอาด → [] (รวมถึง .zense ที่ถูกแก้ — harness state ไม่นับ)", () => {
+test("uncommittedChanges: clean repo → [] (incl. modified .zense — harness state doesn't count)", () => {
 	const { cwd, base } = makeRepo();
 	assert.deepEqual(uncommittedChanges(cwd), []);
-	appendFileSync(join(cwd, ".zense", "x"), "dirty"); // แตะเฉพาะ .zense
-	writeFileSync(join(cwd, ".zense", "memory.jsonl"), "{}\n"); // untracked ใน .zense
+	appendFileSync(join(cwd, ".zense", "x"), "dirty"); // touch only .zense
+	writeFileSync(join(cwd, ".zense", "memory.jsonl"), "{}\n"); // untracked inside .zense
 	assert.deepEqual(uncommittedChanges(cwd), []);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("uncommittedChanges: tracked ที่แก้ + untracked ใหม่ → ถูก list ทั้งคู่", () => {
+test("uncommittedChanges: modified tracked + new untracked files → both listed", () => {
 	const { cwd, base } = makeRepo();
 	appendFileSync(join(cwd, "README.md"), "more\n");
 	writeFileSync(join(cwd, "new.ts"), "export {};\n");
@@ -43,36 +43,36 @@ test("uncommittedChanges: tracked ที่แก้ + untracked ใหม่ �
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("uncommittedChanges: dir ที่ไม่ใช่ git repo → [] (degrade เงียบ ไม่บล็อก compile)", () => {
+test("uncommittedChanges: non-git dir → [] (degrades silently, never blocks compile)", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-dirty-nogit-"));
 	assert.deepEqual(uncommittedChanges(base), []);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("snapshotUncommitted: commit ของที่ค้างนอก .zense → repo สะอาด, .zense ไม่ตามเข้า commit", () => {
+test("snapshotUncommitted: commits pending changes outside .zense → repo clean, no .zense in the commit", () => {
 	const { cwd, base, git } = makeRepo();
 	writeFileSync(join(cwd, "wip.ts"), "// wip\n");
-	writeFileSync(join(cwd, ".zense", "memory.jsonl"), "{}\n"); // ต้องไม่โดน commit
+	writeFileSync(join(cwd, ".zense", "memory.jsonl"), "{}\n"); // must not be committed
 	const r = snapshotUncommitted(cwd, composeSnapshotMessage(uncommittedChanges(cwd)));
 	assert.equal(r.ok, true, r.msg);
 	assert.notEqual(r.msg, "nothing to commit");
-	assert.deepEqual(uncommittedChanges(cwd), []); // นอก .zense สะอาดแล้ว
+	assert.deepEqual(uncommittedChanges(cwd), []); // everything outside .zense is clean now
 	const files = git(["show", "--name-only", "--format=", "HEAD"]).split("\n").map((s) => s.trim()).filter(Boolean);
 	assert.deepEqual(files, ["wip.ts"], `committed files: ${files}`);
 	const subject = git(["log", "-1", "--format=%s"]).trim();
 	assert.ok(subject.startsWith("chore: snapshot pre-spec"), subject);
-	assert.ok(subject.includes("wip.ts"), `subject ต้องตั้งชื่อไฟล์ที่ค้างจริง ไม่ใช่ fixed: ${subject}`);
+	assert.ok(subject.includes("wip.ts"), `subject must name the actual pending file, not fixed text: ${subject}`);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("composeSnapshotMessage: subject สร้างจากไฟล์จริง (≤72 chars) + body list ครบทุกไฟล์", () => {
+test("composeSnapshotMessage: subject built from real files (≤72 chars) + body lists every file", () => {
 	const m = composeSnapshotMessage([" M src/a.ts", "?? new.ts", "R  old.ts -> renamed.ts"]);
 	const [subject, , ...body] = m.split("\n");
 	assert.ok(subject.length <= 72, `subject too long: ${subject.length}`);
 	assert.ok(subject.includes("src/a.ts, new.ts"), subject);
-	assert.ok(subject.includes("old.ts -> renamed.ts"), `3 ไฟล์สั้นควรอยู่ครบใน subject: ${subject}`);
+	assert.ok(subject.includes("old.ts -> renamed.ts"), `3 short files should all fit in the subject: ${subject}`);
 	assert.ok(body.join("\n").includes("- old.ts -> renamed.ts"));
-	// ไฟล์เยอะ → subject ตัดด้วย (+N) แต่ body ครบ
+	// many files → subject truncated with (+N) but the body is complete
 	const many = Array.from({ length: 30 }, (_, i) => `?? file-${i}.ts`);
 	const m2 = composeSnapshotMessage(many);
 	const subject2 = m2.split("\n")[0];
@@ -81,7 +81,7 @@ test("composeSnapshotMessage: subject สร้างจากไฟล์จร
 	assert.equal(m2.split("\n").filter((l) => l.startsWith("- ")).length, 30);
 });
 
-test("isGitRepo: ตรวจถูกทั้งสองกรณี — feature guard ต้องปิดสนิทเมื่อไม่ใช่ git repo", () => {
+test("isGitRepo: detects both cases — feature guards must switch off entirely outside git repos", () => {
 	const { cwd, base } = makeRepo();
 	assert.equal(isGitRepo(cwd), true);
 	rmSync(base, { recursive: true, force: true });
@@ -90,7 +90,7 @@ test("isGitRepo: ตรวจถูกทั้งสองกรณี — feat
 	rmSync(nogit, { recursive: true, force: true });
 });
 
-test("snapshotUncommitted: .zense/ อยู่ใน .gitignore → add ห้ามล้ม (git ≥2.55 exclude-pathspec regression) + commit ไม่มี .zense ตาม", () => {
+test("snapshotUncommitted: .zense/ in .gitignore → add must not fail (git ≥2.55 exclude-pathspec regression) + no .zense in the commit", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-dirty-ignored-"));
 	const cwd = join(base, "repo");
 	mkdirSync(cwd, { recursive: true });
@@ -104,17 +104,17 @@ test("snapshotUncommitted: .zense/ อยู่ใน .gitignore → add ห้�
 	git(["commit", "-q", "-m", "init"]);
 	writeFileSync(join(cwd, "wip.ts"), "// wip\n");
 	mkdirSync(join(cwd, ".zense"), { recursive: true });
-	writeFileSync(join(cwd, ".zense", "spec.json"), "{}\n"); // ถูก ignore — สมัยก่อน add ตายตรงนี้
+	writeFileSync(join(cwd, ".zense", "spec.json"), "{}\n"); // ignored — the old add died right here
 	const r = snapshotUncommitted(cwd, "chore: snapshot");
-	assert.equal(r.ok, true, `snapshot ต้องสำเร็จแม้ .zense ถูก ignore: ${r.msg}`);
-	assert.match(r.msg, /^[0-9a-f]{7,}$/, `msg ต้องเป็น short hash ของ snapshot commit: ${r.msg}`);
+	assert.equal(r.ok, true, `snapshot must succeed despite .zense being ignored: ${r.msg}`);
+	assert.match(r.msg, /^[0-9a-f]{7,}$/, `msg must be the snapshot commit's short hash: ${r.msg}`);
 	const files = git(["show", "--name-only", "--format=", "HEAD"]).split("\n").map((s) => s.trim()).filter(Boolean);
-	assert.deepEqual(files, ["wip.ts"], `commit ห้ามมี .zense/.gitignore ที่ไม่เกี่ยวตาม: ${files}`);
-	assert.deepEqual(uncommittedChanges(cwd), []); // นอก .zense สะอาดแล้ว
+	assert.deepEqual(files, ["wip.ts"], `the commit must not drag .zense/.gitignore along: ${files}`);
+	assert.deepEqual(uncommittedChanges(cwd), []); // everything outside .zense is clean now
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("gitAddButZense: repo ไม่มี commit แรก (no HEAD) + ไม่ ignore .zense → stage เฉพาะ source, .zense ไม่ติด index", () => {
+test("gitAddButZense: repo without a first commit (no HEAD) + .zense not ignored → sources only staged, .zense never enters the index", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-dirty-nohead-"));
 	const cwd = join(base, "repo");
 	mkdirSync(cwd, { recursive: true });
@@ -128,16 +128,16 @@ test("gitAddButZense: repo ไม่มี commit แรก (no HEAD) + ไม�
 	const add = gitAddButZense(cwd);
 	assert.equal(add.ok, true, add.err);
 	const staged = git(["diff", "--cached", "--name-only"]).split("\n").filter(Boolean);
-	assert.deepEqual(staged, ["src.ts"], `staged ต้องไม่มี .zense (no-HEAD fallback): ${staged}`);
+	assert.deepEqual(staged, ["src.ts"], `staged must contain no .zense (no-HEAD fallback): ${staged}`);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("snapshotUncommitted: ไม่มีอะไรค้าง → ok แต่ 'nothing to commit' (ไม่สร้าง commit ว่าง)", () => {
+test("snapshotUncommitted: nothing pending → ok but 'nothing to commit' (no empty commit)", () => {
 	const { cwd, base, git } = makeRepo();
 	const before = git(["rev-parse", "HEAD"]);
 	const r = snapshotUncommitted(cwd, "chore: snapshot");
 	assert.equal(r.ok, true);
 	assert.equal(r.msg, "nothing to commit");
-	assert.equal(git(["rev-parse", "HEAD"]), before, "HEAD ต้องไม่ขยับ");
+	assert.equal(git(["rev-parse", "HEAD"]), before, "HEAD must not move");
 	rmSync(base, { recursive: true, force: true });
 });

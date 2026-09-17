@@ -1,51 +1,51 @@
 #!/usr/bin/env bash
-# release.sh — one-command release สำหรับ pi-zense:
-#   เลือก bump (patch|minor|major|X.Y.Z) → precheck (clean tree + npm test) → npm login (ถ้ายัง)
-#   → npm version (commit+tag อัตโนมัติ) → git push --follow-tags → npm publish
-# ใช้: npm run release -- patch   หรือ   bash scripts/release.sh   (interactive prompt)
+# release.sh — one-command release for pi-zense:
+#   pick a bump (patch|minor|major|X.Y.Z) → precheck (clean tree + npm test) → npm login (if needed)
+#   → npm version (auto commit+tag) → git push --follow-tags → npm publish
+# usage: npm run release -- patch   or   bash scripts/release.sh   (interactive prompt)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
 	cat >&2 <<'EOF'
 usage: bash scripts/release.sh [patch|minor|major|X.Y.Z]
-  ไม่ส่ง arg = ถาม interactive (เลือกจากลิสต์ หรือพิมพ์ X.Y.Z เอง)
+  no arg = interactive prompt (pick from the list or type X.Y.Z yourself)
 EOF
 }
 
-# ----- เลือก bump: arg แรกก่อน ถ้าไม่มีค่อยถาม interactive
+# ----- pick the bump: first arg if given, otherwise ask interactively
 BUMP="${1:-}"
 if [ -z "$BUMP" ]; then
 	if [ ! -t 0 ]; then
 		usage
 		exit 2
 	fi
-	echo "เลือก version bump:"
+	echo "select a version bump:"
 	select choice in patch minor major "X.Y.Z (custom)"; do
 		case "$choice" in
 			patch | minor | major) BUMP="$choice" ;;
 			"X.Y.Z (custom)") read -rp "version (X.Y.Z): " BUMP ;;
-			*) echo "เลือก 1-4" >&2 ;;
+			*) echo "pick 1-4" >&2 ;;
 		esac
 		[ -n "$BUMP" ] && break
 	done
 fi
 
-# ----- validate ก่อน precheck อื่นเสมอ (c4: arg ผิดต้องตายตรงนี้ ไม่ไปแตะอย่างอื่นเลย)
+# ----- always validate before any other precheck (a bad arg must die here, touching nothing else)
 case "$BUMP" in
 	patch | minor | major) ;;
 	*)
 		if ! [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-			echo "✗ invalid bump \"$BUMP\" — ต้องเป็น patch|minor|major|X.Y.Z" >&2
+			echo "✗ invalid bump \"$BUMP\" — must be patch|minor|major|X.Y.Z" >&2
 			usage
 			exit 2
 		fi
 		;;
 esac
 
-# ----- prechecks: tree สะอาด + tests เขียว (abort ก่อน bump เสมอ ไม่ทิ้ง state ค้าง)
+# ----- prechecks: clean tree + green tests (always abort before the bump, never leave state behind)
 if [ -n "$(git status --porcelain)" ]; then
-	echo "✗ working tree ไม่สะอาด — commit/stash ก่อน release:" >&2
+	echo "✗ working tree is not clean — commit/stash before releasing:" >&2
 	git status --short >&2
 	exit 1
 fi
@@ -53,17 +53,17 @@ fi
 echo "▸ running tests…"
 npm test
 
-# ----- npm auth: login เฉพาะตอนที่ยังไม่ได้ (interactive ครั้งเดียว ครั้งต่อไปผ่านเลย)
+# ----- npm auth: login only if not already (interactive once, then it stays)
 if ! npm whoami >/dev/null 2>&1; then
 	echo "▸ npm login required…"
 	npm login
 fi
 echo "▸ npm user: $(npm whoami)"
 
-# ----- bump+commit+tag (npm version ทำครบในคำสั่งเดียว) → push → publish
+# ----- bump+commit+tag (npm version does all three in one command) → push → publish
 NEW=$(npm version "$BUMP" -m "release %s")
 echo "▸ bumped → $NEW (commit+tag created)"
 git push --follow-tags
 npm publish
 
-echo "✅ released $NEW — pushed commit+tag และ publish ขึ้น npm เรียบร้อย"
+echo "✅ released $NEW — commit+tag pushed and published to npm"

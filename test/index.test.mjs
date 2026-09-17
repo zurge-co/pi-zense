@@ -56,21 +56,21 @@ test("panelize: fake theme.bg injectable via structural type — token 'selected
 	assert.match(out[0], /^<selectedBg>/);
 });
 
-test("panelize: line สั้นกว่า w ถูก pad เต็มความกว้างแล้ว wrap bg ทั้งก้อน", () => {
+test("panelize: a line shorter than w gets padded to full width, then bg-wrapped whole", () => {
 	const fake = { bg: (_c, text) => `[BG]${text}[/BG]` };
 	const [padded] = panelize(fake, ["abc"], 8);
-	// content ใน bg wrap ต้องกว้างเท่า w พอดี (abc + 5 spaces)
+	// the content inside the bg wrap must be exactly w wide (abc + 5 spaces)
 	assert.equal(padded.slice(4, -5).length, 8);
 	assert.equal(padded, `[BG]abc${" ".repeat(5)}[/BG]`);
 });
 
-test("panelize: นับความกว้างด้วย visibleWidth — ANSI escape ไม่ถูกนับเป็นจอ, บรรทัดยาวเกินไม่ pad ติดลบ", () => {
+test("panelize: width measured via visibleWidth — ANSI escapes take no screen; overlong lines get no negative padding", () => {
 	const fake = { bg: (_c, text) => `{${text}}` };
 	const [ansiLine] = panelize(fake, ["\x1b[31mRED\x1b[39m"], 10);
-	// "RED" กว้าง 3 บนจอ → pad 7 ช่อง ทั้งที่ string ยาวกว่านั้นมาก
+	// "RED" is 3 wide on screen → padded by 7 cells even though its string is far longer
 	assert.equal(visibleWidth(ansiLine.slice(1, -1)), 10);
-	const [longLine] = panelize(fake, ["สิบสองตัวอักษรแน่ๆ"], 5);
-	assert.ok(!longLine.includes("  ")); // w น้อยกว่าเนื้อ → ไม่พยายาม pad ติดลบ
+	const [longLine] = panelize(fake, ["twelve-chars-x"], 5);
+	assert.ok(!longLine.includes("  ")); // w smaller than the content → never attempts negative padding
 });
 
 test("missing or empty targets are never blocked", () => {

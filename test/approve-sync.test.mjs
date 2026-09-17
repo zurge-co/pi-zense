@@ -24,10 +24,10 @@ const setupZenseDir = () => {
 	return cwd;
 };
 
-test("syncApprovedSpecFiles: เขียน approved:true กลับลง spec.json + spec.md (latest copies)", () => {
+test("syncApprovedSpecFiles: writes approved:true back into spec.json + spec.md (latest copies)", () => {
 	const cwd = setupZenseDir();
 	const unsigned = baseSpec();
-	// จำลอง commitSpec: เขียนไฟล์ตอนยังไม่ได้เซ็น
+	// simulate commitSpec: the files are written while still unsigned
 	writeFileSync(join(cwd, ".zense", "spec.json"), JSON.stringify(unsigned, null, 2));
 	writeFileSync(join(cwd, ".zense", "spec.md"), renderSpecMd(unsigned));
 
@@ -40,7 +40,7 @@ test("syncApprovedSpecFiles: เขียน approved:true กลับลง sp
 	assert.match(readFileSync(join(cwd, ".zense", "spec.md"), "utf8"), /^approved: true$/m);
 });
 
-test("syncApprovedSpecFiles: sync archive copies ที่ paths ชี้อยู่ด้วย", () => {
+test("syncApprovedSpecFiles: also syncs the archive copies that paths point at", () => {
 	const cwd = setupZenseDir();
 	const unsigned = baseSpec();
 	const archJson = join(cwd, ".zense", "specs", "a.json");
@@ -53,9 +53,9 @@ test("syncApprovedSpecFiles: sync archive copies ที่ paths ชี้อย
 	assert.match(readFileSync(archMd, "utf8"), /^approved: true$/m);
 });
 
-test("syncApprovedSpecFiles: ไฟล์ไม่มี/paths ไม่ส่ง → best-effort ไม่พัง", () => {
-	const cwd = setupZenseDir(); // ยังไม่เคย commit spec — ไม่มี spec.json
+test("syncApprovedSpecFiles: missing files / no paths → best-effort, no breakage", () => {
+	const cwd = setupZenseDir(); // never committed a spec — no spec.json
 	assert.equal(syncApprovedSpecFiles(cwd, { ...baseSpec(), approved: true }), false);
-	assert.equal(existsSync(join(cwd, ".zense", "spec.json")), false); // ห้ามสร้างไฟล์มั่วที่ยังไม่เคย commit
+	assert.equal(existsSync(join(cwd, ".zense", "spec.json")), false); // must never create a file that was never committed
 	assert.equal(syncApprovedSpecFiles(cwd, { ...baseSpec(), approved: true }, { json: join(cwd, "nope.json") }), false);
 });

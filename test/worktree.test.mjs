@@ -18,29 +18,29 @@ import {
 
 // ----- pure helpers (path/command rewrite) -----
 
-test("rewritePathForWorktree: relative path ใต้ repo → remap ใต้ wtRoot", () => {
+test("rewritePathForWorktree: relative path under the repo → remapped under wtRoot", () => {
 	assert.equal(rewritePathForWorktree("/r", "/r-wt", "extensions/x.ts"), "/r-wt/extensions/x.ts");
 });
 
-test("rewritePathForWorktree: absolute path ใต้ cwd → remap ใต้ wtRoot", () => {
+test("rewritePathForWorktree: absolute path under cwd → remapped under wtRoot", () => {
 	assert.equal(rewritePathForWorktree("/r", "/r-wt", "/r/a/b.ts"), "/r-wt/a/b.ts");
 });
 
-test("rewritePathForWorktree: path นอก repo (absolute ไม่ใต้ cwd) → คืนเดิม", () => {
+test("rewritePathForWorktree: path outside the repo (absolute, not under cwd) → unchanged", () => {
 	assert.equal(rewritePathForWorktree("/r", "/r-wt", "/Users/elsewhere/doc.md"), "/Users/elsewhere/doc.md");
 });
 
-test("rewritePathForWorktree: relative ออกนอก repo (../) → ไม่อยู่ใต้ wtRoot", () => {
+test("rewritePathForWorktree: relative escape (../) → not under wtRoot", () => {
 	const out = rewritePathForWorktree("/r/sub", "/r/sub-wt", "../outside.txt");
 	assert.ok(!out.startsWith("/r/sub-wt"), `expected not under wtRoot, got ${out}`);
 });
 
-test("rewritePathForWorktree: path ใต้ .zense/ → คืนเดิม (harness state อยู่ main)", () => {
+test("rewritePathForWorktree: path under .zense/ → unchanged (harness state lives in main)", () => {
 	assert.equal(rewritePathForWorktree("/r", "/r-wt", ".zense/spec.md"), ".zense/spec.md");
 	assert.equal(rewritePathForWorktree("/r", "/r-wt", "/r/.zense/memory.jsonl"), "/r/.zense/memory.jsonl");
 });
 
-test("buildWorktreeCommand: นำหน้าด้วย cd <wtRoot> && (path มี space ก็ quote ด้วย single-quote)", () => {
+test("buildWorktreeCommand: prefixed with cd <wtRoot> && (spacey paths single-quoted)", () => {
 	assert.equal(buildWorktreeCommand("npm test", "/r-wt"), "cd '/r-wt' && npm test");
 	assert.equal(buildWorktreeCommand("ls", "/path with space/wt"), "cd '/path with space/wt' && ls");
 });
@@ -58,10 +58,10 @@ const SPEC = {
 	approved: true,
 };
 
-/** git runner แบบระบุ dir (ไว้ commit ใน worktree) */
+/** git runner bound to a dir (for committing inside a worktree) */
 const gitIn = (dir) => (args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
-/** สร้าง temp git repo พร้อม initial commit; คืน {cwd, cleanup} */
+/** create a temp git repo with an initial commit */
 const makeRepo = () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-wt-"));
 	const cwd = join(base, "repo");
@@ -78,23 +78,23 @@ const makeRepo = () => {
 	return { cwd, base, git };
 };
 
-/** staged paths ใน main (ยกเว้น .zense) — helper ของ assertion */
+/** staged paths in main (excluding .zense) — assertion helper */
 const stagedIn = (git) => git(["diff", "--cached", "--name-only", "--", ".", ":!.zense"]).split("\n").map((s) => s.trim()).filter(Boolean);
 
-test("gitOk: returns ok=false ใน dir ที่ไม่ใช่ git repo", () => {
+test("gitOk: returns ok=false in a non-git dir", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-nogit-"));
 	const r = gitOk(["status"], base);
 	assert.equal(r.ok, false);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("createWorktree: สร้าง worktree + branch zense/impl/* + copy spec.json เข้าไป", () => {
+test("createWorktree: creates the worktree + a zense/impl/* branch + copies spec.json in", () => {
 	const { cwd, base, git } = makeRepo();
 	writeFileSync(join(cwd, ".zense", "spec.json"), '{"version":1}');
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt, "worktree should be created");
 	assert.ok(wt.branch.startsWith("zense/impl/v1-"), `branch=${wt.branch}`);
-	// worktree ต้องอยู่ nested ใต้ <repo>/.zense/worktree/ (ไม่ใช่ sibling dir ข้าง repo)
+	// the worktree must nest under <repo>/.zense/worktree/ (not a sibling of the repo)
 	assert.equal(
 		join(cwd, ".zense", "worktree"),
 		dirname(wt.root),
@@ -108,12 +108,12 @@ test("createWorktree: สร้าง worktree + branch zense/impl/* + copy spec
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("createWorktree: main repo git status สะอาดหลังสร้าง (nested worktree ถูก exclude ใน .git/info/exclude)", () => {
+test("createWorktree: main repo git status stays clean (nested worktree excluded via .git/info/exclude)", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
 	assert.equal(git(["status", "--porcelain"]).trim(), "", "main git status should be clean");
-	// exclude ไปอยู่ใน local .git/info/exclude ไม่แตะไฟล์ tracked
+	// the exclusion lives in local .git/info/exclude, never in tracked files
 	const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
 	assert.ok(exclude.includes("/.zense/worktree/"), `exclude has worktree path: ${exclude}`);
 	rmSync(base, { recursive: true, force: true });
@@ -124,46 +124,46 @@ test("createWorktree: captures baseline ref (main HEAD before branch)", () => {
 	const headBefore = git(["rev-parse", "HEAD"]).trim();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt, "worktree should be created");
-	assert.equal(wt.baseline, headBefore, "baseline = main HEAD ณ ตอนก่อนสร้าง branch");
+	assert.equal(wt.baseline, headBefore, "baseline = main HEAD right before branching");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("createWorktree: ใน dir ที่ไม่ใช่ git repo → คืน null ไม่ throw", () => {
+test("createWorktree: in a non-git dir → null, no throw", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-nogit2-"));
 	const wt = createWorktree(base, SPEC);
 	assert.equal(wt, null);
 	rmSync(base, { recursive: true, force: true });
 });
 
-// ----- applyWorktreeBack (ADR-003: staged-only, ไม่ commit) -----
+// ----- applyWorktreeBack (ADR-003: staged-only, never commits) -----
 
-test("applyWorktreeBack: eval PASS → change staged ใน main แต่ HEAD ไม่ขยับ (ไม่มี commit ใหม่) + cleanup worktree/branch + เก็บ reverse patch", () => {
+test("applyWorktreeBack: eval PASS → change staged in main, HEAD unmoved (no new commit) + worktree/branch cleaned + reverse patch stored", () => {
 	const { cwd, base, git } = makeRepo();
 	const headBefore = git(["rev-parse", "HEAD"]).trim();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
-	// จำลองการแก้ไฟล์ใน worktree (เหมือน agent เขียน)
+	// simulate an agent edit inside the worktree
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, true, `apply should succeed: ${ar.msg}`);
-	// ADR-003 core: main HEAD ไม่ขยับ — ไม่มี commit ใหม่จาก apply
+	// ADR-003 core: main HEAD unmoved — apply created no commit
 	assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore, "HEAD must not move (no auto-commit)");
 	assert.deepEqual(git(["log", "--format=%s"]).trim().split("\n"), ["init"], "main log unchanged");
-	// change ถูก stage ไว้ใน index (รอมนุษย์ commit)
+	// the change sits staged in the index, awaiting a human commit
 	assert.deepEqual(stagedIn(git), ["src.txt"], "src.txt staged in main");
 	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "impl\n");
 	assert.deepEqual(ar.paths, ["src.txt"]);
-	// commit message สำเร็จรูปจาก squashed commit (subject = spec title)
+	// ready-made commit message from the squashed commit (subject = spec title)
 	assert.ok(ar.commitMsg.includes("Add src module"), `commitMsg has spec title: ${ar.commitMsg}`);
-	// reverse patch ถูกเก็บไว้สำหรับ discard
+	// reverse patch stored for discard
 	assert.ok(readFileSync(join(cwd, ".zense", "pending-apply.patch"), "utf8").includes("src.txt"), "reverse patch stored");
-	// worktree + branch ถูก cleanup แล้ว
+	// worktree + branch cleaned up
 	assert.ok(!existsSync(wt.root), "worktree dir removed");
 	assert.equal(git(["branch", "--list", wt.branch]).trim(), "", "branch deleted");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: interim commits หลายอัน + ไฟล์ uncommitted → squash แล้ว stage ครบใน main (log ไม่ขยับ)", () => {
+test("applyWorktreeBack: several interim commits + an uncommitted file → squashed and fully staged in main (log unmoved)", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
@@ -174,19 +174,19 @@ test("applyWorktreeBack: interim commits หลายอัน + ไฟล์ un
 	writeFileSync(join(wt.root, "b.txt"), "b\n");
 	gwt(["add", "b.txt"]);
 	gwt(["commit", "-q", "-m", "wip: add b"]);
-	writeFileSync(join(wt.root, "c.txt"), "c\n"); // uncommitted ตัวสุดท้าย
+	writeFileSync(join(wt.root, "c.txt"), "c\n"); // last file, uncommitted
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, true, `apply should succeed: ${ar.msg}`);
-	// interim commits ไม่ตามเข้า main เลย — log ยังเหมือนเดิม
+	// no interim commits ever reach main — the log is untouched
 	assert.deepEqual(git(["log", "--format=%s"]).trim().split("\n"), ["init"], "main log unchanged (no interim, no merge commit)");
-	// ทุกไฟล์ (รวม uncommitted) staged ครบ
+	// every file (incl. uncommitted) fully staged
 	assert.deepEqual(stagedIn(git).sort(), ["a.txt", "b.txt", "c.txt"], "all files staged");
-	// commit message สำเร็จรูปต้องเก็บรายชื่อ interim (traceability)
+	// the ready-made message must list the interims (traceability)
 	assert.ok(ar.commitMsg.includes("wip: add a") && ar.commitMsg.includes("wip: add b"), `commitMsg lists interims: ${ar.commitMsg}`);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: worktree ไม่มีการเปลี่ยนแปลง → ok=true paths ว่าง, main สะอาด, cleanup ครบ", () => {
+test("applyWorktreeBack: unchanged worktree → ok=true with empty paths, main clean, fully cleaned up", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
@@ -199,7 +199,7 @@ test("applyWorktreeBack: worktree ไม่มีการเปลี่ยน�
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: repo ที่ gitignore .zense/ — staging ใน worktree ห้ามล้ม (git ≥2.55 exclude-pathspec regression) + .zense ไม่ตามเข้า main", () => {
+test("applyWorktreeBack: repo gitignoring .zense/ — worktree staging must not fail (git ≥2.55 exclude-pathspec regression) + .zense never follows into main", () => {
 	const base = mkdtempSync(join(tmpdir(), "zense-wt-ignored-"));
 	const cwd = join(base, "repo");
 	mkdirSync(cwd, { recursive: true });
@@ -207,78 +207,78 @@ test("applyWorktreeBack: repo ที่ gitignore .zense/ — staging ใน wor
 	git(["init", "-q"]);
 	git(["config", "user.email", "t@t"]);
 	git(["config", "user.name", "t"]);
-	writeFileSync(join(cwd, ".gitignore"), ".zense/\n"); // ← เคสที่ git add แบบ ':!.zense' เดิม fatal exit 1
+	writeFileSync(join(cwd, ".gitignore"), ".zense/\n"); // ← the case where git add with ':!.zense' used to fatal exit 1
 	writeFileSync(join(cwd, "README.md"), "# init\n");
 	git(["add", "-A"]);
 	git(["commit", "-q", "-m", "init"]);
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
-	writeFileSync(join(wt.root, ".zense", "spec.json"), "{}\n"); // harness state ถูก ignore ใน worktree ด้วย (สืบจาก .gitignore)
+	writeFileSync(join(wt.root, ".zense", "spec.json"), "{}\n"); // harness state is ignored in the worktree too (via .gitignore)
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
-	assert.equal(ar.ok, true, `apply ต้องสำเร็จแม้ .zense ถูก gitignore: ${ar.msg}`);
-	assert.deepEqual(stagedIn(git), ["src.txt"], "เฉพาะ source เท่านั้นที่ staged — harness state ไม่ตาม");
+	assert.equal(ar.ok, true, `apply must succeed despite .zense being gitignored: ${ar.msg}`);
+	assert.deepEqual(stagedIn(git), ["src.txt"], "only sources staged — harness state stays behind");
 	assert.ok(!existsSync(wt.root), "worktree cleaned up");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: guard dirty main — main มี uncommitted change นอก .zense → refuse (ok=false dirtyMain) ไม่แตะ branch/worktree", () => {
+test("applyWorktreeBack: dirty-main guard — uncommitted changes outside .zense → refuse (ok=false dirtyMain), branch/worktree untouched", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
-	// human แก้ไฟล์ใน main ค้างไว้ (ไม่ commit)
+	// a human edit is left uncommitted in main
 	writeFileSync(join(cwd, "README.md"), "# human change\n");
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, false, `apply should be refused: ${ar.msg}`);
 	assert.equal(ar.dirtyMain, true, "flagged as dirtyMain");
-	// worktree + branch ต้องยังอยู่ (retry ได้ ไม่สูญงาน)
+	// worktree + branch must survive (retry-safe, no work lost)
 	assert.ok(existsSync(wt.root), "worktree kept");
 	assert.ok(git(["branch", "--list", wt.branch]).trim(), "branch kept");
-	// ของ human ไม่โดนแตะ
+	// the human's file is untouched
 	assert.equal(readFileSync(join(cwd, "README.md"), "utf8"), "# human change\n");
 	assert.deepEqual(stagedIn(git), [], "nothing staged by failed apply");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: guard ไม่เล็ง .zense — มีเฉพาะ .zense change ใน main ก็ apply ได้ตาม policy", () => {
+test("applyWorktreeBack: the guard ignores .zense — dirty .zense in main doesn't block apply (policy)", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
-	// .zense/ (harness state) dirty ใน main — ต้องไม่ trip guard
+	// .zense/ (harness state) dirty in main — must not trip the guard
 	appendFileSync(join(cwd, ".zense", "x"), "state-dirty");
-	writeFileSync(join(cwd, ".zense", "memory.jsonl"), "{}\n"); // untracked ใน .zense ด้วย
+	writeFileSync(join(cwd, ".zense", "memory.jsonl"), "{}\n"); // untracked inside .zense too
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, true, `apply should succeed despite dirty .zense: ${ar.msg}`);
 	assert.deepEqual(stagedIn(git), ["src.txt"]);
-	// .zense ใน main ต้องไม่โดนแตะตอน apply
+	// main's .zense must be untouched by apply
 	assert.equal(readFileSync(join(cwd, ".zense", "memory.jsonl"), "utf8"), "{}\n");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: conflict (อีก session แก้ไฟล์เดียวกันใน main) → ok=false conflict=true, main ถูกย้อนสะอาด, เก็บ worktree", () => {
+test("applyWorktreeBack: conflict (another session edited the same file in main) → ok=false conflict=true, main rolled back clean, worktree kept", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
-	// อีก session แก้ same file ใน main และ commit ก่อน
+	// the other session edits + commits the same file in main first
 	writeFileSync(join(cwd, "src.txt"), "main-change\n");
 	git(["add", "src.txt"]);
 	git(["commit", "-q", "-m", "other session"]);
-	// session นี้แก้ same file ใน worktree
+	// this session edits the same file in the worktree
 	writeFileSync(join(wt.root, "src.txt"), "wt-change\n");
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, false);
 	assert.equal(ar.conflict, true);
-	// main ต้องถูกย้อนกลับสะอาด (ไม่ค้าง conflict markers / staged junk)
+	// main must be rolled back clean (no conflict markers / staged junk)
 	assert.equal(git(["status", "--porcelain", "--", ".", ":!.zense"]).trim(), "", "main clean after abort");
 	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "main-change\n");
-	// worktree ยังอยู่ (ให้มนุษย์ resolve)
+	// the worktree survives (for human resolution)
 	assert.ok(existsSync(wt.root), "worktree kept for manual resolve");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: ไม่มี .zense changes ใน staged result (harness state ไม่ตามเข้า main) — ทั้งกรณี staged และ commit ย่อยใน worktree", () => {
+test("applyWorktreeBack: no .zense changes in the staged result (harness state never follows into main) — via both staging and interim commits in the worktree", () => {
 	const { cwd, base, git } = makeRepo();
-	// สร้าง .zense/spec.md tracked ใน main ก่อน
+	// make .zense/spec.md tracked in main first
 	mkdirSync(join(cwd, ".zense"), { recursive: true });
 	writeFileSync(join(cwd, ".zense", "spec.md"), "# old\n");
 	git(["add", "-A"]);
@@ -294,24 +294,24 @@ test("applyWorktreeBack: ไม่มี .zense changes ใน staged result (ha
 	gwt(["commit", "-q", "-m", "wip: zense state"]);
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, true);
-	// staged ใน main ต้องไม่มี .zense/spec.md
+	// nothing .zense/spec.md may be staged in main
 	const staged = stagedIn(git);
 	assert.ok(!staged.some((p) => p.startsWith(".zense")), `no .zense in staged: ${staged}`);
 	assert.deepEqual(staged, ["src.txt"]);
-	// main spec.md ยังเป็นของเดิม (ไม่ถูกลาก)
+	// main's spec.md still has the old content (untouched)
 	assert.equal(readFileSync(join(cwd, ".zense", "spec.md"), "utf8"), "# old\n");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("applyWorktreeBack: multi-session — A apply ค้าง staged อยู่, B apply ตามหลัง → guard เด้ง refuse (อีกทางเลือกคือปนของ)", () => {
+test("applyWorktreeBack: multi-session — A's apply sits staged, B applies after → the guard must refuse (mixing is the only alternative)", () => {
 	const { cwd, base, git } = makeRepo();
-	// session A: apply สำเร็จ (staged ค้างใน main)
+	// session A: applied successfully (staged in main)
 	const wtA = createWorktree(cwd, SPEC);
 	assert.ok(wtA);
 	writeFileSync(join(wtA.root, "a.txt"), "a\n");
 	const arA = applyWorktreeBack(cwd, SPEC, wtA);
 	assert.equal(arA.ok, true);
-	// session B: worktree ใหม่ (branch จาก HEAD เดิม — A ยังไม่ commit) แล้วพยายาม apply
+	// session B: a new worktree (branched from the same HEAD — A hasn't committed) tries to apply
 	const specB = { ...SPEC, version: 2, title: "Add b module" };
 	const wtB = createWorktree(cwd, specB);
 	assert.ok(wtB);
@@ -320,75 +320,75 @@ test("applyWorktreeBack: multi-session — A apply ค้าง staged อยู
 	assert.equal(arB.ok, false, "B must be refused while A's staged changes pending");
 	assert.equal(arB.dirtyMain, true);
 	assert.ok(existsSync(wtB.root), "B worktree kept");
-	// staged ของ A ยังอยู่ครบ ไม่ถูกแตะ
+	// A's staged files must be intact, untouched
 	assert.deepEqual(stagedIn(git), ["a.txt"]);
 	rmSync(base, { recursive: true, force: true });
 });
 
-// ----- discardPendingApply (undo path หลัง review) -----
+// ----- discardPendingApply (the post-review undo path) -----
 
-test("discardPendingApply: ย้อน change ที่ apply ไว้ → ไฟล์ใหม่ถูกลบ, main กลับสะอาดเหมือนก่อน apply เป๊ะ", () => {
+test("discardPendingApply: rolls back the applied change → new files removed, main exactly back to its pre-apply state", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
-	appendFileSync(join(wt.root, "README.md"), "added-line\n"); // แก้ไฟล์ tracked เดิมด้วย
+	appendFileSync(join(wt.root, "README.md"), "added-line\n"); // also touch a tracked file
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, true);
-	// human review → ไม่พอใจ → discard
+	// human review → unhappy → discard
 	const dr = discardPendingApply(cwd);
 	assert.equal(dr.ok, true, `discard should succeed: ${dr.msg}`);
-	// ไฟล์ใหม่ที่ apply สร้างต้องหาย / ไฟล์เดิมต้องกลับเนื้อเดิม
+	// the apply-created file must be gone / the tracked file restored
 	assert.ok(!existsSync(join(cwd, "src.txt")), "new file removed by reverse patch");
 	assert.equal(readFileSync(join(cwd, "README.md"), "utf8"), "# init\n", "tracked file restored");
 	assert.equal(git(["status", "--porcelain", "--", ".", ":!.zense"]).trim(), "", "main clean as before apply");
-	// patch/msg ถูกเก็บกวาด
+	// patch/msg swept
 	assert.ok(!existsSync(join(cwd, ".zense", "pending-apply.patch")), "patch cleaned");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("discardPendingApply: human แก้ไฟล์ที่ apply ไว้ → reverse fail ชัดๆ และไม่ลบของ human", () => {
+test("discardPendingApply: human edited the applied files → reverse fails loudly and never deletes human work", () => {
 	const { cwd, base, git } = makeRepo();
 	const wt = createWorktree(cwd, SPEC);
 	assert.ok(wt);
 	writeFileSync(join(wt.root, "src.txt"), "impl\n");
 	const ar = applyWorktreeBack(cwd, SPEC, wt);
 	assert.equal(ar.ok, true);
-	// human แก้ไฟล์ที่ apply มาหลังจากนั้น (ทับเนื้อทั้งก้อน)
+	// the human overwrites the applied file afterwards
 	writeFileSync(join(cwd, "src.txt"), "human edit\n");
 	const dr = discardPendingApply(cwd);
 	assert.equal(dr.ok, false, "reverse must fail when human edited applied files");
-	// ของ human ต้องเหลือครบ — ห้ามลบเงียบๆ
+	// the human's content fully survives — never silently deleted
 	assert.equal(readFileSync(join(cwd, "src.txt"), "utf8"), "human edit\n");
-	// patch ยังอยู่ให้มนุษย์ตัดสินใจต่อ
+	// the patch stays around for the human to decide
 	assert.ok(existsSync(join(cwd, ".zense", "pending-apply.patch")), "patch kept on failure");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("discardPendingApply: ไม่มี pending patch → ok=false ไม่พัง", () => {
+test("discardPendingApply: no pending patch → ok=false without breaking anything", () => {
 	const { cwd, base } = makeRepo();
 	const dr = discardPendingApply(cwd);
 	assert.equal(dr.ok, false);
-	assert.ok(dr.msg.includes("ไม่พบ"), `msg explains: ${dr.msg}`);
+	assert.ok(dr.msg.includes("not found"), `msg explains: ${dr.msg}`);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("discardPendingApply: patch ว่าง (apply ไม่มี source change) → ok=true unstage-only ไม่พัง", () => {
+test("discardPendingApply: empty patch (apply had no source change) → ok=true, unstage only, no breakage", () => {
 	const { cwd, base, git } = makeRepo();
 	mkdirSync(join(cwd, ".zense"), { recursive: true });
-	writeFileSync(join(cwd, ".zense", "pending-apply.patch"), ""); // apply ที่ interim แตะเฉพาะ .zense → patch ว่าง
-	// stage อะไรสักอย่างไว้ก่อน (จำลอง index ค้าง)
+	writeFileSync(join(cwd, ".zense", "pending-apply.patch"), ""); // apply whose interim commits touched only .zense → empty patch
+	// stage something first (simulating leftover index)
 	writeFileSync(join(cwd, "leftover.txt"), "x\n");
 	git(["add", "leftover.txt"]);
 	const dr = discardPendingApply(cwd);
 	assert.equal(dr.ok, true, `discard should succeed: ${dr.msg}`);
-	// index ถูก unstage (ของยังอยู่เป็น untracked — patch ว่างไม่ได้บังคับลบ)
+	// the index is unstaged (the file remains untracked — an empty patch can't force-delete it)
 	assert.equal(git(["diff", "--cached", "--name-only"]).trim(), "", "index unstaged");
 	assert.ok(!existsSync(join(cwd, ".zense", "pending-apply.patch")), "patch cleaned");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("composeCommitMessage: subject เป็นบรรทัดเดียว ≤72 chars + list interim + footer", () => {
+test("composeCommitMessage: single-line subject ≤72 chars + interim list + footer", () => {
 	assert.equal(sanitizeSubject("hello   world\nsecond line"), "hello world second line");
 	const long = "x".repeat(100);
 	const s = sanitizeSubject(long);
@@ -403,9 +403,9 @@ test("composeCommitMessage: subject เป็นบรรทัดเดีย�
 	assert.ok(!bare.includes("Squashed"), "no interim section when empty");
 });
 
-// ----- acceptPendingApply (ทางออกฝั่ง "รับงาน" ของ pendingApply — คู่กับ discard tests ด้านบน) -----
+// ----- acceptPendingApply (pendingApply's accept side — counterpart of the discard tests above) -----
 
-/** จำลองสถานะหลัง applyWorktreeBack: patch+msg ค้างใน .zense + change จาก worktree staged อยู่ใน index */
+/** Simulate the state after applyWorktreeBack: patch+msg pending in .zense + the worktree's change staged in the index */
 const seedPending = ({ cwd, git }) => {
 	writeFileSync(join(cwd, ".zense", "pending-apply.patch"), "dummy reverse patch\n");
 	writeFileSync(join(cwd, ".zense", "pending-apply.msg"), "Add src module\n\nbody from composeCommitMessage\n");
@@ -418,21 +418,21 @@ const pendingFiles = (cwd) => ({
 	msg: existsSync(join(cwd, ".zense", "pending-apply.msg")),
 });
 
-test("acceptPendingApply: ไม่มี pending patch → ok=false ชัดๆ ไม่แตะ repo", () => {
+test("acceptPendingApply: no pending patch → clear ok=false, repo untouched", () => {
 	const { cwd, base, git } = makeRepo();
 	const headBefore = git(["rev-parse", "HEAD"]).trim();
 	const r = acceptPendingApply(cwd);
 	assert.equal(r.ok, false);
-	assert.match(r.msg, /ไม่มี pending apply/);
+	assert.match(r.msg, /no pending apply/);
 	assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore);
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("acceptPendingApply: มนุษย์ commit เองแล้ว (index ว่าง, HEAD ขยับ) → ok, patch+msg ถูกลบ, ไม่มี warning", () => {
+test("acceptPendingApply: the human committed themselves (empty index, HEAD moved) → ok, patch+msg removed, no warnings", () => {
 	const { cwd, base, git } = makeRepo();
 	const preApplyHead = git(["rev-parse", "HEAD"]).trim();
 	seedPending({ cwd, git });
-	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]); // มนุษย์ commit เอง
+	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]); // the human's own commit
 	const r = acceptPendingApply(cwd, { preApplyHead });
 	assert.equal(r.ok, true, r.msg);
 	assert.equal(r.committedOnBehalf, false);
@@ -441,50 +441,50 @@ test("acceptPendingApply: มนุษย์ commit เองแล้ว (index
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("acceptPendingApply: soft-mode — index ว่างแต่ HEAD ไม่ขยับ (change หาย?) → ok แต่แนบ warning ไม่ refuse", () => {
+test("acceptPendingApply: soft mode — empty index but HEAD unmoved (change vanished?) → still ok, warning attached, never refuses", () => {
 	const { cwd, base, git } = makeRepo();
 	const preApplyHead = git(["rev-parse", "HEAD"]).trim();
 	seedPending({ cwd, git });
-	git(["reset", "-q", "--hard", "HEAD"]); // จำลอง change โดน reset ทิ้งนอก flow (index ว่าง ไม่มี commit ใหม่)
+	git(["reset", "-q", "--hard", "HEAD"]); // simulate the change being reset away outside the flow (empty index, no new commit)
 	const r = acceptPendingApply(cwd, { preApplyHead });
-	assert.equal(r.ok, true, "soft-mode ต้อง accept ต่อแม้อันตราย");
+	assert.equal(r.ok, true, "soft mode accepts even when suspect");
 	assert.equal(r.warnings.length, 1);
 	assert.match(r.warnings[0], /HEAD/);
 	assert.deepEqual(pendingFiles(cwd), { patch: false, msg: false });
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("acceptPendingApply: ยัง staged ค้าง + ไม่ได้ขอ commit แทน → ok=false พร้อมบอกวิธี commit เอง/ขอแทน", () => {
+test("acceptPendingApply: still staged + no commit-on-behalf requested → ok=false explaining both ways out", () => {
 	const { cwd, base, git } = makeRepo();
 	seedPending({ cwd, git });
 	const headBefore = git(["rev-parse", "HEAD"]).trim();
 	const r = acceptPendingApply(cwd);
 	assert.equal(r.ok, false);
 	assert.match(r.msg, /commitIfStaged=true \/ \/zense accept commit/);
-	assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore, "ห้าม commit เองโดยไม่ได้ขอ");
-	assert.deepEqual(pendingFiles(cwd), { patch: true, msg: true }, "ยังไม่ accept → patch+msg ต้องอยู่");
+	assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore, "must never commit unprompted");
+	assert.deepEqual(pendingFiles(cwd), { patch: true, msg: true }, "not yet accepted → patch+msg must remain");
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("acceptPendingApply: commitIfStaged=true (เคสสั่ง agent commit ให้หน่อย) → commit แทนด้วย message ที่เตรียมไว้ แล้วล้าง patch+msg", () => {
+test("acceptPendingApply: commitIfStaged=true ('commit it for me') → commits with the prepared message, then clears patch+msg", () => {
 	const { cwd, base, git } = makeRepo();
 	seedPending({ cwd, git });
 	const r = acceptPendingApply(cwd, { commitIfStaged: true });
 	assert.equal(r.ok, true, r.msg);
 	assert.equal(r.committedOnBehalf, true);
-	assert.equal(git(["log", "-1", "--format=%s"]).trim(), "Add src module", "subject มาจาก pending-apply.msg");
-	// commit ต้องมี src.txt (staged ตอน seed) แต่ห้ามมี .zense/
+	assert.equal(git(["log", "-1", "--format=%s"]).trim(), "Add src module", "subject comes from pending-apply.msg");
+	// the commit must contain src.txt (staged at seed time) but no .zense/
 	assert.deepEqual(git(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).split("\n").filter(Boolean), ["src.txt"]);
 	assert.deepEqual(pendingFiles(cwd), { patch: false, msg: false });
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("acceptPendingApply: human amendments — evalTree ต่างจาก HEAD^{tree} → คืนเฉพาะชื่อไฟล์ที่มนุษย์แก้", () => {
+test("acceptPendingApply: human amendments — evalTree differs from HEAD^{tree} → returns only the human-edited files", () => {
 	const { cwd, base, git } = makeRepo();
 	seedPending({ cwd, git });
 	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]);
-	const evalTree = git(["rev-parse", "HEAD^{tree}"]).trim(); // tree ตอน apply (repin เหมือน lastEval.head)
-	writeFileSync(join(cwd, "src.txt"), "human tweak\n"); // มนุษย์แก้เพิ่มหลัง grader ผ่าน
+	const evalTree = git(["rev-parse", "HEAD^{tree}"]).trim(); // the tree at apply time (repinned like lastEval.head)
+	writeFileSync(join(cwd, "src.txt"), "human tweak\n"); // human edit after the grader passed
 	writeFileSync(join(cwd, "extra.md"), "human notes\n");
 	git(["add", "src.txt", "extra.md"]);
 	git(["commit", "-q", "-m", "human adjustments after review"]);
@@ -494,7 +494,7 @@ test("acceptPendingApply: human amendments — evalTree ต่างจาก HE
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("acceptPendingApply: evalTree เท่ากับ HEAD^{tree} (มนุษย์ไม่แก้อะไรเลย) → amendedFiles ว่าง", () => {
+test("acceptPendingApply: evalTree equals HEAD^{tree} (no human edits) → amendedFiles empty", () => {
 	const { cwd, base, git } = makeRepo();
 	seedPending({ cwd, git });
 	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]);
@@ -505,7 +505,7 @@ test("acceptPendingApply: evalTree เท่ากับ HEAD^{tree} (มนุ�
 	rmSync(base, { recursive: true, force: true });
 });
 
-test("acceptPendingApply: ไม่ส่ง evalTree → ข้าม delta เงียบๆ (amendedFiles ว่าง)", () => {
+test("acceptPendingApply: no evalTree → the delta is skipped quietly (amendedFiles empty)", () => {
 	const { cwd, base, git } = makeRepo();
 	seedPending({ cwd, git });
 	git(["commit", "-q", "-F", join(cwd, ".zense", "pending-apply.msg")]);

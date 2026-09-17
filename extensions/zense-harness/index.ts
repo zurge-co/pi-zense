@@ -1,9 +1,9 @@
 /**
  * zense-harness — AI-driven SDLC harness for pi, per PLAN.md.
  *
- * ชื่อ "zense" (เซ็น) พ้องเสียงกับ sign — สื่อว่าทุกครั้งที่สั่ง agent ทำงาน
- * จะมีลายเซ็นของมนุษย์กำกับอยู่เสมอ (spec approval = ลายเซ็นฝั่ง input,
- * review packet = การอนุมัติฝั่ง output)
+ * The name "zense" puns on the Thai word for "sign" — every agent task
+ * carries a human signature (spec approval = input-side signature,
+ * review packet = output-side approval)
  *
  * Loop: spec → criteria → implementation → dual eval → exception review → learn.
  *
@@ -38,14 +38,14 @@ interface Spec {
 	version: number;
 	title: string;
 	intent: string;
-	approach?: string[];       // แนวทางการทำงาน (presentational — โชว์ตอน sign dialog ให้คนเซ็นเห็น shape ของงาน; optional เพราะ persisted spec เก่าไม่มี field นี้)
+	approach?: string[];       // shown in the sign dialog; optional — older persisted specs lack this field
 	scope: string[];           // path globs the agent may touch
 	constraints: string[];
 	criteria: Criterion[];
 	specDebt: string[];        // unverifiable items → forced human review
 	approved: boolean;
 	approvedAt?: number;
-	changesFrom?: string[];    // สรุปสิ่งที่เปลี่ยนเทียบ version ก่อน (commitSpec คำนวณตอน v>=2 — ห้ามนำเสนอ spec เดิมซ้ำโดยไม่บอก change)
+	changesFrom?: string[];    // diff vs previous version (commitSpec computes at v>=2 — never re-present an identical spec silently)
 }
 interface State {
 	phase: "requirements" | "design" | "implementation" | "eval" | "review" | "maintenance";
@@ -56,17 +56,17 @@ interface State {
 	trajectoryFlags: string[];
 	gateEnabled: boolean;
 	subagentRuns: SubagentRun[];
-	lastCompileLessons?: number;    // จำนวนบทเรียนจาก memory ที่ feed เข้า compile_spec ล่าสุด
-	specSource?: "set" | "compile"; // spec ปัจจุบันมาจาก agent เขียนเอง (set) หรือ sub-agent (compile) — ใช้ telemetry H
-	lastEval?: { verdict: string; perCriteria: Record<string, string>; failedIds: string[]; probes: ProbeResult[]; at: number; specVersion?: number; head?: string }; // W2: evidence ล่าสุดจาก zense_eval → เป็น input ของ reviewer (specVersion+head ผูกกับรอบปัจจุบัน กัน evidence เก่าหลุดไปถึง reviewer)
-	baselineHead?: string;      // HEAD ของ main repo ตอน spec approval — ใช้ scope git evidence (log/diff เฉพาะตั้งแต่ baseline ของรอบนี้ ไม่ใช่ทั้งประวัติ)
-	evalOverrideFails?: { specVersion: number; ids: string[]; count: number }; // anti-loop: FAIL ที่มาจาก probe override ล้วน ซ้ำ ids เดิมกับ spec เวอร์ชันเดิม → DEADLOCK escalate แทนวน "กลับไปแก้" ไม่จบ
-	specMdPath?: string;            // path ของ archive spec .md ของเวอร์ชันปัจจุบัน (zense_eval append ผลลัพธ์ที่นี่)
-	specJsonPath?: string;          // path ของ archive spec .json ของเวอร์ชันปัจจุบัน
-	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
-	worktreeLeaveNotified?: boolean; // dedupe notify “unmerged worktree” 1 ครั้ง/การสร้าง
-	pendingApply?: PendingApply;    // change ที่ apply เข้า main แบบ staged หลัง eval PASS รอมนุษย์ commit (ADR-003)
-	contextBulletin?: string;      // one-shot ข้อความ cycle-closure ที่จะติด system prompt ของ turn ถัดไป (consume แล้วเคลียร์ทันที) — ปิดช่อง agent ไม่รู้ว่ามนุษย์ accept/discard/commit แล้ว
+	lastCompileLessons?: number;    // memory lessons fed into the latest compile_spec
+	specSource?: "set" | "compile"; // whether current spec came from the agent (set) or sub-agent (compile) — telemetry
+	lastEval?: { verdict: string; perCriteria: Record<string, string>; failedIds: string[]; probes: ProbeResult[]; at: number; specVersion?: number; head?: string }; // latest zense_eval evidence feeds the reviewer (specVersion+head pin it to the current round so stale evidence can't leak)
+	baselineHead?: string;      // main repo HEAD at spec approval — scopes git evidence (log/diff) to this round only
+	evalOverrideFails?: { specVersion: number; ids: string[]; count: number }; // anti-loop: same override-only FAIL ids on the same spec version → escalate DEADLOCK instead of looping "go fix it"
+	specMdPath?: string;            // archive spec .md of the current version (zense_eval appends results here)
+	specJsonPath?: string;          // archive spec .json of the current version
+	worktree?: Worktree | null;     // active session worktree (null = work directly in main)
+	worktreeLeaveNotified?: boolean; // dedupe: notify "unmerged worktree" once per creation
+	pendingApply?: PendingApply;    // change staged into main after eval PASS, awaiting human commit (ADR-003)
+	contextBulletin?: string;      // one-shot cycle-closure message pinned to the next turn's system prompt (consumed then cleared) — so the agent knows the human accepted/discarded/committed
 }
 interface SubagentRun {
 	role: string;
@@ -74,46 +74,45 @@ interface SubagentRun {
 	summary: string;
 	at: number;
 	startedAt?: number;
-	logPath?: string;            // .zense/subagents/<stamp>-<role>.log — เขียน live ระหว่างรัน
-	model?: string;              // model ที่ sub-agent รันจริง ('provider/id' จาก JSONL events) — เทียบกับ .zense/models.json เพื่อดัก pi fallback เงียบๆ
+	logPath?: string;            // .zense/subagents/<stamp>-<role>.log — written live during the run
+	model?: string;              // model the sub-agent actually ran ('provider/id' from JSONL events) — compared with .zense/models.json to catch silent pi fallbacks
 	status?: "running" | "done" | "failed";
-	retried?: boolean;           // provider-missing heal: รันนี้ถูก retry 1 ครั้งด้วย '-e <provider ext>' (2026-09-17)
-	autoIncluded?: boolean;      // provider-missing heal: retry สำเร็จ → merge persist path เข้า include list ของ role
+	retried?: boolean;           // provider-missing heal: this run was retried once with '-e <provider ext>'
+	autoIncluded?: boolean;      // provider-missing heal: retry succeeded → persist path merged into the role's include list
 }
-/** Active per-session worktree: redirect ทุก tool call ของ main agent เข้าไปทำงานในนี้
- *  (ผ่านการ mutate event.input) จนกว่า eval PASS จะ apply เข้า main แบบ staged (ไม่ commit — ADR-003);
- *  กัน 2 session เขียนทับกัน */
+/** Active per-session worktree: every main-agent tool call is redirected here
+ *  (by mutating event.input); on eval PASS the work is applied back to main as
+ *  staged changes (no commit — ADR-003). Prevents two sessions stomping each other. */
 interface Worktree {
-	root: string;               // absolute path ของ worktree (nested ใต้ <repo>/.zense/worktree/)
+	root: string;               // absolute path of the worktree (nested under <repo>/.zense/worktree/)
 	branch: string;             // zense/impl/v<N>-<stamp>
-	dir: string;                // === root (เก็บซ้ำเพื่อ semantic clarity ตอน worktree remove)
-	baseline?: string;          // HEAD ของ main ก่อนสร้าง branch — กลายเป็น git-evidence baseline ของรอบนี้
+	dir: string;                // === root (kept duplicated for semantic clarity at worktree remove)
+	baseline?: string;          // main HEAD before branch creation — the git-evidence baseline for this round
 }
-/** change ที่ applyWorktreeBack stage ไว้ใน main (ยังไม่ commit) — persist ข้าม session
- *  + reconcile ตอน session start (ยังอยู่ใน index / ถูก commit / ถูก discard นอก flow) */
+/** Change applyWorktreeBack staged in main (not yet committed) — persisted across sessions
+ *  so session start can reconcile (still staged / committed / discarded outside the flow). */
 interface PendingApply {
 	specVersion: number;
-	branch: string;             // branch ที่ apply มา (traceability — ถูกลบแล้วหลัง apply)
-	paths: string[];            // repo-relative paths ที่ถูก stage ตอน apply (undo hint + สรุปใน status)
+	branch: string;             // branch the apply came from (traceability — deleted after apply)
+	paths: string[];            // repo-relative paths staged at apply (undo hint + status summary)
 	appliedAt: number;
-	preApplyHead?: string;      // HEAD ของ main ก่อน apply (squash ไม่ขยับ HEAD — ใช้เทียบตอน reconcile ว่ามีคน commit แล้วหรือยัง)
+	preApplyHead?: string;      // main HEAD before apply (squash doesn't move HEAD — reconcile uses it to detect outside commits)
 }
 
 const zenseDir = (cwd: string) => join(cwd, ".zense");
 
-// ----------------------------------------------------------------------------- spec version change summary (module scope — export เพื่อ unit-test ได้)
+// ----------------------------------------------------------------------------- spec version change summary (module scope — exported for unit tests)
 
-/**
- * เทียบ spec ใหม่ (next) กับ version ก่อน (prev) แบบ field-by-field แล้วคืนบรรทัดสรุป
- * ที่มนุษย์อ่านเข้าใจ — เงื่อนไขสำคัญของ re-spec loop: เมื่อ eval/review verify ไม่ผ่าน
- * แล้วต้อง commit spec version ใหม่ มนุษย์ผู้เซ็นต้องเห็นชัดๆ ว่า "version นี้แก้อะไรจาก
- * version ก่อน" — ห้ามนำเสนอ spec เดิมซ้ำเงียบๆ. criteria เทียบตาม id: เพิ่ม (+) / ลบ (−) /
- * แก้ (~ text/check); ส่วนที่เป็น list (approach/scope/constraints/specDebt) เทียบแบบ set.
- * ไม่มีการเปลี่ยนแปลงเลย → คืนบรรทัดเตือนบรรทัดเดียว (caller ใช้ตรวจ identical ได้จากตัวนี้) */
+/** Field-by-field diff between prev and next spec as human-readable summary lines.
+ *  Re-spec loop requirement: when eval/review fails and a new spec version is committed,
+ *  the signer must see exactly what changed — never re-present an identical spec silently.
+ *  Criteria diffed by id: added (+) / removed (−) / changed (~ text/check); list fields
+ *  (approach/scope/constraints/specDebt) diffed as sets. No changes at all → one warning
+ *  line (callers use it to detect identical specs). */
 export const buildSpecChanges = (prev: Spec, next: Spec): string[] => {
 	const lines: string[] = [];
 	if (prev.title !== next.title) lines.push(`title: "${prev.title}" → "${next.title}"`);
-	if (prev.intent !== next.intent) lines.push(`intent: เปลี่ยน (อ่านเนื้อใหม่ใน spec ด้านล่าง)`);
+	if (prev.intent !== next.intent) lines.push(`intent: changed (read the new text in the spec below)`);
 	const listDiff = (label: string, a: string[], b: string[]) => {
 		for (const x of b.filter((x) => !a.includes(x))) lines.push(`${label} +: ${x}`);
 		for (const x of a.filter((x) => !b.includes(x))) lines.push(`${label} −: ${x}`);
@@ -137,15 +136,13 @@ export const buildSpecChanges = (prev: Spec, next: Spec): string[] => {
 	listDiff("specDebt", prev.specDebt ?? [], next.specDebt ?? []);
 	return lines.length
 		? lines
-		: [`⚠️ ไม่มีการเปลี่ยนแปลงจาก v${prev.version} — spec ใหม่เหมือน version ก่อนทุกประการ`];
+		: [`⚠️ No changes from v${prev.version} — the new spec is identical to the previous version`];
 };
 
-/**
- * จัดกลุ่มบรรทัด changesFrom (flat ที่ buildSpecChanges ผลิต) เป็นหมวดอ่านง่ายสำหรับ render
- *  — parse จาก prefix บรรทัดเดิมเท่านั้น (ไม่แตะ format ที่ persist) → หมวดละ `### <ชื่อ>` +
- *  ordered list นับ 1 ใหม่ทุกหมวด, item = บรรทัดเดิม verbatim (คง +/−/~).
- *  ลำดับหมวดคงที่ตาม CHANGE_GROUPS; หมวดที่ไม่มี change ไม่แสดง; บรรทัดเตือน ⚠️
- *  (identical spec) แสดง verbatim ไม่มี heading; บรรทัดที่จับกลุ่มไม่ได้ลง `### Other` ท้ายสุด */
+/** Group the flat changesFrom lines (from buildSpecChanges) into render-friendly sections.
+ *  Parses only the original line prefixes (persisted format untouched). Group order fixed by
+ *  CHANGE_GROUPS; empty groups hidden; ⚠️ identical-spec warnings render verbatim without a
+ *  heading; ungroupable lines land in `### Other` last. */
 export const CHANGE_GROUPS: ReadonlyArray<[string, (line: string) => boolean]> = [
 	["Title & intent", (l) => l.startsWith("title:") || l.startsWith("intent:")],
 	["Approach", (l) => l.startsWith("approach ")],
@@ -155,8 +152,8 @@ export const CHANGE_GROUPS: ReadonlyArray<[string, (line: string) => boolean]> =
 	["Spec debt", (l) => l.startsWith("specDebt ")],
 ];
 
-/** แยกบรรทัด change ลง bucket ตาม CHANGE_GROUPS (ลำดับคงที่) — ใช้ร่วมกันระหว่าง groupSpecChanges
- *  (archive .md plain text) กับ renderSpecChangesTui (sign dialog ทาสี) เพื่อไม่ให้ตรรกะจัดกลุ่ม drift */
+/** Bucket change lines by CHANGE_GROUPS (fixed order) — shared by groupSpecChanges (archive .md)
+ *  and renderSpecChangesTui (sign dialog) so the grouping logic never drifts. */
 const bucketSpecChanges = (lines: string[]) => {
 	const buckets = new Map<string, string[]>();
 	const warns: string[] = [];
@@ -189,28 +186,25 @@ export const groupSpecChanges = (lines: string[]): string => {
 	return parts.join("\n\n");
 };
 
-/** role สีของทิศทาง change — map กับ theme ของ pi: + เพิ่ม = success (เขียว) / − ลบ = error (แดง) / ~ แก้ = warning (เหลือง) */
+/** Theme color for each change direction: + add = success / − remove = error / ~ change = warning */
 export type ChangeMarkRole = Extract<ThemeColor, "success" | "error" | "warning">;
 
-/**
- * render section "## Changes in v{N}" สำหรับ sign dialog (TUI เท่านั้น — archive .md
- * ยังใช้ groupSpecChanges ที่เป็น plain text คง label+marker เดิม เพราะสีใช้ไม่ได้ในไฟล์):
- * item ใต้ heading ตัด label ที่ซ้ำกับ heading ทิ้ง ("approach +: x" → "1. x") แล้วแสดงทิศทาง
- * ด้วยสีแทนเครื่องหมายผ่าน color(role, text) — บรรทัดที่ไม่มี marker (title:/intent:/Other/⚠️) เป็น neutral.
- * จัดกลุ่มด้วย bucketSpecChanges ตัวเดียวกับ archive (ลำดับหมวด/⚠️ verbatim/Other ท้ายสุด เหมือนกันเป๊ะ).
- * คืน array บรรทัด (ยังไม่ wrap — caller wrap ตามความกว้างจริงด้วย wrapTextWithAnsi ตอน render);
- * spec ไม่มี changesFrom → คืน [] (ไม่มี section Changes) */
+/** Render the "## Changes in v{N}" section for the sign dialog (TUI only — the archive .md
+ *  keeps plain-text label+marker via groupSpecChanges since files can't show color):
+ *  items drop the redundant heading label ("approach +: x" → "1. x") and get colored by
+ *  direction instead. Grouping identical to the archive via bucketSpecChanges.
+ *  Returns unwrapped lines; [] when the spec has no changesFrom. */
 export const renderSpecChangesTui = (spec: Spec, color: (role: ChangeMarkRole, text: string) => string): string[] => {
 	if (!spec.changesFrom?.length) return [];
 	const { buckets, warns, other } = bucketSpecChanges(spec.changesFrom);
 	const ROLE = { "+": "success", "−": "error", "~": "warning" } as const;
-	// item รูป "<label> <marker>: <detail>" → "N. <detail>" ทาสีตาม marker; ไม่ match pattern → neutral verbatim
+	// "<label> <marker>: <detail>" → "N. <detail>" colored by marker; unmatched lines stay neutral
 	const renderItem = (line: string, n: number): string => {
 		const m = /^(\S+) ([+−~]): (.*)$/.exec(line);
 		return m ? color(ROLE[m[2] as keyof typeof ROLE], `${n}. ${m[3]}`) : `${n}. ${line}`;
 	};
 	const groups: string[][] = [];
-	if (warns.length) groups.push([...warns]); // ⚠️ verbatim ไม่มี heading (ตรง groupSpecChanges)
+	if (warns.length) groups.push([...warns]); // ⚠️ verbatim, no heading (matches groupSpecChanges)
 	for (const [heading] of CHANGE_GROUPS) {
 		const items = buckets.get(heading);
 		if (items?.length) groups.push([`### ${heading}`, ...items.map((x, i) => renderItem(x, i + 1))]);
@@ -219,10 +213,9 @@ export const renderSpecChangesTui = (spec: Spec, color: (role: ChangeMarkRole, t
 	return [`## Changes in v${spec.version} (vs v${spec.version - 1})`, "", ...groups.flatMap((g, i) => (i ? ["", ...g] : g))];
 };
 
-/** render spec เป็น markdown — ใช้ทั้ง archive .md และ sign dialog (dialog เรนเดอร์ตัวนี้อยู่แล้ว)
- *  v>=2 ที่มี changesFrom จะมี section "## Changes in v{N} (vs v{N-1})" คั่นก่อน Intent เสมอ
- *  → ผู้เซ็นเห็น change ของ version ใหม่ชัดก่อนอ่านเนื้อเต็ม; spec เก่าที่ไม่มี field เรนเดอร์เหมือนเดิม.
- *  บรรทัด change ถูกจัดกลุ่มเป็นหมวด (groupSpecChanges) แทน flat bullet — ผู้เซ็นอ่านง่ายกว่า */
+/** Render a spec as markdown — used for both the archive .md and the sign dialog.
+ *  v>=2 with changesFrom gets a "## Changes in v{N} (vs v{N-1})" section before Intent
+ *  so the signer sees what changed up front. */
 export const renderSpecMd = (s: Spec): string =>
 	`# Spec v${s.version}: ${s.title}\napproved: ${s.approved}\n\n` +
 	(s.changesFrom?.length
@@ -230,11 +223,10 @@ export const renderSpecMd = (s: Spec): string =>
 		: "") +
 	`## Intent\n${s.intent}\n\n${s.approach?.length ? "## Approach\n" + s.approach.map((x) => `- ${x}`).join("\n") + "\n\n" : ""}## Scope\n${s.scope.map((x) => `- ${x}`).join("\n")}\n\n## Constraints\n${s.constraints.map((x) => `- ${x}`).join("\n")}\n\n## Acceptance criteria\n${s.criteria.map((c) => `- [ ] ${c.id}: ${c.text} *(check: ${c.check})*`).join("\n")}\n\n## Spec debt (human-verified only)\n${s.specDebt.map((x) => `- ${x}`).join("\n")}\n`;
 
-/** sync ลายเซ็นของ spec กลับลงไฟล์บน disk หลัง approve:
- *  ไฟล์ถูกเขียนตอน commitSpec ด้วย approved:false — approveCurrentSpec เปลี่ยนเฉพาะ state ใน
- *  memory + session log (persist) → .zense/spec.{json,md} และ archive copies ที่ specJsonPath/
- *  specMdPath ชี้อยู่ต้อง sync ด้วย ไม่งั้น grader/script ที่อ่านไฟล์เห็น approved:false ตลอด.
- *  best-effort: เขียนไม่ได้/ไฟล์หาย → ข้ามเงียบๆ ไม่ให้การเซ็นพัง */
+/** Sync the approval back to spec files on disk:
+ *  commitSpec writes files with approved:false, while approveCurrentSpec only updates in-memory
+ *  state — .zense/spec.{json,md} plus archive copies must follow or graders/scripts keep seeing
+ *  approved:false. Best-effort: unwritable/missing files are skipped silently. */
 export const syncApprovedSpecFiles = (cwd: string, spec: Spec, paths?: { json?: string; md?: string }): boolean => {
 	const json = JSON.stringify(spec, null, 2);
 	const md = renderSpecMd(spec);
@@ -258,11 +250,10 @@ export const syncApprovedSpecFiles = (cwd: string, spec: Spec, paths?: { json?: 
 };
 
 /**
- * merge "tuiMode": "fullscreen" เข้า settings.json — เฉพาะตอนที่ key ยังไม่มีเท่านั้น (ผู้ใช้ยังไม่เคยเลือก)
- * public extension API ของ pi ไม่มี tuiMode setter (SettingsManager.setTuiMode ไม่ถูก expose ให้ extension)
- * เลยต้องเขียนไฟล์ตรงๆ — pure function แยกออกจาก fs เพื่อ unit-test ได้โดยไม่แตะไฟล์จริงของผู้ใช้
- * คืน null = ไฟล์เดิม parse ไม่ได้/ไม่ใช่ object → ห้ามเขียนทับเด็ดขาด (กัน clobber การตั้งค่าของผู้ใช้)
- * changed=false = user ตั้ง tuiMode เองแล้ว (แม้แต่ "regular") → respect ทันที ไม่แตะต้อง
+ * Merge "tuiMode": "fullscreen" into settings.json — only when the key is absent.
+ * pi's public extension API has no tuiMode setter, so we write the file directly.
+ * null = existing file unparseable/not an object → never overwrite (protects user settings).
+ * changed=false = user already chose a tuiMode (even "regular") → respect it, touch nothing.
  */
 export const applyFullscreenDefault = (raw: string | undefined): { text: string; changed: boolean } | null => {
 	if (raw === undefined || !raw.trim()) return { text: `${JSON.stringify({ tuiMode: "fullscreen" }, null, 2)}\n`, changed: true };
@@ -277,31 +268,30 @@ export const applyFullscreenDefault = (raw: string | undefined): { text: string;
 	return { text: `${JSON.stringify({ ...(parsed as Record<string, unknown>), tuiMode: "fullscreen" }, null, 2)}\n`, changed: true };
 };
 
-/** shell-quote แบบ single-quote สำหรับ path ที่อาจมี space/special char */
+/** single-quote shell-escape for paths with spaces/special chars */
 const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
 /**
- * Remap path ที่ agent ขอ (relative ต่อ session cwd = main repo) ไปเป็น path ใต้ worktree root
- * โดย relative structure เดิม. path นอก repo (เช่น pi docs ใน node_modules) และ path ใต้
- * .zense/ (harness state ที่ต้องอยู่ใน main) คืนค่าเดิม — ไม่ redirect.
- * Pure function → unit-test ได้ (export เผื่อ test ใช้โดยตรง).
+ * Remap an agent-requested path (relative to session cwd = main repo) to the same relative
+ * location under the worktree root. Paths outside the repo (e.g. pi docs in node_modules)
+ * and anything under .zense/ (harness state lives in main) are returned unchanged.
  */
 export const rewritePathForWorktree = (cwd: string, wtRoot: string, path: string): string => {
 	if (!path) return path;
 	const abs = resolve(cwd, path);
 	const rel = relative(cwd, abs).split(sep).join("/");
-	if (!rel || rel.startsWith("..")) return path;           // นอก repo → ไม่ redirect
-	if (rel === ".zense" || rel.startsWith(".zense/")) return path; // harness state อยู่ main
+	if (!rel || rel.startsWith("..")) return path;           // outside repo → no redirect
+	if (rel === ".zense" || rel.startsWith(".zense/")) return path; // harness state lives in main
 	return join(wtRoot, rel);
 };
 
-/** นำหน้า bash command ด้วย `cd <wtRoot> &&` เพื่อให้รันใน worktree (path มี space ก็ quote) */
+/** Prefix a bash command with `cd <wtRoot> &&` so it runs inside the worktree */
 export const buildWorktreeCommand = (cmd: string, wtRoot: string): string =>
 	`cd ${shellQuote(wtRoot)} && ${cmd}`;
 
-// ----- git worktree helpers (module scope — export เพื่อ integration-test ใน temp git repo ได้)
+// ----- git worktree helpers (module scope — exported for integration tests)
 
-/** git runner ที่ไม่ throw — คืน {ok,out,err} ให้ caller ตัดสินใจ (สำหรับ best-effort worktree ops) */
+/** non-throwing git runner returning {ok,out,err} — for best-effort worktree ops */
 export const gitOk = (args: string[], cwd: string): { ok: boolean; out: string; err: string } => {
 	try {
 		const out = execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -312,26 +302,24 @@ export const gitOk = (args: string[], cwd: string): { ok: boolean; out: string; 
 	}
 };
 
-/** สร้าง git worktree ของ session นี้ที่ spec approval (phase → implementation).
- *  worktree อยู่ใต้ <repo>/.zense/worktree/ (nested ใน main working tree — git รองรับ)
- *  เพื่อให้ state ของ zense รวมอยู่ใน workspace ที่เดียว ไม่รก parent dir. best-effort:
- *  ล้มเหลว (ไม่ใช่ git repo / ชื่อซ้ำ) → คืน null (caller degrade กลับทำงานใน main ตามปกติ ไม่พัง). */
-/** worktree เดิมเอามาใช้ต่อได้ไหม: มี record และ root ยังอยู่บนดิสก์ (user อาจลบ worktree ทิ้งเอง
- *  ระหว่าง session → false = สร้างใหม่). กันเคส bump spec version แล้วเซ็นใหม่กลาง implement:
- *  เดิมสร้าง worktree เปล่าจาก main ทุกครั้ง → งานที่ implement ค้างไว้ใน worktree เก่ากลายเป็น orphan
- *  (eval รอบถัดไปรันกับ worktree เปล่าแล้ว FAIL ทั้งที่ทำเสร็จแล้ว — เจอจริงรอบ v3→v4) */
+/** Does the existing worktree still exist on disk? Reusing it matters when a spec version is
+ *  bumped mid-implementation: recreating a fresh worktree would orphan in-progress work and make
+ *  the next eval run against an empty tree → FAIL despite finished work (hit for real at v3→v4). */
 export const canReuseWorktree = (wt: Worktree | null | undefined): boolean => !!wt && existsSync(wt.root);
 
+/** Create this session's git worktree at spec approval. Nested under <repo>/.zense/worktree/
+ *  so zense state stays in one workspace. Best-effort: failure (not a git repo / name clash)
+ *  returns null and the caller degrades to working in main. */
 export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 	const branch = `zense/impl/v${spec.version}-${stamp}`;
 	const wtParent = join(zenseDir(cwd), "worktree");
 	const wtRoot = join(wtParent, `${basename(cwd)}-wt-${stamp}`);
 	mkdirSync(wtParent, { recursive: true });
-	const head = gitOk(["rev-parse", "HEAD"], cwd); // baseline ของรอบ = main HEAD ก่อน branch (ก่อน worktree add เสมอ)
+	const head = gitOk(["rev-parse", "HEAD"], cwd); // round baseline = main HEAD before branching (always before worktree add)
 	if (gitOk(["worktree", "add", wtRoot, "-b", branch], cwd).ok !== true) return null;
 	excludeFromGitStatus(cwd, wtParent);
-	// copy current spec + memory เข้า worktree ให้ bash-based read ในนั่นเห็น state ปัจจุบัน (ไม่ใช่ตอน checkout)
+	// copy current spec + memory into the worktree so bash-based reads see current state (not checkout-time state)
 	const wtZense = join(wtRoot, ".zense");
 	mkdirSync(wtZense, { recursive: true });
 	for (const f of ["spec.json", "spec.md", "memory.jsonl"]) {
@@ -341,8 +329,8 @@ export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	return { root: wtRoot, branch, dir: wtRoot, ...(head.ok ? { baseline: head.out.trim() } : {}) };
 };
 
-/** cursor ใต้ repo ที่ zense สร้าง (เช่น .zense/worktree/) ไม่ควรโผล่ใน git status ของ main —
- *  best-effort append ลง .git/info/exclude (local-only ไม่แตะไฟล์ tracked ของผู้ใช้). ล้มเหลว → ข้ามเงียบๆ */
+/** Keep zense-created dirs (e.g. .zense/worktree/) out of main's git status — best-effort
+ *  append to .git/info/exclude (local-only, never touches tracked user files). */
 const excludeFromGitStatus = (cwd: string, absPath: string): void => {
 	try {
 		const top = gitOk(["rev-parse", "--show-toplevel"], cwd);
@@ -362,15 +350,15 @@ const excludeFromGitStatus = (cwd: string, absPath: string): void => {
 	}
 };
 
-/** เรียง subject ของ commit ให้เป็นบรรทัดเดียว (≤72 chars) — ใช้ spec title ที่มนุษย์เซ็นอนุมัติแล้ว */
+/** single-line commit subject (≤72 chars) — built from the human-signed spec title */
 export const sanitizeSubject = (title: string): string => {
 	const oneLine = (title || "").replace(/\s+/g, " ").trim();
 	if (!oneLine) return "zense impl";
 	return oneLine.length <= 72 ? oneLine : oneLine.slice(0, 71).trimEnd() + "…";
 };
 
-/** commit message ของ squashed impl commit — deterministic จาก spec (title=intent ที่มนุษย์เซ็นแล้ว
- *  จึงอธิบายงานได้จริง ไม่ใช่ "zense: eval pass" กากๆ) + รายชื่อ interim commits ที่โดน squash เก็บไว้ใน body */
+/** Commit message for the squashed impl commit — deterministic from the spec (its signed title
+ *  describes the work for real) + squashed interim-commit subjects kept in the body. */
 export const composeCommitMessage = (spec: Spec, interimSubjects: string[]): string => {
 	const subject = sanitizeSubject(spec.title || `zense impl v${spec.version}`);
 	const body: string[] = [];
@@ -380,63 +368,65 @@ export const composeCommitMessage = (spec: Spec, interimSubjects: string[]): str
 	return `${subject}\n\n${body.join("\n\n")}\n`;
 };
 
-// ----- pending apply (ADR-003: eval PASS → apply เข้า main แบบ staged, ไม่ commit — มนุษย์ commit หลัง review)
+// ----- pending apply (ADR-003: eval PASS → apply into main as staged changes; the human commits after review)
 
-const PENDING_PATCH = "pending-apply.patch"; // reverse patch ของ change ที่ apply ไว้ — ใช้โดย discardPendingApply
-const PENDING_MSG = "pending-apply.msg";     // commit message สำเร็จรูป (จาก squashed commit) — มนุษย์ commit -F ได้เลย
-const NOT_ZENSE = ":!.zense";                // pathspec: ทุกอย่างยกเว้น .zense (harness state ไม่เข้า apply/undo เด็ดขาด)
+const PENDING_PATCH = "pending-apply.patch"; // reverse patch of the applied change — used by discardPendingApply
+const PENDING_MSG = "pending-apply.msg";     // ready-made commit message (from the squashed commit) — human may `commit -F`
+const NOT_ZENSE = ":!.zense";                // pathspec: everything except .zense (harness state never enters apply/undo)
 
-/** เป็น git working tree หรือไม่ — feature ทุกอย่างที่พยิง git (pre-spec dirty guard, worktree, apply-back)
- *  ต้อง degrade เงียบเมื่อ false (โปรเจกต์ที่ยังไม่ init git ไม่ควรเห็น guard นี้เลย) */
+/** Is this a git working tree? Every git-dependent feature (pre-spec dirty guard, worktree,
+ *  apply-back) must degrade silently when false (non-git projects shouldn't see these guards). */
 export const isGitRepo = (cwd: string): boolean => gitOk(["rev-parse", "--is-inside-work-tree"], cwd).ok;
 
-/** รายการ uncommitted change นอก .zense (porcelain เช่น " M src/x.ts", "?? new.ts") — ว่าง = สะอาดหรือไม่ใช่ git repo
- *  ใช้เป็น pre-spec guard: worktree ของ spec ใหม่ branch จาก HEAD ตอน approve → ของที่ยังไม่ commit
- *  จะไม่ตามเข้า worktree และหลุดจาก baseline (baselineHead=HEAD) ทั้งที่ agent เห็นไฟล์อยู่ใน main */
+/** Uncommitted changes outside .zense (porcelain lines like " M src/x.ts", "?? new.ts");
+ *  empty = clean or not a git repo. Used as the pre-spec guard: a new spec's worktree branches
+ *  from the HEAD at approval time, so uncommitted work would neither follow into the worktree
+ *  nor be covered by the baseline — even though the agent sees the files in main. */
 export const uncommittedChanges = (cwd: string): string[] => {
 	const r = gitOk(["status", "--porcelain", "--", ".", NOT_ZENSE], cwd);
 	if (!r.ok) return [];
 	return r.out.split("\n").map((s) => s.trimEnd()).filter(Boolean);
 };
 
-/** commit message ของ snapshot auto-commit — ห้าม fixed: สร้างจากรายชื่อไฟล์ที่ค้างจริง (subject ≤72 chars
- *  ผ่าน sanitizeSubject; รายชื่อครบทุกไฟล์อยู่ใน body เผื่อ subject ถูกตัด) เพื่อ log อธิบายตัวเองได้ */
+/** Commit message for the snapshot auto-commit — never fixed text: built from the actual file
+ *  list (subject ≤72 chars via sanitizeSubject; full list always in the body). */
 export const composeSnapshotMessage = (dirty: string[]): string => {
-	const names = dirty.map((l) => l.slice(3).replace(/^"|"$/g, "")).filter(Boolean); // porcelain: "XY <path>" (octal-quoted ถ้ามีช่องว่าง/ไทย)
-	// ลดจำนวนชื่อไฟล์ใน subject ลงทีละตัวจนพอดี 72 chars (ห้ามปล่อยให้ sanitizeSubject ตัดทิ้ง
-	// เปล่าๆ — suffix "(+N)" ที่บอกว่ามีไฟล์อื่นอีกจะหายไปด้วย); body ด้านล่าง list ครบทุกไฟล์เสมอ
+	const names = dirty.map((l) => l.slice(3).replace(/^"|"$/g, "")).filter(Boolean); // porcelain: "XY <path>" (octal-quoted when it has spaces/non-ASCII)
+	// drop file names from the subject one by one until it fits 72 chars (don't let sanitizeSubject
+	// truncate blindly — the "(+N)" suffix would be lost); body always lists every file
 	let subject = "";
 	for (let take = Math.min(3, names.length); take >= 0 && !subject; take--) {
 		const more = names.length > take ? ` (+${names.length - take})` : "";
 		const cand = sanitizeSubject(`chore: snapshot pre-spec${take ? `: ${names.slice(0, take).join(", ")}${more}` : more ? ` (${names.length} files)` : ""}`);
-		if (!cand.endsWith("…") || take === 0) subject = cand; // ยอมตัดตอน take=0 เท่านั้น (prefix เองยาวเกิน — แทบเป็นไปไม่ได้)
+		if (!cand.endsWith("…") || take === 0) subject = cand; // accept truncation only at take=0 (prefix alone too long — near-impossible)
 	}
 	return `${subject}\n\nFiles snapshotted (uncommitted at pre-spec check):\n${names.map((n) => `- ${n}`).join("\n")}\n`;
 };
 
-/** stage ทุก change ยกเว้น .zense (policy: harness state ห้ามเข้า index/commit เด็ดขาด) —
- *  ห้ามใช้ exclude pathspec (`git add -A -- . ':!.zense'`): git ≥2.55 fatal exit 1
- *  "The following paths are ignored by one of your .gitignore files: .zense" ทันทีที่ traversal
- *  เจอ dir ที่ถูก ignore แม้มี exclusion ครอบอยู่ (exclude-only / --ignore-errors ก็ไม่รอด —
- *  เจอจริง git 2.55.0) → snapshot รายงาน "git add failed" ทั้งที่ policy เดิมถูกต้องอยู่แล้ว
- *  วิธีที่ใช้ได้ทุกกรณี: add ธรรมดา (ignored files ถูกข้ามเงียบๆ exit 0) แล้ว unstage .zense ทิ้งเสมอ —
- *  กันเคสโปรเจกต์ที่ไม่ได้ ignore .zense (add -A จะดูด harness state ทั้งหมดรวม .zense/worktree/)
- *  โดย reset กลับ HEAD (tracked .zense — ถ้ามี — คงสภาพ index เดิม ไม่กลายเป็น staging deletion)
- *  หรือ rm --cached เมื่อยังไม่มี commit แรก (ไม่มี HEAD ให้ reset); best-effort, ไม่มีใน index → no-op */
+/** Stage every change except .zense (policy: harness state never enters index/commit).
+ *  Do NOT use an exclude pathspec (`git add -A -- . ':!.zense'`): git ≥2.55 fatals
+ *  "The following paths are ignored by one of your .gitignore files: .zense" as soon as
+ *  traversal hits an ignored dir, exclusion notwithstanding (seen on git 2.55.0) → snapshots
+ *  report "git add failed" despite correct policy.
+ *  Works in every case: plain add (ignored files skipped, exit 0), then always unstage .zense —
+ *  covers projects that don't ignore .zense (add -A would slurp all harness state incl.
+ *  .zense/worktree/). reset back to HEAD if it exists (tracked .zense stays staged as before),
+ *  otherwise rm --cached (no HEAD yet). Best-effort; not-in-index → no-op. */
 export const gitAddButZense = (cwd: string): { ok: boolean; out: string; err: string } => {
 	const add = gitOk(["add", "-A", "--", "."], cwd);
 	if (!add.ok) return add;
 	const head = gitOk(["rev-parse", "--verify", "-q", "HEAD"], cwd);
-	if (head.ok) gitOk(["reset", "-q", "--", ".zense"], cwd); // reset <paths> กลับ HEAD (default commit) — tracked .zense คงสภาพ index เดิม
-	else gitOk(["rm", "-r", "--cached", "-q", "--ignore-unmatch", ".zense"], cwd); // no HEAD ให้ reset — ลบออกจาก index เท่านั้น worktree ไม่แตะ
+	if (head.ok) gitOk(["reset", "-q", "--", ".zense"], cwd); // reset <paths> to HEAD — tracked .zense keeps its index state
+	else gitOk(["rm", "-r", "--cached", "-q", "--ignore-unmatch", ".zense"], cwd); // no HEAD to reset — index-only removal, worktree untouched
 	return add;
 };
 
-/** snapshot commit ของที่ค้างอยู่ (มนุษย์เลือก "commit ให้" จาก pre-spec dialog) — matcher กับ behavior เดิม
- *  ของ harness: add -A ยกเว้น .zense (ผ่าน gitAddButZense) + --no-verify; ไม่มีอะไร staged → ok แต่ msg="nothing to commit" */
+/** Snapshot-commit pending changes (human chose "commit for me" in the pre-spec dialog).
+ *  Mirrors harness behavior: add -A except .zense (via gitAddButZense) + --no-verify;
+ *  nothing staged → ok with msg="nothing to commit". */
 export const snapshotUncommitted = (cwd: string, message: string): { ok: boolean; msg: string } => {
 	const add = gitAddButZense(cwd);
-	// ไม่เช็ค add = error จะไปโผล่ที่ commit แทน ("nothing to commit") ทั้งที่ของจริง add ล้ม → รายงานต้นตอตรงๆ
+	// without this check, an add failure would surface at commit time as "nothing to commit" — report the real cause
 	if (!add.ok) return { ok: false, msg: `git add failed: ${add.err}` };
 	if (gitOk(["diff", "--cached", "--quiet"], cwd).ok) return { ok: true, msg: "nothing to commit" };
 	const cm = gitOk(["commit", "-m", message, "--no-verify"], cwd);
@@ -447,139 +437,144 @@ export const snapshotUncommitted = (cwd: string, message: string): { ok: boolean
 
 export interface ApplyBackResult {
 	ok: boolean;
-	conflict?: boolean;   // merge --squash ชน — main ถูกย้อนสภาพเดิมแล้ว, เก็บ worktree ไว้ให้มนุษย์ resolve
-	dirtyMain?: boolean;  // guard: main มี uncommitted change นอก .zense อยู่ก่อน → refuse ก่อนแตะ branch (เก็บ worktree)
+	conflict?: boolean;   // merge --squash clashed — main was rolled back; worktree kept for human resolution
+	dirtyMain?: boolean;  // guard: main had uncommitted changes outside .zense → refused before touching the branch (worktree kept)
 	msg: string;
-	paths: string[];      // repo-relative paths ที่ถูก stage ใน main (ว่าง = ไม่มี source change เลย)
-	commitMsg?: string;   // message ของ squashed commit ใน branch — เสนอเป็นคำสั่ง commit สำเร็จรูปให้มนุษย์
+	paths: string[];      // repo-relative paths staged in main (empty = no source change at all)
+	commitMsg?: string;   // message of the squashed branch commit — offered to the human as a ready-made commit command
 }
 
-/** apply worktree branch เข้า main แบบ **staged-only** (ไม่ commit — ADR-003: มนุษย์ review ใน main แล้ว
- *  commit ชั้นสุดท้ายเอง หรือสั่ง agent):
- *  0) guard: main สกปรกนอก .zense → refuse (ของปนกัน = undo ลำบาก) — ยังไม่แตะ branch (retry ได้เสมอ)
- *  1) squash interim commits ใน branch เป็น commit เดียว (logic เดิมของ merge-back; .zense ไม่ตาม)
- *  2) git merge --squash — stage ทุก change เข้า index แต่ห้ามสร้าง commit/merge state
- *  3) เก็บ reverse patch (git diff --cached) ไว้ .zense/pending-apply.patch ให้ discardPendingApply ย้อนคืนเป๊ะ
- *  conflict → ย้อน non-.zense กลับ HEAD เอง (--squash ไม่เขียน MERGE_HEAD → merge --abort ใช้ไม่ได้)
- *  แล้วคืน conflict=true เก็บ worktree. success → cleanup worktree + branch */
+/** Apply the worktree branch into main as **staged-only** (no commit — ADR-003: the human
+ *  reviews in main and makes the final commit, or asks the agent):
+ *  0) guard: main dirty outside .zense → refuse (mixed changes make undo hard) — branch
+ *     untouched, so retry is always possible
+ *  1) squash interim branch commits into one (.zense excluded per policy)
+ *  2) git merge --squash — stages everything without creating a commit/merge state
+ *  3) store a reverse patch (git diff --cached) at .zense/pending-apply.patch so
+ *     discardPendingApply can restore exactly
+ *  conflict → non-.zense rolled back to HEAD manually (--squash writes no MERGE_HEAD, so
+ *  merge --abort is unavailable) and conflict=true returned with the worktree kept;
+ *  success → worktree + branch cleaned up. */
 export const applyWorktreeBack = (cwd: string, spec: Spec, wt: Worktree): ApplyBackResult => {
-	// 0. guard: main ต้องสะอาด (ยกเว้น .zense) — มีของค้าง → refuse ก่อนแตะ branch
+	// 0. guard: main must be clean (except .zense) — refuse before touching the branch
 	const dirty = gitOk(["status", "--porcelain", "--", ".", NOT_ZENSE], cwd);
 	if (dirty.ok && dirty.out.trim())
 		return {
 			ok: false,
 			dirtyMain: true,
 			paths: [],
-			msg: `main มี uncommitted change นอก .zense/ ค้างอยู่ → ไม่ apply (ของปนกัน undo จะลำบาก): commit/stash ของเดิมก่อน แล้ว eval ใหม่\n${dirty.out.trim().split("\n").slice(0, 10).join("\n")}`,
+			msg: `main has uncommitted changes outside .zense/ — not applying (mixed changes make undo hard): commit/stash them first, then re-eval\n${dirty.out.trim().split("\n").slice(0, 10).join("\n")}`,
 		};
-	// 1. squash: หา branch point แล้วรวม interim commits เป็น commit เดียว (ยกเว้น .zense ตาม policy)
+	// 1. squash: find the branch point and fold interim commits into one (.zense excluded)
 	const mb = gitOk(["merge-base", wt.branch, "HEAD"], cwd);
 	const base = mb.ok ? mb.out.trim() : "";
 	const interimSubjects = base ? gitOk(["log", "--format=%s", `${base}..HEAD`], wt.root).out.split("\n").map((s) => s.trim()).filter(Boolean) : [];
-	// stage changes ใน worktree (ยกเว้น .zense) — รวม untracked files ด้วย (git diff --quiet HEAD ไม่เห็น untracked)
-	// ผ่าน gitAddButZense: exclude pathspec กับ git add ล้มเมื่อ .zense ถูก ignore (git ≥2.55 — ดูคอมเมนต์ helper)
+	// stage worktree changes (except .zense) incl. untracked files (git diff --quiet HEAD misses those)
+	// via gitAddButZense: exclude-pathspec + git add fails when .zense is ignored (git ≥2.55 — see helper)
 	gitAddButZense(wt.root);
 	if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
 		gitOk(["commit", "-m", "(interim — squashed at apply-back)", "--no-verify"], wt.root);
 	}
 	const ahead = base ? Number(gitOk(["rev-list", "--count", `${base}..HEAD`], wt.root).out.trim() || "0") : 0;
 	if (base && ahead > 0) {
-		gitOk(["reset", "--soft", base], wt.root); // index ยังอุดมด้วย diff รวมของทุก interim commit
-		gitOk(["reset", "-q", "HEAD", "--", ".zense"], wt.root); // policy: .zense ไม่ตามเข้า main (best-effort unstage)
+		gitOk(["reset", "--soft", base], wt.root); // index still holds the union diff of all interim commits
+		gitOk(["reset", "-q", "HEAD", "--", ".zense"], wt.root); // policy: .zense never follows into main (best-effort unstage)
 		if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
 			gitOk(["commit", "-m", composeCommitMessage(spec, interimSubjects), "--no-verify"], wt.root);
 		} else {
-			// ไม่เหลือ source diff เลย (interim commits แตะเฉพาะ .zense) → รีเซ็ต branch กลับ base กัน squash commit ว่าง
+			// no source diff left (interim commits touched only .zense) → reset branch to base to avoid an empty squash commit
 			gitOk(["reset", "--hard", base], wt.root);
 		}
 	} else if (!gitOk(["diff", "--cached", "--quiet"], wt.root).ok) {
-		// หา branch point ไม่ได้ → squash ไม่ได้ แต่ยัง commit สิ่งที่ staged ด้วย message จาก spec
+		// no branch point found → can't squash, but still commit what's staged with a spec-derived message
 		gitOk(["commit", "-m", composeCommitMessage(spec, []), "--no-verify"], wt.root);
 	}
-	// เก็บ message ของ squashed commit ไว้ (ก่อน branch โดนลบ) — มนุษย์ commit ต่อด้วย message เดิมได้
+	// keep the squashed message (before the branch is deleted) so the human can commit with it
 	const branchMsg = gitOk(["log", "-1", "--format=%B", wt.branch], cwd);
 	const commitMsg = branchMsg.ok && branchMsg.out.trim() ? branchMsg.out.trim() + "\n" : composeCommitMessage(spec, interimSubjects);
-	// 2. apply เข้า main แบบ staged-only — ห้าม finalize merge commit
+	// 2. apply into main as staged-only — never finalize a merge commit
 	if (!gitOk(["merge", "--squash", wt.branch], cwd).ok) {
-		// --squash ไม่เขียน MERGE_HEAD → merge --abort ใช้ไม่ได้: ย้อนเองเฉพาะ non-.zense
-		// (guard ข้อ 0 รับประกันว่าก่อน merge ไม่มี uncommitted/untracked change นอก .zense → ย้อนได้ไม่ลบของใคร)
+		// --squash writes no MERGE_HEAD → merge --abort is unavailable: roll back non-.zense manually
+		// (guard 0 guarantees no uncommitted/untracked change outside .zense pre-merge → nothing human lost)
 		gitOk(["reset", "-q", "HEAD", "--", ".", NOT_ZENSE], cwd);
 		gitOk(["restore", "--staged", "--worktree", "--source=HEAD", "--", ".", NOT_ZENSE], cwd);
 		gitOk(["clean", "-fd", "--", ".", NOT_ZENSE], cwd);
-		return { ok: false, conflict: true, paths: [], msg: `apply conflict — main ถูกย้อนกลับสภาพเดิมแล้ว; แก้ด้วยมือ: cd ${wt.root} แล้ว resolve/commit ใน branch ${wt.branch}; จากนั้น git merge --squash ${wt.branch} ใน main` };
+		return { ok: false, conflict: true, paths: [], msg: `apply conflict — main was rolled back; fix manually: cd ${wt.root}, resolve/commit on branch ${wt.branch}, then git merge --squash ${wt.branch} in main` };
 	}
-	// 3. staged paths + reverse patch สำหรับ discard (patch ว่างได้ — เคส interim แตะเฉพาะ .zense)
+	// 3. staged paths + reverse patch for discard (patch may be empty — interim commits touching only .zense)
 	const paths = gitOk(["diff", "--cached", "--name-only", "--", ".", NOT_ZENSE], cwd).out.split("\n").map((s) => s.trim()).filter(Boolean);
 	const patch = gitOk(["diff", "--cached", "--binary", "--", ".", NOT_ZENSE], cwd);
 	mkdirSync(zenseDir(cwd), { recursive: true });
 	writeFileSync(join(zenseDir(cwd), PENDING_PATCH), patch.ok ? patch.out : "");
-	// 4. cleanup worktree + branch (change ครบใน index ของ main แล้ว)
+	// 4. cleanup worktree + branch (the full change now lives in main's index)
 	gitOk(["worktree", "remove", wt.dir, "--force"], cwd);
 	gitOk(["branch", "-D", wt.branch], cwd);
-	return { ok: true, paths, commitMsg, msg: `applied ${wt.branch} → main (staged, uncommitted — spec v${spec.version}; มนุษย์ commit หลัง review)` };
+	return { ok: true, paths, commitMsg, msg: `applied ${wt.branch} → main (staged, uncommitted — spec v${spec.version}; human commits after review)` };
 };
 
-/** undo ของ applyWorktreeBack: unstage ทั้งหมด แล้ว reverse-apply patch ที่เก็บไว้
- *  → main กลับสภาพก่อน apply เป๊ะ (reverse แตะเฉพาะไฟล์ใน patch — ของมนุษย์ที่ไม่เกี่ยวไม่โดน;
- *  ไฟล์ใหม่ที่ apply สร้างถูกลบโดย reverse patch). reverse ไม่ลง = มนุษย์แก้ไฟล์ชน patch ค้างไว้
- *  → fail ชัดๆ ไม่ลบของมนุษย์เงียบๆ (caller escalate ให้มนุษย์จัดการเอง). success → ลบ patch/msg ทิ้ง */
+/** Undo applyWorktreeBack: unstage everything, then reverse-apply the stored patch → main
+ *  returns to its exact pre-apply state (reverse only touches patched files — unrelated human
+ *  work is safe). Reverse failing means a human edit collided with the patch → fail loudly,
+ *  never silently delete human work (caller escalates). On success the patch/msg are removed. */
 export const discardPendingApply = (cwd: string): { ok: boolean; msg: string } => {
 	const patchPath = join(zenseDir(cwd), PENDING_PATCH);
 	if (!existsSync(patchPath))
-		return { ok: false, msg: `ไม่พบ ${patchPath} — undo อัตโนมัติไม่ได้; ย้อนด้วยมือ: git restore --staged --worktree -- <paths>` };
-	gitOk(["reset", "-q", "HEAD", "--", "."], cwd); // unstage ทุกอย่างก่อน — reverse patch กระทบ working tree เท่านั้น
+		return { ok: false, msg: `${patchPath} not found — cannot undo automatically; revert manually: git restore --staged --worktree -- <paths>` };
+	gitOk(["reset", "-q", "HEAD", "--", "."], cwd); // unstage everything first — the reverse patch then touches only the working tree
 	if (readFileSync(patchPath, "utf8").trim()) {
 		const rr = gitOk(["apply", "-R", "--whitespace=nowarn", patchPath], cwd);
 		if (!rr.ok)
-			return { ok: false, msg: `reverse-apply patch ไม่ผ่าน (มีการแก้ไฟล์ที่ apply ไว้หลังจากนั้น?): ${rr.err}\nห้ามลบของมนุษย์เงียบๆ — ตรวจเองด้วย git status / git diff` };
+			return { ok: false, msg: `reverse-apply failed (were the applied files edited afterwards?): ${rr.err}\nNever delete human work silently — inspect yourself with git status / git diff` };
 	}
 	rmSync(patchPath, { force: true });
 	rmSync(join(zenseDir(cwd), PENDING_MSG), { force: true });
-	return { ok: true, msg: "discarded — main กลับสภาพเหมือนก่อน apply (reverse patch สำเร็จ)" };
+	return { ok: true, msg: "discarded — main restored to its pre-apply state (reverse patch succeeded)" };
 };
 
 export interface AcceptResult {
 	ok: boolean;
 	msg: string;
-	amendedFiles: string[];      // ไฟล์ที่มนุษย์แก้เองหลัง grader ผ่าน (name-only จาก evalTree → HEAD^{tree})
-	warnings: string[];          // soft-mode anomalies (ไม่ refuse — แค่แนบไว้ใน report)
-	committedOnBehalf: boolean;  // harness commit แทนจาก staged ที่ค้างอยู่ (เฉพาะตอนถูกขอ)
+	amendedFiles: string[];      // files the human edited after the grader passed (name-only, evalTree → HEAD^{tree})
+	warnings: string[];          // soft-mode anomalies (never refuse — attached to the report)
+	committedOnBehalf: boolean;  // harness committed staged leftovers on the human's explicit request
 }
 
-/** accept ของ pendingApply — ทางออกฝั่ง "รับงาน" ของ change ที่ staged ไว้ (คู่กับ discard):
- *  soft verify (ไม่ refuse ทุกกรณี): index สะอาด = ถือว่ามนุษย์ commit เองแล้ว; index ยัง staged ค้าง
- *  → ต้อง commitIfStaged=true ถึงจะ commit แทนด้วย message ที่เตรียมไว้ (ห้าม --no-verify: จุดนี้มนุษย์
- *  ยอมรับแล้ว hook ควรทำงาน); index สะอาดแต่ HEAD ยังเท่า preApplyHead → change น่าจะหาย (reset/stash
- *  นอก flow) ไม่ใช่ถูก commit → แนบ warning แต่ยัง accept ตาม soft-mode
- *  human delta: เทียบ evalTree (tree ของ index ตอน apply/grade — lastEval.head ถูก repin ไว้แล้ว) กับ
- *  HEAD^{tree} → ชื่อไฟล์ที่มนุษย์แก้เพิ่มหลัง grader ผ่าน เอาไป learn เป็น lesson (.zense ตัดออกตาม policy)
- *  success → ลบ patch+msg ทิ้ง: undo จากนี้คือ git revert ปกติ ไม่ใช่ reverse patch อีกต่อไป */
+/** Accept side of pendingApply (discard's counterpart):
+ *  soft verification, never refuses for mere anomalies: clean index = the human committed
+ *  themselves; staged leftovers → commit on their behalf only when commitIfStaged=true (and
+ *  WITHOUT --no-verify: the human accepted, hooks should run); clean index but HEAD still
+ *  preApplyHead → the change likely vanished via out-of-band reset/stash rather than a commit
+ *  → attach a warning, still accept (soft mode).
+ *  Human delta: diff evalTree (the index tree at apply/grade time — lastEval.head was repinned)
+ *  against HEAD^{tree} → files the human edited post-grade become a learned lesson
+ *  (.zense excluded per policy). Success removes patch+msg: from here, undo means plain
+ *  git revert, not the reverse patch. */
 export const acceptPendingApply = (
 	cwd: string,
 	opts: { evalTree?: string; preApplyHead?: string; commitIfStaged?: boolean } = {},
 ): AcceptResult => {
 	const patchPath = join(zenseDir(cwd), PENDING_PATCH);
 	if (!existsSync(patchPath))
-		return { ok: false, msg: `ไม่มี pending apply ให้ accept (ไม่พบ ${PENDING_PATCH} — อาจ accept/commit ไปแล้ว หรือยังไม่เคย apply)`, amendedFiles: [], warnings: [], committedOnBehalf: false };
+		return { ok: false, msg: `no pending apply to accept (${PENDING_PATCH} not found — already accepted/committed, or never applied)`, amendedFiles: [], warnings: [], committedOnBehalf: false };
 	const warnings: string[] = [];
 	let committedOnBehalf = false;
 	if (!gitOk(["diff", "--cached", "--quiet"], cwd).ok) {
-		// ยัง staged ค้าง = มนุษย์ยังไม่ commit เอง — commit แทนได้ก็ต่อเมื่อถูกขอมาเท่านั้น
+		// still staged = human hasn't committed — commit on their behalf only when explicitly asked
 		if (!opts.commitIfStaged)
 			return {
 				ok: false,
-				msg: "ยังมี staged change ค้างอยู่ (มนุษย์ยังไม่ commit) — commit เองด้วย `git commit -F .zense/pending-apply.msg` แล้ว accept อีกครั้ง หรือขอให้ harness commit แทน (commitIfStaged=true / /zense accept commit)",
+				msg: "staged changes are still pending (not yet committed) — either commit yourself with `git commit -F .zense/pending-apply.msg` then accept again, or ask the harness to commit for you (commitIfStaged=true / /zense accept commit)",
 				amendedFiles: [],
 				warnings,
 				committedOnBehalf: false,
 			};
 		const cr = gitOk(["commit", "-F", join(zenseDir(cwd), PENDING_MSG)], cwd);
 		if (!cr.ok)
-			return { ok: false, msg: `commit แทนไม่สำเร็จ (hook reject หรือ config ขาด?): ${cr.err}\nตรวจด้วย git status แล้ว commit ด้วยมือ`, amendedFiles: [], warnings, committedOnBehalf: false };
+			return { ok: false, msg: `commit on your behalf failed (hook rejected or missing config?): ${cr.err}\nCheck git status and commit manually`, amendedFiles: [], warnings, committedOnBehalf: false };
 		committedOnBehalf = true;
 	} else if (opts.preApplyHead && gitOk(["rev-parse", "HEAD"], cwd).out.trim() === opts.preApplyHead) {
 		warnings.push(
-			`index ว่างแต่ HEAD ยังเป็น ${opts.preApplyHead.slice(0, 12)} (จุดก่อน apply) — change น่าจะหายไปโดย reset/stash นอก flow มากกว่าถูก commit; ตรวจ git status / git log ก่อนเชื่อว่างานอยู่ครบ`,
+			`index is empty but HEAD is still ${opts.preApplyHead.slice(0, 12)} (the pre-apply point) — the change likely vanished via out-of-band reset/stash rather than a commit; check git status / git log before trusting the work is in`,
 		);
 	}
 	const amendedFiles: string[] = [];
@@ -592,18 +587,20 @@ export const acceptPendingApply = (
 	}
 	rmSync(patchPath, { force: true });
 	rmSync(join(zenseDir(cwd), PENDING_MSG), { force: true });
-	return { ok: true, msg: "ปิด pending apply แล้ว — change durable ใน main (undo จากนี้ใช้ git revert ปกติ)", amendedFiles, warnings, committedOnBehalf };
+	return { ok: true, msg: "pending apply closed — the change is durable in main (further undo = plain git revert)", amendedFiles, warnings, committedOnBehalf };
 };
 
-// ----------------------------------------------------------------------------- cycle closure: bulletin + reset (module scope — export เพื่อ unit-test)
-/** งานปิด 2 อาการของ 'closure ไม่สนิท': (1) agent ไม่รู้ว่ามนุษย์ accept/discard/commit แล้ว
- *  (เห็นแค่ tool results — command/reconcile ปิดเงียบๆ) → contextBulletin one-shot ติด system prompt
- *  turn ถัดไปครั้งเดียว (ห้าม sendUserMessage — trigger turn ใหม่เสมอ); (2) state.spec ค้างทำ
- *  commitSpec นับ version ต่อทั้งที่เป็นงานใหม่ → resetCycleState เคลียร์ cycle-scope ให้เริ่ม v1 ใหม่ */
+// ----------------------------------------------------------------------------- cycle closure: bulletin + reset (module scope — exported for unit tests)
+/** Two symptoms of sloppy closure: (1) the agent doesn't know the human accepted/discarded/
+ *  committed (it only ever sees tool results) → a one-shot contextBulletin rides the next
+ *  turn's system prompt (never sendUserMessage — that would trigger a new turn);
+ *  (2) a leftover state.spec would make commitSpec continue the version counter for an
+ *  entirely new job → resetCycleState clears cycle scope so new work starts at v1. */
 
-/** cycle reset: เคลียร์เฉพาะ state ที่ผูกกับรอบงาน — คง session-scope observability (turnsUsed/tokensUsed/
- *  subagentRuns/trajectoryFlags/escalations) และห้ามแตะ .zense/spec.json + specs archive บน disk (ประวัติ);
- *  เรียกเฉพาะตอน closure สำเร็จ (accept/discard/reconcile ที่ index ว่าง) — idempotent (state ว่างอยู่แล้วก็ไม่พัง) */
+/** Cycle reset: clears only round-scoped state — keeps session observability (turnsUsed/
+ *  tokensUsed/subagentRuns/trajectoryFlags/escalations) and never touches .zense/spec.json or
+ *  the on-disk specs archive (history). Call only on successful closure (accept/discard/
+ *  reconcile with an empty index); idempotent. */
 export const resetCycleState = (s: State): void => {
 	s.spec = undefined;
 	s.phase = "requirements";
@@ -617,22 +614,23 @@ export const resetCycleState = (s: State): void => {
 	s.worktreeLeaveNotified = undefined;
 };
 
-/** one-shot getter: คืนค่า bulletin แล้วเคลียร์ field ทันที (caller persist — กันติด system prompt ทุก turn); ไม่มี → undefined ไม่แตะ state */
+/** one-shot getter: returns the bulletin and clears the field immediately (caller persists —
+ *  otherwise it would ride every system prompt); undefined when absent. */
 export const takeContextBulletin = (s: { contextBulletin?: string }): string | undefined => {
 	const b = s.contextBulletin;
 	if (b !== undefined) s.contextBulletin = undefined;
 	return b;
 };
 
-/** ข้อความ ≤2 บรรทัด ขึ้นต้น '[zense]' — ติด system prompt ของ turn ถัดไป ห้าม markdown หนัก */
+/** ≤2-line messages prefixed '[zense]' — pinned to the next turn's system prompt; no heavy markdown */
 export const buildAcceptBulletin = (specVersion: number, title: string, amendedCount: number): string =>
-	`[zense] งาน spec v${specVersion} "${title}" ถูก accept + commit บน main แล้ว${amendedCount ? ` (มนุษย์แก้เพิ่ม ${amendedCount} ไฟล์หลัง grader ผ่าน)` : ""} — cycle reset แล้ว งานใหม่เริ่ม spec v1`;
+	`[zense] spec v${specVersion} "${title}" was accepted + committed on main${amendedCount ? ` (human amended ${amendedCount} file(s) after the grader passed)` : ""} — cycle reset; new work starts at spec v1`;
 
 export const buildReconcileBulletin = (specVersion: number): string =>
-	`[zense] pendingApply ของ spec v${specVersion} ถูกมนุษย์ปิดนอก flow (commit แล้ว หรือถิ้ง change) — cycle reset แล้ว งานใหม่เริ่ม spec v1`;
+	`[zense] spec v${specVersion}'s pendingApply was closed by the human outside the flow (committed, or the change dropped) — cycle reset; new work starts at spec v1`;
 
 export const buildDiscardBulletin = (specVersion: number): string =>
-	`[zense] change ของ spec v${specVersion} ถูก discard — reverse patch ออกจาก main แล้ว — cycle reset แล้ว งานใหม่เริ่ม spec v1`;
+	`[zense] spec v${specVersion}'s change was discarded — reverse patch removed it from main — cycle reset; new work starts at spec v1`;
 
 const freshState = (): State => ({
 	phase: "requirements",
@@ -644,7 +642,7 @@ const freshState = (): State => ({
 	subagentRuns: [],
 });
 
-// ----------------------------------------------------------------------------- requirements draft parsing (module scope — export เพื่อ unit-test ได้)
+// ----------------------------------------------------------------------------- requirements draft parsing (module scope — exported for unit tests)
 
 export interface SpecDraft {
 	title: string;
@@ -656,8 +654,9 @@ export interface SpecDraft {
 	specDebt: string[];
 }
 
-/** คำถาม clarify หนึ่งข้อ (หลัง normalize): รองรับทั้ง legacy string (choices ว่าง) และ shape ใหม่
- *  ที่ sub-agent แนบตัวเลือกคำตอบมาให้ — มนุษย์เลือกจาก list แล้ว Enter ได้ทันที หรือเลือก "อื่นๆ (พิมพ์เอง)" */
+/** One clarify question (normalized): supports a legacy bare string (choices empty) and the
+ *  newer shape where the sub-agent attaches answer options — the human picks from the list or
+ *  chooses "Other (type your own)". */
 export interface ClarifyQuestion {
 	question: string;
 	choices: string[];
@@ -671,9 +670,10 @@ export type DraftParse =
 const asStringArray = (v: unknown): string[] | undefined =>
 	Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : undefined;
 
-/** normalize questions ของ clarify draft → ClarifyQuestion[] เสมอ: legacy string → choices ว่าง,
- *  object {question, choices} → เก็บตามนั้น (จำกัด 6 ตัวเลือก กัน dialog ยาวเกิน); item ที่ไม่มีคำถามจริง → ข้าม;
- *  ไม่เหลือข้อไหนเลย → undefined (ตกไปเป็น error criteria-missing ตาม contract เดิม ไม่ใช่ clarify) */
+/** Normalize clarify-draft questions → ClarifyQuestion[]: legacy string → empty choices;
+ *  {question, choices} → kept as-is (max 6 options, keeps the dialog short); items without a
+ *  real question are skipped; nothing left → undefined (falls through to the criteria-missing
+ *  error per contract, not clarify). */
 export const asClarifyQuestions = (v: unknown): ClarifyQuestion[] | undefined => {
 	if (!Array.isArray(v)) return undefined;
 	const out: ClarifyQuestion[] = [];
@@ -691,9 +691,9 @@ export const asClarifyQuestions = (v: unknown): ClarifyQuestion[] | undefined =>
 };
 
 /**
- * ดึง JSON object เดียวออกจาก output ของ sub-agent — ทนได้ทั้ง JSON ดิบ, ```json fence
- * และข้อความคั่นรอบ (ลอง first-'{' ถึง last-'}') เพราะ model ชอบแถม prose ทั้งที่สั่งห้าม;
- * ถ้า parse ตรงๆ ตัวเดียวจะพลาดบ่อยโดยไม่จำเป็น
+ * Extract a single JSON object from sub-agent output — tolerant of raw JSON, ```json fences,
+ * and surrounding prose (first-'{' to last-'}'), because models love adding prose despite
+ * being told not to; a single strict parse would fail needlessly often.
  */
 export const extractJsonObject = (text: string): unknown => {
 	const candidates: string[] = [text.trim()];
@@ -706,38 +706,40 @@ export const extractJsonObject = (text: string): unknown => {
 		try {
 			return JSON.parse(c);
 		} catch {
-			/* ลอง candidate ถัดไป */
+			/* try the next candidate */
 		}
 	}
 	return undefined;
 };
 
 /**
- * A: parse + validate draft ของ requirements sub-agent ตาม contract:
+ * A: parse + validate the requirements sub-agent draft per contract:
  *   - spec shape    → {title,intent,approach,scope,constraints,criteria[{id,text,check}],specDebt}
- *   - clarify shape (F) → {"questions": [...]} (ขอถามกลับแทนการเดา) — ถือเป็น clarify เฉพาะตอนที่ยังไม่มี criteria;
- *     คำถามเป็นได้ทั้ง string (legacy) และ object {question, choices} (แนบตัวเลือกคำตอบ ให้มนุษย์เลือกเร็ว)
- *   - อื่นๆ        → error พร้อมข้อความบอกว่าพังตรงไหน (ใช้เป็น feedback ตอน retry รอบ 2)
- * ผิดรูปเล็กน้อยจะถูก normalize (criteria id หาย → auto c1..n, array หาย → []) แต่
- * criteria ว่าง / item ไม่มี text/check ถือว่า invalid เพราะทำให้ spec ไม่มีฟัน
+ *   - clarify shape (F) → {"questions": [...]} (ask back instead of guessing) — counts as
+ *     clarify only when no criteria are present; questions may be bare strings (legacy) or
+ *     {question, choices} objects (answer options for fast human picking)
+ *   - anything else → error describing what broke (used as feedback on the round-2 retry)
+ * Minor shape issues are normalized (missing criteria ids → auto c1..n, missing arrays → []),
+ * but empty criteria / items without text+check are invalid — a spec without teeth is worse
+ * than none.
  */
 export const parseSpecDraft = (text: string): DraftParse => {
 	const raw = extractJsonObject(text);
 	if (raw === undefined || typeof raw !== "object" || raw === null || Array.isArray(raw))
-		return { kind: "error", error: "output ไม่ใช่ JSON object (หา JSON ที่ parse ได้ไม่เจอ — สั่ง output ONLY JSON ไว้)" };
+		return { kind: "error", error: "output is not a JSON object (no parseable JSON found — the prompt instructs output ONLY JSON)" };
 	const o = raw as Record<string, unknown>;
 	const qs = asClarifyQuestions(o.questions);
 	if (qs?.length && o.criteria === undefined) return { kind: "clarify", questions: qs.slice(0, 5) };
 	if (!Array.isArray(o.criteria) || o.criteria.length === 0)
-		return { kind: "error", error: "criteria ต้องเป็น array ที่มีอย่างน้อย 1 รายการ (แต่ละอันต้องมี check เป็นคำสั่งที่รันได้จริง)" };
+		return { kind: "error", error: "criteria must be an array with at least 1 item (each needs a check that is a runnable command)" };
 	const criteria: Criterion[] = [];
 	for (let i = 0; i < o.criteria.length; i++) {
 		const c = o.criteria[i] as Record<string, unknown> | null;
-		if (!c || typeof c !== "object") return { kind: "error", error: `criteria[${i}] ไม่ใช่ object` };
+		if (!c || typeof c !== "object") return { kind: "error", error: `criteria[${i}] is not an object` };
 		const ctext = typeof c.text === "string" ? c.text.trim() : "";
 		const check = typeof c.check === "string" ? c.check.trim() : "";
-		if (!ctext) return { kind: "error", error: `criteria[${i}].text ว่างหรือไม่ใช่ string` };
-		if (!check) return { kind: "error", error: `criteria[${i}].check ว่างหรือไม่ใช่ string` };
+		if (!ctext) return { kind: "error", error: `criteria[${i}].text is empty or not a string` };
+		if (!check) return { kind: "error", error: `criteria[${i}].check is empty or not a string` };
 		criteria.push({ id: typeof c.id === "string" && c.id.trim() ? c.id.trim() : `c${i + 1}`, text: ctext, check });
 	}
 	return {
@@ -755,14 +757,15 @@ export const parseSpecDraft = (text: string): DraftParse => {
 };
 
 /**
- * heuristic "check นี้ harness/grader รันอัตโนมัติได้จริงไหม": ผ่านถ้ามี command token ที่รู้จัก,
- * backtick-quoted command, '$'-prompt หรือ pattern path-exists; เจอคำว่า manual/ดูด้วยตา = ไม่ผ่านทันที
- * — quality gate (G) ใช้ผลัก criterion ที่เช็คไม่ได้จริงลง specDebt (forced human review)
- * เจตนาคือหลวมฝั่งผ่าน (false negative ดีกว่า false positive: ทุกอย่างที่ไม่แน่ใจต้องไป specDebt)
+ * Heuristic: can the harness/grader actually run this check automatically? Passes on known
+ * command tokens, backtick-quoted commands, '$'-prompts, or a path-exists pattern; words like
+ * "manual"/"by eye" fail immediately. The quality gate (G) pushes uncheckable criteria into
+ * specDebt (forced human review). Intentionally permissive (false negatives beat false
+ * positives: anything uncertain must land in specDebt).
  */
 export const isMachineCheckable = (check: string): boolean => {
 	const s = check.toLowerCase();
-	if (/\bmanual(ly)?\b|by eye|visually|eyeball|ask (the )?human|ดูด้วยตา|ตรวจด้วยมือ/.test(s)) return false;
+	if (/\bmanual(ly)?\b|by eye|visually|eyeball|ask (the )?human/.test(s)) return false;
 	if (/path exists|file exists|exists:/.test(s)) return true;
 	if (/`[^`]+`/.test(check) || /^\s*\$/.test(check)) return true;
 	return /\b(npm|pnpm|yarn|bun|npx|node|deno|pytest|python3?|pip|cargo|go|make|just|mvn|gradle|dotnet|composer|php|ruby|bundle|bash|sh|zsh|curl|wget|git|grep|rg|ls|cat|head|tail|find|test|diff|cmp|wc|jq|yq|stat|tsc|vitest|jest|mocha|uv|turbo|docker)\b/i.test(check);
@@ -778,8 +781,9 @@ export const jaccard = (a: Set<string>, b: Set<string>): number => {
 	return inter / (a.size + b.size - inter);
 };
 
-/** G: กัน spec ซ้ำ — scan archive .zense/specs/*.json (ล่าสุด 20 อัน) เทียบ token ของ
- *  title+intent; Jaccard ≥ 0.5 ถือว่า "คล้าย" (threshold หลวมพอจับ paraphrase แต่ไม่ชนงานต่างกัน) */
+/** G: duplicate-spec guard — scan the newest 20 archive specs (.zense/specs/*.json) and
+ *  compare title+intent tokens; Jaccard ≥ 0.5 counts as "similar" (loose enough to catch
+ *  paraphrases without flagging genuinely different work). */
 export const findSimilarSpec = (cwd: string, draft: SpecDraft): { file: string; title: string; score: number } | null => {
 	const dir = join(zenseDir(cwd), "specs");
 	if (!existsSync(dir)) return null;
@@ -791,91 +795,96 @@ export const findSimilarSpec = (cwd: string, draft: SpecDraft): { file: string; 
 			const score = jaccard(mine, tokenSet(`${old.title ?? ""} ${old.intent ?? ""}`));
 			if (score >= 0.5 && (!best || score > best.score)) best = { file: f, title: old.title ?? "?", score };
 		} catch {
-			/* ข้ามไฟล์เสียใน archive */
+			/* skip corrupt archive files */
 		}
 	}
 	return best;
 };
 
 /**
- * G: quality gate ฝั่ง harness — sub-agent เก่งเรื่องดราฟต์ แต่ harness ต้องเป็นคนสงสัยแทนมนุษย์:
- * scope ว่าง / check ตรวจอัตโนมัติไม่ได้ / ซ้ำ spec เก่า → บังคับลง specDebt (forced human review ตอน eval/review)
- * คืน draft ใหม่ (ไม่ mutate ของเดิม) พร้อม notes สั้นๆ ว่าเพิ่มอะไรบ้าง (ใช้ทั้ง telemetry H และแจ้งใน tool result)
+ * G: harness-side quality gate — the sub-agent is good at drafting, but the harness must be
+ * skeptical on the human's behalf: empty scope / unverifiable check / duplicate of an old spec
+ * → forced into specDebt (human review at eval/review). Returns a new draft (no mutation)
+ * plus short notes about what was added (telemetry + tool-result messaging).
  */
 export const applyQualityGate = (cwd: string, draft: SpecDraft): { draft: SpecDraft; notes: string[] } => {
 	const notes: string[] = [];
 	const extraDebt: string[] = [];
 	if (!draft.scope.length) {
-		extraDebt.push("quality-gate: scope ไม่ได้ระบุ — ทุก write จะผ่าน scope check หมด; ควรระบุ path prefix ที่ agent แก้ได้");
+		extraDebt.push("quality-gate: scope not specified — every write would pass the scope check; name the path prefixes the agent may touch");
 		notes.push("empty-scope");
 	}
-	// W3: scope typo = gate ไร้ฟันเงียบๆ — prefix ที่ไม่มี path จริงจะไม่ match write ไหนเลย ทั้งที่คิดว่าคุมอยู่
+	// W3: a scope typo = silently toothless gate — a prefix with no real path matches no writes
 	for (const s of draft.scope) {
 		const prefix = s.replace(/\*+$/, "").replace(/\/+$/, "");
 		if (prefix && !existsSync(join(cwd, prefix))) {
-			extraDebt.push(`quality-gate: scope \"${s}\" ไม่ match path จริงใน repo — ตรวจการสะกด/โครงสร้างจริงก่อนเซ็น`);
+			extraDebt.push(`quality-gate: scope \"${s}\" matches no real path in the repo — check the spelling/structure before signing`);
 			notes.push(`scope-missing:${s.slice(0, 30)}`);
 		}
 	}
 	for (const c of draft.criteria) {
 		const ph = hasUnsubstitutedPlaceholder(c.check);
 		if (ph) {
-			extraDebt.push(`quality-gate: ${c.id} มี placeholder ที่ไม่ได้ substitute ใน check ("${ph}") — ต้องแก้ check ก่อนเซ็น`);
+			extraDebt.push(`quality-gate: ${c.id} has an unsubstituted placeholder in its check ("${ph}") — fix the check before signing`);
 			notes.push(`placeholder:${c.id}`);
 		} else if (!isMachineCheckable(c.check)) {
-			extraDebt.push(`quality-gate: ${c.id} มี check ที่ตรวจอัตโนมัติไม่ได้ ("${c.check.slice(0, 80)}") — ต้อง verify ด้วยมนุษย์`);
+			extraDebt.push(`quality-gate: ${c.id} has a check that can't be verified automatically ("${c.check.slice(0, 80)}") — requires human verification`);
 			notes.push(`manual-check:${c.id}`);
 		}
 	}
 	const similar = findSimilarSpec(cwd, draft);
 	if (similar) {
-		extraDebt.push(`quality-gate: intent คล้าย spec เก่า "${similar.title}" (${similar.file}, similarity=${similar.score.toFixed(2)}) — ยืนยันก่อนเซ็นว่าไม่ซ้ำซ้อน`);
+		extraDebt.push(`quality-gate: intent looks similar to old spec "${similar.title}" (${similar.file}, similarity=${similar.score.toFixed(2)}) — confirm it isn't redundant before signing`);
 		notes.push(`similar:${similar.file}`);
 	}
 	return { draft: { ...draft, specDebt: [...draft.specDebt, ...extraDebt] }, notes };
 };
 
-// ----------------------------------------------------------------------------- sub-agent argv (module scope — export เพื่อ unit-test ได้)
+// ----------------------------------------------------------------------------- sub-agent argv (module scope — exported for unit tests)
 
-/** C: role ที่หน้าที่คือ "อ่าน/ร่าง" ไม่ใช่ "แก้โค้ด" — ล็อก read-only ผ่าน --exclude-tools
- *  (defense-in-depth: prompt สั่งห้ามแก้แค่ชั้นเดียวโดนละเมิดได้ แต่ tools ที่ไม่มีเรียกไม่ได้เลย)
- *  ยังเหลือ read+bash ไว้ เพราะ D ต้องการให้มันสำรวจ repo และลองรัน check command จริงก่อนดราฟต์ */
-// W2: grader/reviewer ก็ read-only — หน้าที่คือตัดสิน/รายงาน ไม่ใช่แก้โค้ด (subprocess ไม่ผ่าน gate
-// และไม่โดน agent_end heuristics ของ main agent → ปล่อย write ไว้ = grader แก้ test ให้ผ่านเองได้เงียบๆ)
+/** C: roles whose job is "read/draft", not "edit code", are locked read-only via
+ *  --exclude-tools (defense-in-depth: a prompt-level ban is one disobedience away from a
+ *  write; an absent tool cannot be called at all). read+bash stay because the role must
+ *  explore the repo and dry-run check commands before drafting.
+ * W2: grader/reviewer are read-only too — they judge/report, never fix code (subprocesses
+ * bypass the gate and the main agent's agent_end heuristics → leaving write available would
+ * let a grader silently edit tests until they pass). */
 export const SUBAGENT_EXCLUDE_TOOLS: Record<string, string[]> = {
 	requirements: ["write", "edit"],
-	// planner ต้อง explore repo เบาๆ/คิดแผน ไม่ใช่แก้โค้ด — read-only เท่า requirements
+	// planner explores the repo lightly / thinks — read-only like requirements
 	planner: ["write", "edit"],
 	grader: ["write", "edit"],
 	reviewer: ["write", "edit"],
-	// distiller อ่าน memory.jsonl ไฟล์เดียวแล้วคืน JSON — ไม่ต้องเขียน/รันคำสั่งเลย (harness เป็นคนเขียนทับเองหลัง validate)
+	// distiller reads only memory.jsonl and returns JSON — no writes/commands at all (the harness rewrites the file itself after validation)
 	distiller: ["write", "edit", "bash"],
 };
 
-/** M (2026-09-08): per-role boot strip flags — sub-agent ทุก launch จ่าย system prompt ของ pi
- *  ใหม่ทั้งก้อน (skills/prompt templates/themes/extensions ถูกโหลดเหมือน session ปกติ) ทั้งที่ role
- *  เป็นหน้าที่ตายตัว: grader/reviewer ตัดสินจาก evidence ใน prompt ล้วน → boot เปลือยเต็มตัว;
- *  requirements ต้อง explore repo เป้าหมาย (skills/extensions ของ repo อาจให้ context จำเป็น)
- *  → ตัดเฉพาะ themes/prompt-templates. กรณี --no-extensions ปลอดภัยเพราะ harness bails ตัวเองใน
- *  sub-agent ด้วย PI_ZENSE_SUBAGENT=1 อยู่แล้ว — ปิดเฉพาะ extension อื่นของผู้ใช้ ไม่ทำ zense หลุด */
+/** M (2026-09-08): per-role boot strip flags — every sub-agent launch otherwise pays pi's full
+ *  system prompt again (skills/prompt templates/themes/extensions all load as in a normal
+ *  session) even though each role has one fixed job: grader/reviewer judge purely from prompt
+ *  evidence → fully bare boot; requirements must explore the target repo (its
+ *  skills/extensions may carry needed context) → strip only themes/prompt-templates.
+ *  --no-extensions is safe because the harness bails itself inside sub-agents via
+ *  PI_ZENSE_SUBAGENT=1 — only the user's other extensions are switched off; zense stays. */
 export const SUBAGENT_STRIP_FLAGS: Record<string, string[]> = {
 	requirements: ["--no-themes", "--no-prompt-templates"],
-	// planner เหมือน requirements: อาจต้อง context จาก skills/extensions ของ repo ระหว่างแตก subtasks
+	// planner, like requirements: may need repo skills/extensions context while decomposing
 	planner: ["--no-themes", "--no-prompt-templates"],
 	grader: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
 	reviewer: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
 	distiller: ["--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions"],
 };
 
-/** B (2026-09-02): timeout ต่อ role — log จริง (.zense/subagents/) พิสูจน์ว่า requirements/grader โดนฆ่า
- *  ที่ 240s พอดีทุกไฟล์ (งาน explore repo + รัน check นานกว่านั้น). override ทุก role ได้ด้วย
- *  ไม่มี env override (ถอด 2026-09-02 ตามคำตัดสินใจ user: env เป็น knob ที่ agent แกะไม่ได้ตอนรัน)
- *  ช่องปรับของ agent = .zense/config.json key subagentTimeoutMs {"<role>": ms, "default": ms}
- *  อ่านสดทุกครั้งที่ launch (ไม่ cache) → agent เขียนไฟล์ปุ๊บ รอบถัดไปใช้ทันที ไม่ต้อง restart
- *  (ส่ง cwd ก่อนแล้ว fallbackCwd: worktree ไม่มี .zense ของตัวเองเพราะ gitignored → fallback ไป main repo) */
+/** B (2026-09-02): per-role timeout — real logs (.zense/subagents/) showed requirements/grader
+ *  being killed at exactly 240s in every file (repo exploration + check runs need longer).
+ *  No env override (removed 2026-09-02 by user decision: env is a knob the agent can't
+ *  inspect at runtime). The agent-visible knob is .zense/config.json key subagentTimeoutMs
+ *  {"<role>": ms, "default": ms}, read live at every launch (no cache) so an agent edit
+ *  takes effect on the next launch without a restart. Pass cwd first, then fallbackCwd:
+ *  a worktree has no .zense of its own (gitignored) → fall back to the main repo. */
 export const SUBAGENT_TIMEOUT_MS: Record<string, number> = {
 	requirements: 600_000,
-	// planner แค่อ่าน intent + ดู layout คร่าวๆ แล้วแตก subtasks — เบากว่า requirements มาก
+	// planner only reads the intent + skims the layout before decomposing — much lighter than requirements
 	planner: 300_000,
 	grader: 600_000,
 	reviewer: 480_000,
@@ -892,31 +901,33 @@ export const subagentTimeout = (role: string, cwd?: string, fallbackCwd?: string
 			const v = cfg.subagentTimeoutMs?.[role] ?? cfg.subagentTimeoutMs?.default;
 			if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
 		} catch {
-			/* config พัง/อ่านไม่ได้ → ลอง dir ถัดไป แล้วเหลือ built-in map */
+			/* corrupt/unreadable config → try the next dir, fall back to the built-in map */
 		}
 	}
 	return SUBAGENT_TIMEOUT_MS[role] ?? SUBAGENT_TIMEOUT_MS.default;
 };
 
-/** ext-config (2026-09-08, v7): extension loading ของ sub-agent ต่อ role — DEFAULT = UNLOAD ทั้งหมด
- *  (uniform bare boot ทุก role; เหตุผล user: กัน extension ที่มี gate/ค้างไปบล็อก sub-process) แล้วให้
- *  user tick เพิ่มเข้าเองเฉพาะตัวที่ต้องการผ่าน /zense ext-config (opt-in — ตัวที่ user expect เช่น
- *  provider @aliou/pi-synthetic จะโดน tick ไว้เอง ไม่ใช่หายเพราะเราตัดทิ้งให้).
- *  include list persist 2 ชั้น: LOCAL <repo>/.zense/config.json (key subagentExtInclude — repo ใคร repo มัน)
- *  + GLOBAL ~/.pi/agent/zense/config.json (seed ครั้งแรกครั้งเดียว มีแล้วไม่ overwrite)
- *  resolution chain: local (cwd → fallbackCwd เมื่อ worktree) → global → built-in ([]) */
+/** ext-config (2026-09-08, v7): per-role extension loading for sub-agents — DEFAULT = unload
+ *  everything (uniform bare boot for all roles; user rationale: extensions with gates/hangs
+ *  must not block subprocesses). The user opts extensions back in via /zense ext-config
+ *  (opt-in — expected ones like the provider @aliou/pi-synthetic get ticked explicitly).
+ *  The include list persists at two levels: LOCAL <repo>/.zense/config.json (key
+ *  subagentExtInclude — repo-specific) + GLOBAL ~/.pi/agent/zense/config.json (seeded once on
+ *  first save, never overwritten).
+ *  Resolution chain: local (cwd → fallbackCwd inside a worktree) → global → built-in ([]). */
 export const zenseGlobalConfigDir = (): string => join(homedir(), ".pi", "agent", "zense");
 
 export interface InstalledExtension {
-	path: string;   // path ไฟล์ extension จริง (ใช้ส่ง -e และเป็น identity ของ exclusion)
+	path: string;   // real extension file path (passed via -e; also the identity for exclusion)
 	enabled: boolean;
-	source: string; // package/ต้นทาง (แสดงใน UI ให้ user รู้ว่ามาจากไหน)
+	source: string; // package/origin (shown in the UI so the user knows where it came from)
 	scope: string;  // user | project | temporary
 }
 
-/** label แสดงใน UI: basename เดี่ยวๆ ชนกันได้ (package หลาย entry-point เช่น pi-synthetic มี 6× index.ts —
- *  ดูเหมือน list ซ้ำทั้งที่คนละไฟล์) '.../node_modules/@aliou/pi-synthetic/extensions/provider/index.ts'
- *  → 'provider/index.ts'; fallback = basename สำหรับ path ที่หา package dir ไม่เจอ */
+/** UI label: bare basenames collide (multi-entry-point packages like pi-synthetic have
+ *  6× index.ts — looks like a duplicated list when they're different files)
+ *  '.../node_modules/@aliou/pi-synthetic/extensions/provider/index.ts' → 'provider/index.ts';
+ *  fallback = basename when no package dir is found. */
 export const extDisplayLabel = (ext: InstalledExtension): string => {
 	const segs = ext.path.split(/[\\/]/).filter(Boolean);
 	const pkgTail = ext.source.replace(/^npm:/, "").split("/").filter(Boolean).pop() ?? "";
@@ -926,9 +937,10 @@ export const extDisplayLabel = (ext: InstalledExtension): string => {
 	return rel.join("/");
 };
 
-/** enumerate extensions ที่ pi จะโหลดจริง — ใช้ DefaultPackageManager/SettingsManager (กลไกเดียวกันกับ
- *  `pi config` ใน core ไม่ reimplement discovery ให้ drift); onMissing=skip (UI config ห้ามกระตุ้น install)
- *  agentDir/globalDir inject ได้เพื่อ test ด้วย tmp dir ไม่แตะ home จริง; พัง → [] (fallback boot เปลือย) */
+/** Enumerate the extensions pi would actually load — uses DefaultPackageManager/
+ *  SettingsManager (the same mechanism as `pi config` in core, so discovery never drifts);
+ *  onMissing=skip (a config UI must never trigger installs). agentDir injectable for tmp-dir
+ *  tests; failure → [] (degrades to bare boot). */
 export const listInstalledExtensions = async (cwd: string, agentDir = getAgentDir()): Promise<InstalledExtension[]> => {
 	try {
 		const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
@@ -950,12 +962,12 @@ const readExtIncludesFrom = (cfgPath: string, role: string): string[] | undefine
 		if (!Array.isArray(v)) return undefined;
 		return v.filter((p): p is string => typeof p === "string");
 	} catch {
-		return undefined; // config พัง → เทียบเท่าไม่มี (chain ต่อไป global/built-in ไม่ throw)
+		return undefined; // corrupt config counts as absent (the global/built-in chain continues without throwing)
 	}
 };
 
-/** include list ของ role ตาม resolution chain: local (cwd→fallbackCwd) → global → built-in [] (boot เปลือย)
- *  อ่านสดทุกครั้ง (ไม่ cache — save ปุ๊บ run ถัดไปเห็นทันที) */
+/** Role include list per resolution chain: local (cwd→fallbackCwd) → global → built-in []
+ *  (bare boot). Read live every time (no cache — a save is visible on the very next run). */
 export const subagentExtIncludes = (role: string, cwd?: string, fallbackCwd?: string, globalDir = zenseGlobalConfigDir()): string[] => {
 	for (const dir of [cwd, fallbackCwd]) {
 		if (!dir) continue;
@@ -965,10 +977,11 @@ export const subagentExtIncludes = (role: string, cwd?: string, fallbackCwd?: st
 	return readExtIncludesFrom(join(globalDir, "config.json"), role) ?? [];
 };
 
-/** เขียน include list ของ role — LOCAL <cwd>/.zense/config.json เสมอ (คง key อื่นของ config ครบ)
- *  + GLOBAL seed ครั้งแรกครั้งเดียว: global ยังไม่มี key ของ role → เขียนค่าเดียวกันลงไป; มีแล้วข้าม
- *  (คำสั่ง user: "ถ้า global ยังไม่มีให้ครั้งแรก save ลง global ด้วย ถ้ามีแล้วให้ข้ามไป");
- *  value=null = ลบ local override เท่านั้น ไม่ seed; คืน globalSeeded ให้ handler แจ้ง user */
+/** Write a role's include list — always to LOCAL <cwd>/.zense/config.json (other config keys
+ *  preserved) + one-time GLOBAL seeding: when global lacks this role's key, write the same
+ *  value; never overwrite (user instruction: "first save also seeds global; skip afterwards").
+ *  value=null deletes the local override only, without seeding. Returns globalSeeded for the
+ *  handler to surface. */
 export const writeSubagentExtIncludes = (cwd: string, role: string, value: string[] | null, globalDir = zenseGlobalConfigDir()): { globalSeeded: boolean } => {
 	const writeInto = (cfgPath: string, mutate: (sub: Record<string, unknown>) => void): boolean => {
 		try {
@@ -982,7 +995,7 @@ export const writeSubagentExtIncludes = (cwd: string, role: string, value: strin
 			writeFileSync(cfgPath, JSON.stringify(raw, null, 2));
 			return true;
 		} catch {
-			return false; // เขียนไม่ได้ → ข้ามเงียบๆ (config ไม่ควรทำ pipeline พัง)
+			return false; // unwritable → skip silently (config must never break the pipeline)
 		}
 	};
 	writeInto(join(zenseDir(cwd), "config.json"), (sub) => {
@@ -997,11 +1010,11 @@ export const writeSubagentExtIncludes = (cwd: string, role: string, value: strin
 	return { globalSeeded };
 };
 
-/** flags สุดท้ายของ role: DEFAULT (ไม่มี include) = uniform bare boot —
- *  role ที่ base มี --no-extensions อยู่แล้ว → flags เดิมเป๊ะ; role ที่ไม่มี (requirements) → เพิ่มให้ด้วย
- *  (กัน extension ที่มี gate/ค้างไปบล็อก sub-process). มี include list → --no-extensions + '-e <path>'
- *  เฉพาะ path ที่ยัง installed+enabled จริง (ถูก uninstall ไปแล้วทิ้งเงียบๆ กัน boot error);
- *  enumerate พัง → bare boot (degrade ปลอดภัยที่สุด) */
+/** Final flags for a role: DEFAULT (no include list) = uniform bare boot — roles whose base
+ *  already has --no-extensions stay as-is; roles without it (requirements) get it added
+ *  (guards against extensions with gates/hangs blocking the subprocess). With an include list
+ *  → --no-extensions + '-e <path>' only for paths still installed+enabled (uninstalled ones
+ *  are dropped silently to avoid boot errors); enumeration failure → bare boot (safest). */
 export const subagentStripFlagsAsync = async (
 	role: string,
 	cwd?: string,
@@ -1011,7 +1024,7 @@ export const subagentStripFlagsAsync = async (
 ): Promise<string[]> => {
 	const base = SUBAGENT_STRIP_FLAGS[role] ?? [];
 	const include = subagentExtIncludes(role, cwd, fallbackCwd, globalDir);
-	if (!include.length && base.includes("--no-extensions")) return base; // bare อยู่แล้ว — เดิมเป๊ะ ไม่ต้อง enumerate
+	if (!include.length && base.includes("--no-extensions")) return base; // already bare — unchanged, no enumeration needed
 	const enumCwd = cwd ?? fallbackCwd;
 	const valid = include.length && enumCwd ? new Set((await listInstalledExtensions(enumCwd, agentDir)).filter((e) => e.enabled).map((e) => e.path)) : new Set<string>();
 	const flags = base.filter((f) => f !== "--no-extensions");
@@ -1020,48 +1033,51 @@ export const subagentStripFlagsAsync = async (
 	return flags;
 };
 
-/** argv ของ pi sub-agent ตัวเดียวที่ runSubagent ใช้ — แยกออกมาเพื่อ test ได้ว่า flag ถูกต้อง */
-/** model ที่ sub-agent รันจริง (จาก JSONL events, รูป 'provider/id') ตรง pattern ที่ config ไว้ใน models.json ไหม —
- *  match กรณี: exact (case-insensitive) หรือ pattern = usedModel + ':<thinking-level>' (suffix ที่ pi ตัดออกตอน resolve) */
+/** Does the sub-agent's actual model (from JSONL events, 'provider/id' form) match a pattern
+ *  configured in models.json? Matches exact (case-insensitive) or pattern = usedModel +
+ *  ':<thinking-level>' (a suffix pi strips at resolve time). */
 export const modelMatchesPattern = (usedModel: string, pattern: string): boolean => {
 	const used = usedModel.trim().toLowerCase();
 	const pat = pattern.trim().toLowerCase();
 	return used.length > 0 && (pat === used || pat.startsWith(`${used}:`));
 };
 
-// ---- provider-missing diagnosis (2026-09-17): sub-agent boot bare (--no-extensions) ตัด extension
-// ผู้ลง provider ของ main session ทิ้ง — provider ที่ต้องการรู้แน่ได้แค่ตอนรันจริง (models.json ต่อ role
-// อาจต่างจาก main agent) จึงวินิจฉัย post-run: silent fallback (usedModel provider ≠ pattern)
-// หรือ hard error (PROVIDER_MISSING_RX) → auto-heal retry ด้วย '-e <ext>' แล้ว persist ถ้าสำเร็จ,
-// ไม่งั้น mark failed พร้อม guidance per-role (/zense:ext-config:<role>)
+// ---- provider-missing diagnosis (2026-09-17): sub-agents boot bare (--no-extensions), which
+// strips the extension providing the main session's provider — which provider is needed is
+// only knowable at run time (per-role models.json may differ from the main agent), so
+// diagnose post-run: silent fallback shows up as usedModel provider ≠ pattern, or a hard
+// error (PROVIDER_MISSING_RX) → auto-heal retry once with '-e <ext>' and persist on success,
+// else mark failed with per-role guidance (/zense:ext-config:<role>)
 
-/** provider portion ของ model pattern (ก่อน '/' แรก, lowercase) — pattern ไม่มี '/' (เช่น "sonnet:high") = ไม่ระบุ provider */
+/** Provider portion of a model pattern (before the first '/', lowercase) — a pattern without
+ *  '/' (e.g. "sonnet:high") doesn't name a provider. */
 export const providerIdOfModelPattern = (pattern: string): string | undefined => {
 	const i = pattern.indexOf("/");
 	return i > 0 ? pattern.slice(0, i).trim().toLowerCase() : undefined;
 };
 
-/** 'provider/id' (จาก usedModel) → provider lowercase; undefined ถ้าไม่ส่งมา/ไม่มี '/' */
+/** 'provider/id' (from usedModel) → lowercase provider; undefined when absent/no '/' */
 export const usedProviderOf = (usedModel?: string): string | undefined => {
 	if (!usedModel) return undefined;
 	const i = usedModel.indexOf("/");
 	return i > 0 ? usedModel.slice(0, i).toLowerCase() : undefined;
 };
 
-/** provider ที่ pi มี built-in (ไม่ได้มาจาก extension) — mismatch ของ provider พวกนี้แปลว่า model id ผิด/
- *  ไม่มี auth ไม่ใช่ provider หายจาก bare boot → ข้าม heal ไปใช้ warning path เดิม. รายการนี้ใช้แค่"ข้าม"
- *  auto-heal การพลาด (provider extension หลุดเข้ามาใน list) ทำให้แค่ไม่ retry — behavior ไม่พัง */
+/** Providers pi has built-in (not from extensions) — a mismatch on these means a wrong model
+ *  id / missing auth, not a provider lost to bare boot → skip the heal, use the normal warning
+ *  path. The list only gates auto-heal; a false entry merely skips a retry. */
 export const BUILTIN_PROVIDER_IDS = new Set([
 	"anthropic", "openai", "openai-codex", "google", "google-vertex", "google-antigravity", "google-gemini-cli",
 	"amazon-bedrock", "azure-openai-responses", "openrouter", "groq", "mistral", "xai", "cerebras", "zai",
 	"opencode", "opencode-go", "kimi-coding", "minimax", "minimax-cn", "huggingface", "deepseek",
 ]);
 
-/** stderr/output ของ pi ตอน --model pattern resolve ไม่ได้ (bare boot ไม่รู้จัก provider) — สัญญาณ hard-fail
- *  ของ provider-missing (อีกสัญญาณ = silent fallback); เข้มงวดกว้างพอดี — false positive ทำให้แค่ retry ศูนย์เปล่า 1 รอบ */
+/** pi stderr/output when a --model pattern can't resolve (bare boot doesn't know the
+ *  provider) — the hard-fail signal of provider-missing (silent fallback is the other); a
+ *  false positive here costs only one wasted retry. */
 export const PROVIDER_MISSING_RX = /no models found matching|model .{0,60}\bnot available|unknown (model|provider)|no api key found for/i;
 
-/** ผลหาผู้ลง provider: path จริงของ extension + label สั้นสำหรับ UI (extDisplayLabel) */
+/** Provider-extension lookup result: real extension path + short UI label (extDisplayLabel) */
 export interface ProviderExtHit {
 	path: string;
 	label: string;
@@ -1071,14 +1087,15 @@ const defaultExtSourceReader = (path: string): string | undefined => {
 	try {
 		return readFileSync(path, "utf8").slice(0, 400_000);
 	} catch {
-		return undefined; // อ่านไม่ได้ = ไม่ match (ทิ้งเงียบๆ เหมือน pattern ที่เหลือของ ext-config)
+		return undefined; // unreadable = no match (silently skipped like the rest of ext-config)
 	}
 };
 
-/** หา extension (installed+enabled) ที่น่าจะลง providerId — heuristic: ไฟล์มีทั้งคำว่า registerProvider และ
- *  providerId (case-insensitive); score: path มี segment '/provider/' (+2, เช่น pi-synthetic → extensions/provider/
- *  index.ts ท่ามกลาง 6 entry-points) / มี id literal 'id: "<pid>"' (+1). เจอหลายตัวคะแนนสูงสุดเท่ากัน = ambiguous
- *  → undefined (ปล่อยไป guidance ตรงๆ ดีกว่าเดาผิด). reader inject ได้เพื่อ test โดยไม่แตะ disk */
+/** Find the installed+enabled extension likely providing providerId — heuristic: file contains
+ *  both "registerProvider" and the provider id (case-insensitive); scoring: '/provider/' path
+ *  segment (+2, e.g. pi-synthetic → extensions/provider/index.ts among 6 entry-points) /
+ *  id literal 'id: "<pid>"' (+1). A top-score tie = ambiguous → undefined (better plain
+ *  guidance than a wrong guess). Reader injectable for tests. */
 export const findProviderExtension = (
 	providerId: string,
 	exts: InstalledExtension[],
@@ -1099,16 +1116,18 @@ export const findProviderExtension = (
 	if (!scored.length) return undefined;
 	const max = Math.max(...scored.map((s) => s.score));
 	const top = scored.filter((s) => s.score === max);
-	if (top.length !== 1) return undefined; // ambiguous — ไม่เดา
+	if (top.length !== 1) return undefined; // ambiguous — don't guess
 	return { path: top[0].ext.path, label: extDisplayLabel(top[0].ext) };
 };
 
-/** merge path เข้า include list (idempotent — มีแล้วคืนตัวเดิมเป๊ะ ตัวจับ === ได้ที่ caller) */
+/** Merge a path into an include list (idempotent — a present path returns the same array
+ *  identity so callers can compare with ===). */
 export const mergeExtInclude = (current: string[], path: string): string[] => (current.includes(path) ? current : [...current, path]);
 
-/** ตัดสินใจว่า run นี้เข้าเคส provider-missing จาก bare boot หรือไม่ — pure (unit-test ได้); คืน undefined =
- *  ไม่ใช่ (ไม่มี pattern, provider built-in — mismatch แปลว่า model id ผิด/auth หาย, หรือ run ปกติ) ;
- *  kind: provider-mismatch = silent fallback (usedModel คนละ provider กับ pattern) / hard-missing = run พังด้วย model error */
+/** Decides whether a run hit provider-missing from bare boot — pure (unit-testable);
+ *  undefined = no (no pattern, built-in provider — a mismatch there means wrong model id /
+ *  missing auth — or a normal run); kind: provider-mismatch = silent fallback (usedModel has
+ *  a different provider than the pattern) / hard-missing = run died with a model error. */
 export const diagnoseProviderMissing = (
 	modelPattern: string | undefined,
 	r: { ok: boolean; output: string; usedModel?: string },
@@ -1118,7 +1137,7 @@ export const diagnoseProviderMissing = (
 	if (!patternProvider || BUILTIN_PROVIDER_IDS.has(patternProvider)) return undefined;
 	if (r.usedModel) {
 		const usedProv = usedProviderOf(r.usedModel);
-		// เงื่อนไขสุดท้าย: pattern ที่ match กันโดยบังเอิญ (เช่น pattern ไม่ระบุ provider รูป 'model:level') ไม่เข้า heal
+		// final condition: coincidentally matching patterns (e.g. provider-less 'model:level') must not enter the heal
 		if (usedProv !== patternProvider && !modelMatchesPattern(r.usedModel, modelPattern)) return { kind: "provider-mismatch", patternProvider };
 		return undefined;
 	}
@@ -1126,33 +1145,36 @@ export const diagnoseProviderMissing = (
 	return undefined;
 };
 
-/** guidance text ตอน provider-missing วินิจฉัยแล้วแก้อัตโนมัติไม่ได้/ไม่ผ่าน — ชี้คำสั่ง per-role ของ role ที่พังจริง
- *  (ห้ามบอก generic "ext-config" เพราะ role ที่ใช้ provider นี้อาจไม่ใช่ main agent: models.json ต่อ role คนละตัว) */
+/** Guidance text when a diagnosed provider-missing can't be auto-healed — points at the
+ *  per-role command of the role that actually failed (never generic "ext-config": the role
+ *  using this provider may not be the main agent — models.json is per-role). */
 export const buildProviderMissingGuidance = (
 	role: string,
 	providerId: string,
 	opts: { hit?: ProviderExtHit; alreadyIncluded?: boolean; autoRetried?: boolean } = {},
 ): string => {
 	const lines = [
-		`provider "${providerId}" ไม่พร้อมใช้ใน sub-agent (${role}) — sub-agent boot แบบ --no-extensions จึงไม่โหลด extension ผู้ลง provider ของ main session`,
+		`provider "${providerId}" is unavailable in the sub-agent (${role}) — sub-agents boot with --no-extensions, so the extension providing the main session's provider is never loaded`,
 	];
-	if (opts.autoRetried && opts.hit) lines.push(`auto-include "${opts.hit.label}" แล้วแต่ provider ยังไม่พร้อม — ตั้งค่าเอง:`);
+	if (opts.autoRetried && opts.hit) lines.push(`auto-included "${opts.hit.label}" but the provider is still unavailable — configure it yourself:`);
 	if (opts.hit && !opts.alreadyIncluded) {
-		lines.push(`แก้: /zense:ext-config:${role} แล้ว tick "${opts.hit.label}"`);
-		lines.push(`หรือ: /zense ext-config-show ${role} on ${opts.hit.path}`);
-		lines.push(`ถ้า include แล้วยัง fallback → nghi auth: pi login ${providerId} หรือ set env API key ของ provider`);
+		lines.push(`fix: /zense:ext-config:${role} and tick "${opts.hit.label}"`);
+		lines.push(`or: /zense ext-config-show ${role} on ${opts.hit.path}`);
+		lines.push(`if it still falls back after inclusion → suspect auth: pi login ${providerId} or set the provider's API-key env var`);
 	} else if (opts.hit && opts.alreadyIncluded) {
-		lines.push(`extension "${opts.hit.label}" ถูก include ให้ role นี้อยู่แล้วแต่ provider ยังไม่พร้อม — nghi auth: pi login ${providerId} หรือ set env API key ของ provider (ตรวจรายการด้วย /zense ext-config-show ${role})`);
+		lines.push(`extension "${opts.hit.label}" is already included for this role but the provider is still unavailable — suspect auth: pi login ${providerId} or set the provider's API-key env var (review the list with /zense ext-config-show ${role})`);
 	} else {
-		lines.push(`หา extension ผู้ลง provider "${providerId}" ไม่เจอใน installed extensions — ติดตั้ง provider extension นั้นก่อน หรือเปลี่ยน model ของ role ด้วย /zense models`);
+		lines.push(`no extension providing "${providerId}" found among installed extensions — install that provider extension first, or change this role's model with /zense models`);
 	}
 	return lines.join("\n");
 };
 
 export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[], role?: string, stripFlags?: string[]): string[] => {
-	// argv: strip flags (per-role) ก่อน --exclude-tools ก่อน --model ก่อน task; ไม่ใส่ -- นำหน้า task (คงพฤติกรรมเดิม)
-	// M: strip flags จาก SUBAGENT_STRIP_FLAGS ตาม role — เดิมโหลด skills/templates/themes/extensions ครบทุก launch
-	// ext-config: caller (runSubagent) resolve จาก subagentStripFlags() แล้วส่งมา — param นี้ชนะ built-in map
+	// argv: strip flags (per-role), then --exclude-tools, then --model, then task; no leading --
+	// before task (preserves existing behavior). M: strip flags from SUBAGENT_STRIP_FLAGS per
+	// role — previously every launch loaded skills/templates/themes/extensions in full.
+	// ext-config: the caller (runSubagent) resolves via subagentStripFlags() — this param wins
+	// over the built-in map.
 	const flags = stripFlags ?? (role ? SUBAGENT_STRIP_FLAGS[role] : undefined);
 	const argv = ["PI_ZENSE_SUBAGENT=1", "pi", "--mode", "json", "--no-session"];
 	if (flags?.length) argv.push(...flags);
@@ -1162,9 +1184,10 @@ export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTo
 	return argv;
 };
 
-/** D: prompt ของ requirements sub-agent — บังคับ explore ก่อนดราฟต์ (grounding: criteria[].check
- *  ต้องเป็นคำสั่งที่มีอยู่และรันได้จริงใน repo นี้ ไม่ใช่เดา) + clarify contract (F) + output JSON เดียว
- *  (module scope + export: อยู่ข้าง parser ของมันเอง เวลาเปลี่ยน contract จะได้เห็นคู่กัน) */
+/** D: requirements-sub-agent prompt — forces exploration before drafting (grounding:
+ *  criteria[].check must be a command that exists and actually runs in THIS repo, never a
+ *  guess) + clarify contract (F) + single-JSON output. Kept next to its parser (module scope
+ *  + export) so contract changes stay visible as a pair. */
 export const buildRequirementsPrompt = (intent: string, lessons: string[], facts?: string[], exemplar?: string | null, timeoutMs = 300_000): string =>
 	`You are the REQUIREMENTS sub-agent for a spec-gated SDLC harness. Your single JSON output becomes the machine-checked contract for the main agent's implementation, so every criterion must be grounded in THIS repository's reality — never guess.
 
@@ -1185,8 +1208,9 @@ Rules:
 
 ` +
 	`Step 3 — CLARIFY INSTEAD OF GUESSING (grilling loop): if the request is ambiguous enough that a wrong guess would be costly, do NOT draft yet. You get multiple rounds — each round you are re-run with ALL previous answers appended to the Request — so ask only the 1–2 most decision-critical questions per round instead of dumping every doubt at once. Output exactly {"questions": ["short question", "…max 5…"]}; when a question has a few plausible answers, attach them as choices so the human can pick quickly (they can also type their own): {"questions": [{"question": "…", "choices": ["option A", "option B"]}]} — the two shapes may be mixed in one array.` +
-	// W3: exemplar (few-shot จาก spec ที่เคย signed) + facts (context priming ที่ harness เก็บเอง)
-	// แทรกก่อน lessons — หลักฐานจาก repo ตัวเองสำคัญกว่าบทเรียนกว้างๆ ทั้งคู่ optional เพื่อ backward compat
+	// W3: exemplar (few-shot from a previously signed spec) + facts (harness-collected context
+	// priming) go before the lessons — evidence from the repo itself beats generic lessons;
+	// both optional for backward compat
 	(exemplar ? `\n\nA previously SIGNED spec from this repo (style/format exemplar — do NOT copy its content):\n${exemplar}` : "") +
 	(facts?.length ? `\n\nRepository facts gathered by the harness (verified — trust these over your own assumptions):\n${facts.join("\n")}` : "") +
 	(lessons.length
@@ -1194,23 +1218,25 @@ Rules:
 		: "") +
 	`\n\nRequest: ${intent}`;
 
-// ----------------------------------------------------------------------------- decompose-then-compile (module scope — export เพื่อ unit-test ได้)
+// ----------------------------------------------------------------------------- decompose-then-compile (module scope — exported for unit tests)
 
-/** subtask หนึ่งตัวจาก planner — id ต้อง unique ภายใน plan; intent ต้อง self-contained
- *  (requirements sub-agent ของรอบนั้นจะเห็นแค่ intent นี้ ไม่เห็น intent เดิม ไม่เห็น subtask อื่น) */
+/** One planner subtask — id unique within the plan; intent self-contained (that round's
+ *  requirements sub-agent sees only this intent — not the original, not other subtasks). */
 export interface PlannerSubtask { id: string; title: string; intent: string; scope?: string }
 
-/** threshold เชิง deterministic ของการแตกงาน: นับทั้งจำนวนคำ (ภาษาที่เว้นวรรค) และความยาวตัวอักษร
- *  (ภาษาไทย/จีนไม่เว้นวรรค — นับคำอย่างเดียวจะไม่เคยถึง threshold ทั้งที่ intent ใหญ่จริง)
- *  ค่าเป็น heuristic ที่ปรับคุณภาพได้ทีหลัง — ต้องการแค่ deterministic เพื่อ test assert boundary ได้ */
+/** Deterministic decomposition thresholds: count both words (whitespace-separated languages)
+ *  and characters (Thai/Chinese have no whitespace — word count alone would never trigger
+ *  even for huge intents). Heuristic values, tunable later; determinism is what the tests
+ *  need. */
 export const DECOMPOSE_MAX_WORDS = 100;
 export const DECOMPOSE_MAX_CHARS = 800;
 export const wordCount = (s: string): number => s.trim().split(/\s+/).filter(Boolean).length;
 export const needsDecompose = (intent: string): boolean =>
 	wordCount(intent) > DECOMPOSE_MAX_WORDS || intent.trim().length > DECOMPOSE_MAX_CHARS;
 
-/** prompt ของ planner sub-agent — หน้าที่เดียวคือแตก intent ใหญ่เป็น subtasks (JSON เดียว);
- *  ไม่ explore ลึก (งบเวลาให้ requirements ของแต่ละ subtask ไปใช้เอง) และไม่ draft spec */
+/** Planner-sub-agent prompt — its only job is decomposing a big intent into subtasks (single
+ *  JSON); no deep exploration (each subtask's requirements agent has its own time budget)
+ *  and no spec drafting. */
 export const buildPlannerPrompt = (intent: string, timeoutMs = 300_000): string =>
 	`You are the PLANNER sub-agent for a spec-gated SDLC harness. The task below is too large to hand to a single requirements agent (it would exceed its time budget), so your ONLY job is to decompose it into subtasks. You do NOT draft the spec yourself — a separate requirements agent will handle each subtask, seeing ONLY that subtask's "intent" text (never this message, never the other subtasks).
 
@@ -1227,27 +1253,28 @@ export const buildPlannerPrompt = (intent: string, timeoutMs = 300_000): string 
 
 Task: ${intent}`;
 
-/** parse + validate output ของ planner: JSON object เดียวที่มี subtasks 2–8 ตัว [{id,title,intent,scope?}],
- *  id ห้ามซ้ำ — throw Error ข้อความเจาะจง (ใช้เป็น feedback ใน log/fallback) แทนที่จะคืน plan ครึ่งๆ */
+/** Parse + validate planner output: one JSON object with 2–8 subtasks [{id,title,intent,
+ *  scope?}], ids unique — throws errors with specific messages (feedback for log/fallback)
+ *  rather than returning half a plan. */
 export const parsePlannerSubtasks = (text: string): PlannerSubtask[] => {
 	const raw = extractJsonObject(text);
 	if (raw === undefined || typeof raw !== "object" || raw === null || Array.isArray(raw))
-		throw new Error("planner output ไม่ใช่ JSON object (หา JSON ที่ parse ได้ไม่เจอ — สั่ง output ONLY JSON ไว้)");
+		throw new Error("planner output is not a JSON object (no parseable JSON found — the prompt instructs output ONLY JSON)");
 	const o = (raw as Record<string, unknown>).subtasks;
 	if (!Array.isArray(o) || o.length < 2 || o.length > 8)
-		throw new Error(`planner output: subtasks ต้องเป็น array 2–8 ตัว (ได้ ${Array.isArray(o) ? o.length : "non-array"})`);
+		throw new Error(`planner output: subtasks must be an array of 2–8 items (got ${Array.isArray(o) ? o.length : "non-array"})`);
 	const seen = new Set<string>();
 	const out: PlannerSubtask[] = [];
 	for (let i = 0; i < o.length; i++) {
 		const s = o[i] as Record<string, unknown> | null;
-		if (!s || typeof s !== "object") throw new Error(`planner output: subtasks[${i}] ไม่ใช่ object`);
+		if (!s || typeof s !== "object") throw new Error(`planner output: subtasks[${i}] is not an object`);
 		const id = typeof s.id === "string" ? s.id.trim() : "";
 		const title = typeof s.title === "string" ? s.title.trim() : "";
 		const intent = typeof s.intent === "string" ? s.intent.trim() : "";
-		if (!id) throw new Error(`planner output: subtasks[${i}].id ว่างหรือไม่ใช่ string`);
-		if (seen.has(id)) throw new Error(`planner output: subtask id "${id}" ซ้ำ`);
-		if (!title) throw new Error(`planner output: subtasks[${i}].title ว่าง`);
-		if (!intent) throw new Error(`planner output: subtasks[${i}].intent ว่าง — requirements agent เห็นแค่ field นี้ ห้ามว่าง`);
+		if (!id) throw new Error(`planner output: subtasks[${i}].id is empty or not a string`);
+		if (seen.has(id)) throw new Error(`planner output: subtask id "${id}" is duplicated`);
+		if (!title) throw new Error(`planner output: subtasks[${i}].title is empty`);
+		if (!intent) throw new Error(`planner output: subtasks[${i}].intent is empty — the requirements agent sees only this field, it must not be empty`);
 		seen.add(id);
 		const scope = typeof s.scope === "string" && s.scope.trim() ? s.scope.trim() : undefined;
 		out.push({ id, title, intent, ...(scope ? { scope } : {}) });
@@ -1255,9 +1282,10 @@ export const parsePlannerSubtasks = (text: string): PlannerSubtask[] => {
 	return out;
 };
 
-/** รวม draft spec ของทุก subtask เป็น SpecDraft เดียว: criteria ต่อกันแล้ว re-id เป็น c1..cN
- *  (กัน id ชนระหว่าง subtask — ทุก sub-agent draft id ของตัวเองจาก c1), scope/constraints/specDebt
- *  dedupe, approach ติด prefix [subtask] ให้คนเซ็นเห็นว่าแต่ละ bullet มาจาก subtask ไหน */
+/** Merge all subtask drafts into one SpecDraft: criteria concatenated then re-idded c1..cN
+ *  (every sub-agent drafts its own ids from c1 — collisions guaranteed otherwise);
+ *  scope/constraints/specDebt deduped; approach bullets get a [subtask] prefix so the signer
+ *  can see which subtask each came from. */
 export const mergeSubtaskDrafts = (title: string, intent: string, drafts: { subtask: string; draft: SpecDraft }[]): SpecDraft => ({
 	title,
 	intent,
@@ -1268,10 +1296,11 @@ export const mergeSubtaskDrafts = (title: string, intent: string, drafts: { subt
 	specDebt: [...new Set(drafts.flatMap((d) => d.draft.specDebt))],
 });
 
-/** orchestration decompose-then-compile แบบ pure: runTask เป็น injected dependency (prod = launchSubagent,
- *  test = fake) → unit-test ครอบ flow ทั้งหมดโดยไม่ spawn pi. ล้มตรงไหน throw ทันที (ห้ามเสนอ spec ครึ่งๆ):
- *  planner fail/ผิดรูป, subtask fail, draft parse ไม่ผ่าน หรือ sub-agent ดันถาม clarify (decompose path
- *  ไม่รองรับ clarify ต่อ subtask — caller เป็นคน fallback ไป single compile) */
+/** Pure decompose-then-compile orchestration: runTask is an injected dependency (prod =
+ *  launchSubagent, test = fake) so the whole flow is unit-testable without spawning pi.
+ *  Any failure throws immediately (never offer half a spec): planner failure/malformation,
+ *  subtask failure, unparseable draft, or a clarify request (decompose has no per-subtask
+ *  clarify — the caller falls back to a single compile). */
 export const compileDecomposed = async (
 	intent: string,
 	runTask: (role: "planner" | "requirements", task: string) => Promise<{ ok: boolean; output: string }>,
@@ -1282,12 +1311,12 @@ export const compileDecomposed = async (
 	if (!plan.ok) throw new Error(`planner sub-agent failed: ${plan.output.split("\n")[0].slice(0, 200)}`);
 	const subtasks = parsePlannerSubtasks(plan.output);
 	const drafts: { subtask: string; draft: SpecDraft }[] = [];
-	for (const st of subtasks) { // sequential-only: ห้าม parallel (rate-limit + งบเวลารวม)
+	for (const st of subtasks) { // sequential only — never parallel (rate limits + shared time budget)
 		const r = await runTask("requirements", mkRequirementsPrompt(st));
 		if (!r.ok) throw new Error(`requirements sub-agent failed on subtask ${st.id} ("${st.title}"): ${r.output.split("\n")[0].slice(0, 200)}`);
 		const parsed = parseSpecDraft(r.output);
 		if (parsed.kind === "clarify")
-			throw new Error(`subtask ${st.id}: requirements ขอ clarify (${parsed.questions.length} ข้อ) — decompose path ไม่รองรับ clarify ต่อ subtask; caller fallback ไป single compile`);
+			throw new Error(`subtask ${st.id}: requirements asked to clarify (${parsed.questions.length} question(s)) — decompose has no per-subtask clarify; caller falls back to a single compile`);
 		if (parsed.kind === "error")
 			throw new Error(`subtask ${st.id}: draft invalid — ${parsed.error}`);
 		drafts.push({ subtask: st.id, draft: parsed.draft });
@@ -1295,14 +1324,16 @@ export const compileDecomposed = async (
 	return { subtasks, drafts };
 };
 
-// ----------------------------------------------------------------------------- esc-guard (module scope — export เพื่อ unit-test ได้)
+// ----------------------------------------------------------------------------- esc-guard (module scope — exported for unit tests)
 
-/** B (ESC): global input guard สำหรับ dialog ของ zense — pi ส่ง key ให้แค่ focused component;
- *  ถ้า focus หลุดจาก overlay (เช่นตอน agent streaming) ESC จะไปตกที่ main editor → onEscape
- *  abort คำตอบของ agent แทนที่จะปิด dialog. guard นี้นั่งอยู่ระดับ terminal input (ก่อนถึง component
- *  ทุกตัว) ผ่าน ctx.ui.onTerminalInput: ทุก dialog ของ zense register ตัวเองเข้า stack ตอนเปิด/ถอดตอนปิด
- *  — ขณะ stack ไม่ว่าง ESC ถูก consume + ปิด dialog บนสุดด้วย semantics เดิม (done(null)), key อื่นผ่านปกติ;
- *  เมื่อไม่มี dialog เปิด guard คืน undefined เสมอ (ไม่แตะ key ใดๆ ของระบบ) */
+/** B (ESC): global input guard for zense dialogs — pi delivers keys only to the focused
+ *  component; if focus slips off the overlay (e.g. while the agent streams), ESC lands in the
+ *  main editor → onEscape aborts the agent's answer instead of closing the dialog. This guard
+ *  sits at terminal-input level (before any component) via ctx.ui.onTerminalInput: every zense
+ *  dialog registers itself onto a stack on open and unregisters on close — while the stack is
+ *  non-empty ESC is consumed and closes the topmost dialog with its original semantics
+ *  (done(null)); other keys pass through. With no dialog open the guard always returns
+ *  undefined (never touches system keys). */
 export type EscGuardHandler = (data: string) => { consume?: boolean } | undefined;
 export interface EscGuardHandle { close: () => void }
 export const createEscGuard = (): { open: (close: () => void) => EscGuardHandle; handleInput: EscGuardHandler; reset: () => void; depth: () => number } => {
@@ -1321,31 +1352,33 @@ export const createEscGuard = (): { open: (close: () => void) => EscGuardHandle;
 			};
 		},
 		handleInput: (data) => {
-			if (!stack.length) return undefined; // ไม่มี dialog เปิด → ห้าม consume อะไรเลย
+			if (!stack.length) return undefined; // no dialog open → consume nothing
 			if (data === "\x1b" || matchesKey(data, Key.escape)) {
-				stack[stack.length - 1](); // ปิดบนสุด — dialog ถอดตัวเองออกจาก stack ผ่าน handle.close()
-				return { consume: true };  // key ไม่ถึง component ไหนอีก รวมถึง main editor (abort ไม่เกิด)
+				stack[stack.length - 1](); // close the topmost — the dialog unregisters itself via handle.close()
+				return { consume: true };  // the key reaches no other component, incl. the main editor (no abort)
 			}
-			return undefined; // key อื่นผ่านให้ component ที่ focused จัดการเหมือนเดิมทุกประการ
+			return undefined; // every other key goes to the focused component as usual
 		},
-		reset: () => { stack.length = 0; }, // session ใหม่: overlay เก่าถูก pi pop ไปแล้ว — ล้าง entry ค้าง
+		reset: () => { stack.length = 0; }, // new session: old overlays were popped by pi — drop stale entries
 		depth: () => stack.length,
 	};
 };
 
-// ----------------------------------------------------------------------------- eval/review evidence helpers (module scope — export เพื่อ unit-test ได้)
+// ----------------------------------------------------------------------------- eval/review evidence helpers (module scope — exported for unit tests)
 
-/** C (2026-09-02): toolchain probe ฝั่ง harness — จาก log จริง requirements sub-agent เสียหลายรอบ
- *  กับยิง `command -v` ทีละตัว (deno cargo go make just mvn …) จนชน timeout. harness เช็คให้ครั้งเดียว
- *  (execSync เดียว, timeout 5s) แล้วดันผลเป็น fact — sub-agent ไม่ต้องเสีย tool call ไป probe เอง */
+/** C (2026-09-02): harness-side toolchain probe — real logs showed requirements sub-agents
+ *  burning several rounds firing `command -v` one tool at a time (deno cargo go make just mvn
+ *  …) until the timeout. The harness probes once (single execSync, 5s timeout) and hands the
+ *  result over as a fact — the sub-agent spends no tool calls on probing. */
 export const TOOLCHAIN_PROBE = [
 	"node", "npm", "pnpm", "bun", "deno", "python3", "pip3", "uv", "cargo", "go", "make", "just",
 	"mvn", "gradle", "dotnet", "composer", "php", "ruby", "docker", "kubectl", "git",
 ];
 export const probeToolchain = (tools: readonly string[] = TOOLCHAIN_PROBE, env = process.env): string[] => {
 	try {
-		// `; true` ปิดท้ายจำเป็น: ถ้าตัวสุดท้ายของลิสต์ไม่เจอบน PATH loop exit 1 → execSync throw
-		// ทั้งก้อนแล้ว catch ได้ [] เสมอ (default TOOLCHAIN_PROBE เคยรอดเพียงเพราะตัวท้ายคือ git)
+		// the trailing `; true` is required: if the last listed tool is missing from PATH the loop
+		// exits 1 → execSync throws and catch returns [] always (the default TOOLCHAIN_PROBE once
+		// survived only because git happened to be last)
 		const out = execSync(`for t in ${tools.join(" ")}; do command -v "$t" >/dev/null 2>&1 && printf '%s\\n' "$t"; done; true`, {
 			encoding: "utf8",
 			timeout: 5_000,
@@ -1354,14 +1387,15 @@ export const probeToolchain = (tools: readonly string[] = TOOLCHAIN_PROBE, env =
 		}).trim();
 		return out ? out.split("\n").filter(Boolean) : [];
 	} catch {
-		return []; // probe พัง/timeout → ไม่มี fact ก็ยังทำงานได้ (best-effort เหมือนส่วนอื่นของ gatherRepoFacts)
+		return []; // probe failure/timeout → works fine without facts (best-effort like the rest of gatherRepoFacts)
 	}
 };
 
 /**
- * W3: context priming — harness เก็บข้อเท็จจริงถูกๆ ของ repo ให้ requirements sub-agent เอง
- * (D เดิมพึ่ง "สั่งให้ model explore" ล้วนๆ — model ขี้เกียจรอบเดียว criteria ก็ลอยทั้งชุด)
- * ทุกส่วน best-effort: อ่านไม่ได้/ไม่มีไฟล์ → ข้ามเงียบๆ ไม่ให้ compile พังเพราะ repo หน้าตาแปลก
+ * W3: context priming — the harness gathers verified repo facts for the requirements
+ * sub-agent (plain D relied solely on "tell the model to explore" — one lazy round and a
+ * whole criteria set floats). Every part is best-effort: unreadable/missing files are skipped
+ * silently so an odd-looking repo can't break compile.
  */
 export const gatherRepoFacts = (cwd: string): string[] => {
 	const facts: string[] = [];
@@ -1399,8 +1433,9 @@ export const gatherRepoFacts = (cwd: string): string[] => {
 	}
 	const configs = ["tsconfig.json", "vitest.config.ts", "vitest.config.mts", "jest.config.js", "jest.config.ts", ".mocharc.json"].filter((f) => existsSync(join(cwd, f)));
 	if (configs.length) facts.push(`configs present: ${configs.join(", ")}`);
-	// C: manifest ต่อ ecosystem — บอก sub-agent ว่า repo นี้เป็น ecosystem ไหน (cargo/go/deno/python/...)
-	// รวมถึง repo ที่ไม่มี package.json (cargo/go) ซึ่งเคยทำให้ sub-agent เดาผิดและเสียเวลา probe เอง
+	// C: one manifest per ecosystem — tells the sub-agent which ecosystem this repo is
+	// (cargo/go/deno/python/...), incl. repos without package.json (cargo/go) that once made the
+	// sub-agent guess wrong and waste time probing
 	const manifestNames = ["deno.json", "deno.jsonc", "Cargo.toml", "go.mod", "pyproject.toml", "requirements.txt", "Gemfile", "composer.json", "pom.xml", "build.gradle", "build.gradle.kts"];
 	const manifests = manifestNames.filter((f) => existsSync(join(cwd, f)));
 	try {
@@ -1409,16 +1444,17 @@ export const gatherRepoFacts = (cwd: string): string[] => {
 		/* skip */
 	}
 	if (manifests.length) facts.push(`ecosystem manifests present (trust this — do not re-scan): ${manifests.join(", ")}`);
-	// C: toolchain ที่เจอบน PATH — fact เดียวจบ แทนที่จะให้ sub-agent probe ทีละตัวจนชน timeout
+	// C: toolchain found on PATH — one fact, done, instead of the sub-agent probing one by one until the timeout
 	const tools = probeToolchain();
 	if (tools.length) facts.push(`toolchain on PATH (verified — do NOT re-probe one-by-one): ${tools.join(", ")}`);
 	return facts.map((f) => `- ${f}`);
 };
 
 /**
- * W3: few-shot จาก spec จริงของ repo — ดึงฉบับล่าสุดที่เคย signed (approved) จาก archive
- * เป็นตัวอย่าง style/format ที่เคยผ่าน gate ของโปรเจกต์นี้ (ตัด criteria เหลือ 3 อัน ไม่ให้ prompt บวม)
- * ชื่อไฟล์ archive ขึ้นต้นด้วย timestamp → sort desc แล้วไล่ไฟล์แรกที่ approved=true
+ * W3: few-shot from this repo's real specs — pull the newest previously signed (approved)
+ * spec from the archive as a style/format exemplar that already passed this project's gate
+ * (criteria trimmed to 3, keeps the prompt lean). Archive filenames start with a timestamp →
+ * sort descending and take the first approved=true.
  */
 export const loadSpecExemplar = (cwd: string): string | null => {
 	const dir = join(zenseDir(cwd), "specs");
@@ -1436,19 +1472,19 @@ export const loadSpecExemplar = (cwd: string): string | null => {
 				specDebt: s.specDebt.slice(0, 2),
 			});
 		} catch {
-			/* ข้ามไฟล์เสียใน archive */
+			/* skip corrupt archive files */
 		}
 	}
 	return null;
 };
 
-/** W2: สรุปสถานะ git ของ working dir ที่กำลัง eval/review (worktree หรือ main) — best-effort:
- *  ไม่ใช่ repo/คำสั่งล้มเหลว → เว้นส่วนนั้นไป. grader ใช้ดู diff จับ reward hacking,
- *  reviewer ใช้เป็น evidence pack. จำกัดความยาวทุกส่วนกัน prompt บวม */
+/** W2: git snapshot of the working dir being evaluated/reviewed (worktree or main) —
+ *  best-effort: not a repo / command failure → that section is omitted. The grader uses it to
+ *  spot reward hacking, the reviewer as an evidence pack. Every section is length-capped. */
 export const gitChangeSummary = (cwd: string, baseline?: string): string => {
 	const parts: string[] = [];
 	if (baseline) {
-		// ground เฉพาะรอบปัจจุบัน: log/diff เทียบ baseline ตอน spec approval — commit เก่าก่อนรอบนี้ไม่ปนเข้า evidence
+		// ground only the current round: log/diff vs the baseline at spec approval — older commits never leak into evidence
 		const log = gitOk(["log", "--oneline", `${baseline}..HEAD`], cwd);
 		if (log.ok && log.out.trim()) parts.push(`commits since baseline ${baseline.slice(0, 8)}:\n${log.out.trim()}`);
 	} else {
@@ -1464,39 +1500,45 @@ export const gitChangeSummary = (cwd: string, baseline?: string): string => {
 
 export interface ProbeResult {
 	id: string;
-	status: "pass" | "fail" | "skipped"; // skipped = check ไม่ runnable (manual → human review; ไม่บังคับผ่าน/ไม่ผ่าน)
+	status: "pass" | "fail" | "skipped"; // skipped = check not runnable (manual → human review; not forced pass/fail)
 	exitCode?: number;
-	detail: string; // stdout/stderr tail หรือเหตุผลที่ skip
+	detail: string; // stdout/stderr tail, or the reason it was skipped
 }
 
-const PROBE_TIMEOUT_MS = 30_000; // กัน check ค้าง (server รอ port ฯลฯ) ลาก eval ไปด้วย
+const PROBE_TIMEOUT_MS = 30_000; // keeps a hanging check (server waiting on a port, …) from dragging eval down with it
 
-/** usage/syntax/environment errors = เครื่องมือรันคำสั่งเช็คไม่ได้เพราะตัวคำสั่งเองเสีย (arg เกิน /
- *  flag ไม่รู้จัก / parse พัง) — ไม่ใช่หลักฐานว่า artifact ผิด. เช็คที่ "รันแล้วไม่ตรง" จริง
- *  (grep ไม่เจอ, test false, diff แตกต่าง) ล้วน exit 1 แบบเงียบๆ หรือพิมพ์ diff ออก stdout
- *  → ไม่โดน regex นี้ ยังเป็น fail เต็มตัว. ตั้งใจไม่ใส่ "No such file": `cat missing-file`
- *  = artifact หายของจริง ต้อง fail. เคสเจอจริง: "expected at most two arguments… unexpected: +, grep",
- *  "test: too many arguments" → probe ตายทั้งที่ artifact ถูก → ถูก probe-primacy ทับ FAIL เงียบๆ ลูปไม่จบ */
+/** usage/syntax/environment errors = the harness couldn't run the check because the command
+ *  itself is broken (too many args / unknown flag / parse failure) — not evidence that the
+ *  artifact is wrong. Checks that genuinely "ran and didn't match" (grep not found, test
+ *  false, diff differs) exit 1 quietly or print a diff → they dodge this regex and stay full
+ *  fails. "No such file" intentionally absent: `cat missing-file` = a genuinely missing
+ *  artifact, must fail. Real cases: "expected at most two arguments… unexpected: +, grep",
+ *  "test: too many arguments" → probe died on a correct artifact and probe-primacy then
+ *  stamped FAIL over it forever. */
 const PROBE_USAGE_ERROR_RE =
 	/too many arguments|usage:|unexpected (argument|token|operator|flag)|expected (exactly|at (most|least)) \w+ argument|accepts \d+ arg|unrecognized |unknown (flag|command|shorthand|option)|invalid (option|argument|flag)|illegal option|bad option|syntax error/i;
 
-/** ตัดสินว่า shell probe ที่พังคือ "คำสั่งเสียฝั่งเครื่องมือ" (ตัดสิน artifact ไม่ได้) หรือ fail จริง */
+/** Is a broken shell probe a "broken command on the harness side" (can't judge the artifact)
+ *  or a genuine fail? */
 const isProbeCommandError = (exitCode: number | undefined, detail: string): boolean =>
 	exitCode === 126 || exitCode === 127 || PROBE_USAGE_ERROR_RE.test(detail);
 
-/** placeholder ที่ไม่ได้ substitute ใน check — token รูป <word> หรือ {word}
- *  (spec author เผลอเขียน check เป็น template เช่น "path exists: src/<module>/x", "grep -q foo {file}"
- *  → รันแล้ว No such file / exit 1 เงียบ → ถูก probe primacy ทับ FAIL ทั้งที่คำสั่งเสีย เจอจริง)
- *  ยกเว้น ${VAR} (shell variable — lookbehind (?<!\$)) — ไม่ใช่ placeholder */
+/** Unsubstituted placeholders in a check — <word> or {word} tokens
+ *  (a spec author left the check as a template, e.g. "path exists: src/<module>/x",
+ *  "grep -q foo {file}" → runs as No such file / quiet exit 1 → probe primacy stamps FAIL on
+ *  a broken command; seen for real). ${VAR} is excepted (shell variable — lookbehind
+ *  (?<!\$)) — not a placeholder. */
 const PLACEHOLDER_TOKEN_RE = /<[A-Za-z][A-Za-z0-9_-]*>|(?<!\$)\{[A-Za-z][A-Za-z0-9_-]*\}/;
 export const hasUnsubstitutedPlaceholder = (check: string): string | null => {
 	const m = check.match(PLACEHOLDER_TOKEN_RE);
 	return m ? m[0] : null;
 };
 
-/** format contract เดียวของ criteria[].check — source of truth ก้อนเดียว ใช้ทั้ง requirements prompt
- *  (buildRequirementsPrompt — blockquote ลง rules) และ zense_spec tool schema (action=set เขียน check เอง)
- *  เป้าหมาย: agent gen probe ที่ harness (sh -c) รันได้จริงตั้งแต่ครั้งแรก ไม่ใช่เจอพังตอน eval แล้วลูปแก้ spec */
+/** The single format contract for criteria[].check — one source of truth used by both the
+ *  requirements prompt (buildRequirementsPrompt quotes it into the rules) and the zense_spec
+ *  tool schema (action=set authors checks by hand). Goal: the agent generates probes the
+ *  harness (sh -c) can actually run on the first attempt, instead of breaking at eval and
+ *  looping spec fixes. */
 export const CHECK_FORMAT_CONTRACT =
 	"Check format contract (the harness executes this verbatim at eval — a broken command wastes whole eval rounds): each check runs under POSIX sh via `sh -c` with cwd=repo root; exit 0 = pass, non-zero = fail. Allowed forms ONLY: (1) a single-line runnable shell command (e.g. \"npm test\", \"npx tsc --noEmit\", \"grep -q foo src/a.ts\"); (2) \"path exists: <relative-path>\"; (3) a one-level compound of those joined with \" && \" (e.g. \"path exists: src/a.ts && npm test\"). BANNED (sh will not run them and the check dies for infra reasons): globstar ** (e.g. apps/**/dev.yaml — use find/rg or spell the path out), brace expansion, [[ ]], process substitution and other bashisms, && / || inside string literals, and unsubstituted placeholders like <module> or {file}. Every path/token must exist in the repo TODAY and you must have actually run each candidate command (Step 1) and seen it execute — it need not pass yet, but it must not die with command-not-found/usage/syntax errors. Anything you cannot verify by running belongs in specDebt, not in criteria.";
 
@@ -1504,9 +1546,10 @@ type CheckSegment = { kind: "exists"; path: string } | { kind: "shell"; command:
 
 const PATH_EXISTS_SEG_RE = /^\s*(?:path|file)\s+exists:\s*(.+?)\s*$/i;
 
-/** แยก compound check ("path exists: a && npm test") ที่หัว "&&" ออกเป็น segment — คืน null ถ้า
- *  ไม่มี segment แบบ path-exists เลย (check ล้วน shell อาจมี "&&" ใน string literal เช่น
- *  grep -q "a && b" → split มั่วแล้วคำสั่งพัง เลยคงพฤติกรรม sh -c ทั้งก้อนไว้เหมือนเดิม) */
+/** Split a compound check ("path exists: a && npm test") at top-level "&&" into segments —
+ *  null when no path-exists segment exists (a pure-shell check may contain "&&" inside a
+ *  string literal, e.g. grep -q "a && b" → a naive split would break the command, so the
+ *  whole sh -c behavior is preserved). */
 const splitCompoundCheck = (check: string): CheckSegment[] | null => {
 	const parsed: CheckSegment[] = check.split(/\s*&&\s*/).map((seg) => {
 		const m = seg.match(PATH_EXISTS_SEG_RE);
@@ -1515,15 +1558,14 @@ const splitCompoundCheck = (check: string): CheckSegment[] | null => {
 	return parsed.some((s) => s.kind === "exists") ? parsed : null;
 };
 
-/** รัน shell command เดียวใน cwd — คืน pass/exitCode/detail(stdout|stderr tail); exitCode undefined เมื่อ timeout/สัญญาณฆ่า
- *  cmdErr=true เมื่อตัวคำสั่งเองเสีย (usage/syntax/command-not-found) — caller ต้องไม่นับเป็น artifact fail */
-/** strip leading shell-runner prefix ("bash: "/"sh:"/"shell:"/"zsh:", case-insensitive) จาก check —
- *  มนุษย์/LLM มักเขียน check เป็น "bash: npm test" ซึ่ง sh -c ทั้งก้อนแล้วพัง (sh: bash:: command not found,
- *  exit 127 → skipped เสีย machine verification ทุกรอบ); strip เฉพาะต้น command ครั้งเดียว ไม่แตะกลางสตริง */
+/** Strip a leading shell-runner prefix ("bash: "/"sh:"/"shell:"/"zsh:", case-insensitive)
+ *  from a check — humans/LLMs often write "bash: npm test", which when run via sh -c dies
+ *  (sh: bash:: command not found, exit 127 → skipped, losing machine verification every
+ *  round). Strips once at command start; never touches the middle. */
 export const normalizeShellCommand = (check: string): string => check.replace(/^\s*(?:bash|sh|shell|zsh):\s*/i, "");
 
 const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pass: boolean; exitCode?: number; detail: string; cmdErr?: boolean } => {
-	// normalize ก่อนรัน — detail ต้องสะท้อนคำสั่งที่ execute จริง (ตัวถัดไปนับจากนี้คือ stripped command)
+	// normalize before running — detail must reflect the actually executed (stripped) command
 	command = normalizeShellCommand(command);
 	try {
 		const out = execFileSync("sh", ["-c", command], { cwd, timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -1539,18 +1581,22 @@ const runShellSegment = (command: string, cwd: string, timeoutMs: number): { pas
 };
 
 /**
- * W3 (probe-first grading): harness รัน criteria[].check ด้วยตัวเองก่อนส่ง grader —
- * grader ไม่ต้องเดาว่าคำสั่งรันแล้วได้อะไร และ probe เป็นหลักฐานแข็งที่ทับ verdict ของ grader ได้
- * (probe fail ⇒ criterion FAIL ไม่ว่า grader จะว่าอย่างไร — ดู zense_eval)
- * ยกเว้นคำสั่งเช็คเสียฝั่งเครื่องมือเอง (usage/syntax error — ดู isProbeCommandError) → skipped:
- * ไม่ใช่หลักฐานว่า artifact ผิด ปล่อย grader ตัดสินจากหลักฐานอื่น + ฝากมนุษย์ตรวจ ไม่บังคับ FAIL ลูปไม่จบ
- * รองรับ 3 รูปแบบ: "path exists: <p>" resolve ใน process เลย / เช่นเดียวกันกับ segment ของ compound
- * ("path exists: a && npm test" — ทุก segment ต้องผ่าน) / check ล้วน shell ที่ isMachineCheckable → sh -c ทั้งก้อน
+ * W3 (probe-first grading): the harness runs criteria[].check itself before the grader sees
+ * anything — the grader no longer guesses what a command returns, and probes are hard
+ * evidence that can override a grader verdict (probe fail ⇒ criterion FAIL no matter what
+ * the grader says — see zense_eval).
+ * Exception: a check command broken on the harness side (usage/syntax error — see
+ * isProbeCommandError) → skipped: not evidence of artifact failure, the grader judges from
+ * other evidence + the human reviews; no forced FAIL loop.
+ * Supports 3 shapes: "path exists: <p>" resolved in-process / the same per segment of a
+ * compound ("path exists: a && npm test" — every segment must pass) / pure shell checks that
+ * are machine-checkable → whole via sh -c.
  */
 export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = PROBE_TIMEOUT_MS): ProbeResult[] =>
 	criteria.map((c) => {
-		// placeholder ที่ไม่ได้ substitute → คำสั่งเสียฝั่ง spec (ครอบทุก branch: path-exists/compound/shell)
-		// ห้ามไหลเป็น fail (probe primacy จะทับ grader → ลูปไม่จบ) — skipped พร้อมบอกทางแก้
+		// unsubstituted placeholder → spec-side broken command (covers every branch: path-exists/
+		// compound/shell); must never flow into fail (probe primacy would override the grader →
+		// endless loop) — skipped with a fix hint
 		const ph = hasUnsubstitutedPlaceholder(c.check);
 		if (ph)
 			return {
@@ -1560,7 +1606,7 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 			};
 		const segs = splitCompoundCheck(c.check);
 		if (segs?.every((s) => s.kind === "exists")) {
-			// path-exists ล้วน — resolve ใน process (single-path คงพฤติกรรมเดิมเป๊ะทั้ง status และ detail)
+			// pure path-exists — resolve in-process (single-path keeps identical status & detail)
 			const missing: string[] = [];
 			for (const s of segs) if (s.kind === "exists" && !existsSync(resolve(cwd, s.path))) missing.push(s.path);
 			const ok = !missing.length;
@@ -1571,8 +1617,9 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 			};
 		}
 		if (segs) {
-			// compound ปน shell: ทุก segment ต้องรันได้จริง — มี shell segment ที่เครื่องมือตัดสินไม่ได้แม้แต่อันเดียว
-			// ก็ไม่เดารัน (อาจพังหรือ dangerous เพราะ split ผิด semantics) → skipped ให้มนุษย์ตรวจเองทั้ง criterion
+			// compound with shell: every segment must actually be runnable — a single shell segment
+			// the harness can't judge means don't blindly run it (may break or be dangerous because
+			// the split missed the semantics) → skip the whole criterion for human review
 			const unrunnable = segs.find((s) => s.kind === "shell" && !isMachineCheckable(s.command));
 			if (unrunnable && unrunnable.kind === "shell")
 				return { id: c.id, status: "skipped" as const, detail: `segment not machine-runnable: ${unrunnable.command.slice(0, 80)} (→ human review)` };
@@ -1588,7 +1635,7 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 					if (!r.pass)
 						return {
 							id: c.id,
-							// segment นี้คำสั่งเสีย → ตัดสิน artifact ไม่ได้ทั้ง criterion (แม้ segment ก่อนหน้าจะผ่าน)
+							// this segment's command is broken → the whole criterion can't judge the artifact (even if earlier segments passed)
 							status: (r.cmdErr ? "skipped" : "fail") as "skipped" | "fail",
 							...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
 							detail: (r.cmdErr ? `probe command error (not artifact failure, → human review): ` : "") + details.join("; ").slice(-600),
@@ -1597,7 +1644,7 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 			}
 			return { id: c.id, status: "pass" as const, exitCode: 0, detail: details.join("; ").slice(-600) };
 		}
-		// shell-only check (อาจมี "&&" ใน literal) — พฤติกรรมเดิม: sh -c ทั้งก้อน / skip ถ้ารันอัตโนมัติไม่ได้
+		// shell-only check (may contain "&&" inside literals) — as before: whole via sh -c / skip when not auto-runnable
 		if (!isMachineCheckable(c.check)) return { id: c.id, status: "skipped" as const, detail: "not machine-runnable (→ human review)" };
 		const r = runShellSegment(c.check, cwd, timeoutMs);
 		return {
@@ -1608,14 +1655,17 @@ export const runCheckProbes = (cwd: string, criteria: Criterion[], timeoutMs = P
 		};
 	});
 
-const CHECK_LINT_TIMEOUT_MS = 10_000; // lint ตอน commit ต้องเร็ว — cap แข็งที่ PROBE_TIMEOUT_MS (30s)
+const CHECK_LINT_TIMEOUT_MS = 10_000; // commit-time lint must be fast — hard-capped at PROBE_TIMEOUT_MS (30s)
 
-/** deterministic commit-time check lint (W: กัน probe คำสั่งเสียหลุดไปถึง eval แล้วลูปแก้ spec):
- *  รันแต่ละ check ครั้งเดียวผ่าน runCheckProbes ตรงๆ (cwd=repo root, timeout สั้น) → lint เห็นเหมือนที่ eval จะเห็นเป๊ะ
- *  classify: skipped เท่านั้นที่เป็น spec-side broken (placeholder / คำสั่งไม่ machine-runnable / cmdErr 126-127-
- *  usage-syntax — ตัดสิน artifact ไม่ได้เลย ต้อง fix the check) → คืน broken ids + notes บอกสาเหตุ;
- *  pass/fail = artifact-side (รวม fail เพราะของยังไม่ implement และ timeout จากคำสั่งช้า) → ไม่เตือน เพราะปกติก่อนเซ็น
- *  ไม่เปลี่ยน semantics ของ runCheckProbes/probe primacy — เป็นเพียงชั้นเตือนตอน spec ก่อนเซ็น */
+/** Deterministic commit-time check lint (W: stops broken probe commands from reaching eval
+ *  and looping spec fixes): runs each check once via runCheckProbes verbatim (cwd=repo root,
+ *  short timeout) → lint sees exactly what eval will see.
+ *  Classification: only `skipped` is spec-side broken (placeholder / not machine-runnable /
+ *  cmdErr 126–127 usage-syntax — the artifact can't be judged at all → fix the check) →
+ *  returns broken ids + explanatory notes; pass/fail = artifact-side (incl. failing because
+ *  the work isn't implemented yet, or slow-command timeouts) → no warning, normal pre-signing.
+ *  Doesn't change runCheckProbes/probe-primacy semantics — it's only a pre-signing warning
+ *  layer. */
 export const lintSpecChecks = (cwd: string, criteria: Criterion[], timeoutMs = CHECK_LINT_TIMEOUT_MS): { broken: string[]; notes: string[] } => {
 	const results = runCheckProbes(cwd, criteria, Math.min(timeoutMs, PROBE_TIMEOUT_MS));
 	const broken: string[] = [];
@@ -1623,7 +1673,7 @@ export const lintSpecChecks = (cwd: string, criteria: Criterion[], timeoutMs = C
 	for (const r of results) {
 		if (r.status !== "skipped") continue;
 		broken.push(r.id);
-		notes.push(`check-lint: ${r.id} ใช้ check ที่ probe รันไม่ได้ (${r.detail.slice(0, 120)}) — ต้องแก้ check ใน spec ให้รันได้จริง (fix the check, not the artifact) หรือย้ายไป specDebt`);
+		notes.push(`check-lint: ${r.id} uses a check the probe can't run (${r.detail.slice(0, 120)}) — fix the check in the spec so it actually runs (fix the check, not the artifact), or move it to specDebt`);
 	}
 	return { broken, notes };
 };
@@ -1634,22 +1684,23 @@ export interface GradeParse {
 	perCriteria: Record<string, "PASS" | "FAIL">;
 	evidence: Record<string, string>;
 	failedIds: string[];
-	missingIds: string[];      // criterion ที่ grader ไม่ได้ออก verdict — coverage โปร่ง (เดิมถูกเมินเงียบๆ)
-	passNoEvidence: string[];  // PASS แต่ไม่มีหลักฐานต่อท้าย — ปิดช่อง "ตอบมั่วแบบมั่นใจ"
+	missingIds: string[];      // criteria the grader gave no verdict on — spotty coverage (previously ignored silently)
+	passNoEvidence: string[];  // PASS without trailing evidence — closes the "confident bluff" hole
 	overall: "PASS" | "FAIL" | null;
 }
 
 /**
- * W2: parse verdict ของ grader แบบเข้มกว่าเดิม — contract:
- *   <id>: PASS: <evidence> / <id>: FAIL: <evidence> ... บรรทัดสุดท้าย OVERALL: PASS|FAIL
- * เดิมมีรู 3 จุดที่ทำให้ "output พัง = ผ่านฟรี": id ที่ regex ไม่เจอถูกเมิน (coverage ไม่ครบ),
- * OVERALL หาย → verdict unknown ไหลเป็น PASS, PASS ไม่ต้องมีหลักฐาน — pure เพื่อ unit-test ตรงๆ
+ * W2: stricter grader-verdict parsing — contract:
+ *   <id>: PASS: <evidence> / <id>: FAIL: <evidence> ... last line OVERALL: PASS|FAIL
+ * Three old holes made "broken output = free pass": ids the regex missed were ignored
+ * (incomplete coverage), a missing OVERALL flowed unknown → PASS, and PASS needed no
+ * evidence. Pure for direct unit tests.
  */
 export const parseGraderOutput = (output: string, criteria: Criterion[]): GradeParse => {
 	const perCriteria: Record<string, "PASS" | "FAIL"> = {};
 	const evidence: Record<string, string> = {};
 	for (const c of criteria) {
-		// NB: ใช้ [ \t] ไม่ใช่ \s หลัง verdict — \s กินขึ้นบรรทัดใหม่ทำให้ evidence ลากไปเอาบรรทัดถัดไป
+		// NB: [ \t], not \s, after the verdict — \s eats the newline and evidence would slurp the next line
 		const m = output.match(new RegExp(`^\\s*${escapeRe(c.id)}[ \\t]*:[ \\t]*(PASS|FAIL)\\b[ \\t]*:?[ \\t]*([^\\r\\n]*)$`, "im"));
 		if (m) {
 			perCriteria[c.id] = m[1].toUpperCase() as "PASS" | "FAIL";
@@ -1667,8 +1718,9 @@ export const parseGraderOutput = (output: string, criteria: Criterion[]): GradeP
 	};
 };
 
-/** W2/W3: prompt ของ grader — evidence-anchored contract + probe results (harness รันเอง = ground truth)
- *  + diff จริง + reward-hacking checklist + แจ้งชัดว่า read-only — pure builder เพื่อ test/reuse */
+/** W2/W3: grader prompt — evidence-anchored contract + probe results (harness-executed =
+ *  ground truth) + real diff + reward-hacking checklist + explicit read-only notice — pure
+ *  builder for tests/reuse. */
 export const buildGraderPrompt = (spec: Spec, probes: ProbeResult[], diffSummary: string, feedback: string): string =>
 	`You are the OUTPUT-EVAL grader. Judge each acceptance criterion from EVIDENCE ONLY — the probe results below were executed by the harness itself and are ground truth. You have NO write/edit tools; never modify the repo (if a check truly needs a fixture, create it in a tmp dir only).\n\n` +
 	`Reward-hacking checklist (auto-FAIL the related criteria if found): tests weakened/deleted/skipped, assertions removed, writes outside spec scope, placeholder or stub code claimed as done. Compare the change summary below against the spec scope.\n\n` +
@@ -1688,19 +1740,20 @@ export const buildGraderPrompt = (spec: Spec, probes: ProbeResult[], diffSummary
 	(feedback ? `\n\nSYSTEM FEEDBACK: your previous response was rejected: ${feedback}. Return the corrected format only.` : "");
 
 // ----------------------------------------------------------------------------- M: compact tool-result display text
-// เดิมทุก branch ของ zense_eval/zense_review ต่อท้าย sub-agent output ดิบ (สูงสุด ~16k chars จาก runSubagent)
-// เข้า conversation history ถาวร → จ่าย input ซ้ำทุก turn หลัง eval. builders กลุ่มนี้ render เฉพาะสิ่งที่ main
-// agent ต้องใช้ตัดสินใจต่อ (verdict, per-criteria one-liner, probes ที่ไม่ผ่าน, directives, log path ให้อ่านเอง)
-// — ข้อมูลเต็มยังคงอยู่ใน details{} และ .zense/subagents/*.log เหมือนเดิม ไม่มีอะไรหายจาก pipeline
+// Previously every zense_eval/zense_review branch appended raw sub-agent output (up to ~16k
+// chars from runSubagent) into the permanent conversation history → re-paid as input on every
+// turn after eval. These builders render only what the main agent needs for its next decision
+// (verdict, per-criteria one-liners, failed probes, directives, log path to read on demand) —
+// full data still lives in details{} and .zense/subagents/*.log; nothing leaves the pipeline.
 
-/** ตัด evidence เป็น 1 บรรทัดสั้น — บังคับ ceiling เพื่อไม่ให้ tool result บวมกลับ */
+/** Trim evidence to one short line — hard ceiling so the tool result can't balloon back */
 const oneLineEvidence = (s: string, max = 120): string => {
 	const line = (s ?? "").split("\n")[0].trim();
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 };
 
-/** probe section แบบบีบ: ลงรายละเอียดเฉพาะ probes ที่ไม่ pass; ที่ pass รวมเป็นบรรทัดเดียว
- *  (เริ่มด้วย \n\n เหมือน probeSection เดิม — caller ต่อ string แบบเดิมได้ทุก branch) */
+/** Compact probe section: detail only for non-pass probes; passing ones collapse to one line
+ *  (starts with \n\n like the old probeSection — callers keep concatenating the same way). */
 export const buildCompactProbeSection = (probes: ProbeResult[]): string => {
 	const passIds = probes.filter((p) => p.status === "pass").map((p) => p.id);
 	const lines = probes
@@ -1710,7 +1763,8 @@ export const buildCompactProbeSection = (probes: ProbeResult[]): string => {
 	return `\n\n## Probes (harness-executed, authoritative)\n${lines.join("\n") || "(no probes)"}`;
 };
 
-/** input ของ buildEvalResultText — ทุก field มีอยู่แล้วใน handler (ไม่ดึง output ดิบของ sub-agent เข้ามา) */
+/** Input for buildEvalResultText — every field already exists in the handler (no raw
+ *  sub-agent output pulled in). */
 export interface EvalResultView {
 	verdict: string;
 	criteria: Criterion[];
@@ -1721,47 +1775,51 @@ export interface EvalResultView {
 	probes: ProbeResult[];
 	trajectory: string[];
 	specDebt: string[];
-	logPath: string; // path ของ .zense/subagents/*.log — agent อ่านเองเมื่อต้องการรายละเอียด
+	logPath: string; // .zense/subagents/*.log path — the agent reads it itself when it needs detail
 }
 
-/** render ข้อความผลของ zense_eval ทั้ง PASS/FAIL — FAIL แสดงเฉพาะ criteria ที่ไม่ผ่าน (เอาที่ PASS ออกจากสมาธิของ agent)
- *  ทั้งสอง branch จบด้วยชี้ log เต็ม + directives; ห้ามแตะ directives (FAIL = กลับไปแก้, PASS = บังคับเรียก zense_review — agent เคยถือว่างานจบเงียบๆ) */
+/** Render zense_eval's result text for both PASS/FAIL — FAIL shows only failing criteria
+ *  (keeps passing ones out of the agent's attention); both end with the full-log pointer +
+ *  directives. Never touch the directives (FAIL = go fix, PASS = mandatory zense_review — the
+ *  agent once silently considered itself done). */
 export const buildEvalResultText = (v: EvalResultView): string => {
 	const out: string[] = [
 		v.verdict === "PASS"
-			? "✅ Eval PASS — ขั้นต่อไป (บังคับ): เรียก `zense_review` ทันทีเพื่อให้ reviewer sub-agent สร้าง review packet — ห้ามสรุป/ตอบ user จบงานก่อนจนกว่าจะเรียก zense_review แล้ว"
-			: "❌ Eval FAIL — กลับไปแก้แล้วเรียก zense_eval ใหม่ (ห้ามไป review จนกว่าจะ PASS)",
+			? "✅ Eval PASS — next step (mandatory): call `zense_review` immediately so the reviewer sub-agent builds the review packet — do not summarize or close out with the user until zense_review has been called"
+			: "❌ Eval FAIL — go fix it, then call zense_eval again (do not proceed to review until it passes)",
 	];
 	if (v.verdict === "FAIL") {
-		out.push(`criteria ที่ไม่ผ่าน: ${v.failedIds.length ? v.failedIds.join(", ") : "(overall FAIL — ดู evidence ด้านล่างหรือ log เต็ม)"}`);
+		out.push(`failing criteria: ${v.failedIds.length ? v.failedIds.join(", ") : "(overall FAIL — see the evidence below or the full log)"}`);
 		if (v.probeOverrides.length)
 			out.push(
-				`⚠ probe override → FAIL [${v.probeOverrides.join(", ")}]: harness รัน check เองแล้วไม่ผ่านทั้งที่ grader ให้ PASS — สาเหตุได้ 2 ทาง: (1) artifact ผิดจริง → อ่าน probe detail ด้านล่างแล้วแก้; (2) check command ใน spec เสีย (placeholder/path ผิด — แก้ artifact ยังไงก็ไม่ผ่าน) → เรียก zense_spec เวอร์ชันใหม่แก้ check แล้วเซ็นใหม่`,
+				`⚠ probe override → FAIL [${v.probeOverrides.join(", ")}]: the harness ran the check itself and it failed despite the grader's PASS — two possible causes: (1) the artifact is genuinely wrong → read the probe detail below and fix it; (2) the spec's check command itself is broken (placeholder/wrong path — no artifact change will ever pass) → commit a new zense_spec version with a fixed check and re-sign`,
 			);
 	}
-	// FAIL: เฉพาะ criteria ที่ไม่ผ่าน (ตัดเสียงรบกวน); PASS: ครบทุกตัวเพื่อยืนยันความครอบคลุม
+	// FAIL: only failing criteria (less noise); PASS: all of them to confirm coverage
 	const showIds = v.verdict === "FAIL" ? new Set(v.failedIds) : null;
 	const critLines = v.criteria
 		.filter((c) => !showIds || showIds.has(c.id))
 		.map((c) => `- ${c.id}: ${v.perCriteria[c.id] ?? "?"} — ${oneLineEvidence(v.evidence[c.id] ?? "")}`);
 	if (critLines.length) out.push("", "## Verdicts", ...critLines);
-	out.push(buildCompactProbeSection(v.probes).slice(2)); // ตัด \n\n นำหน้าออก — out.push คั่นบรรทัดอยู่แล้ว
+	out.push(buildCompactProbeSection(v.probes).slice(2)); // strip the leading \n\n — out already separates lines
 	out.push("", "## Trajectory flags", v.trajectory.join("\n") || "(none)");
 	out.push("", "## Spec debt (needs human)", v.specDebt.join("\n") || "(none)");
-	out.push("", `🧪 grader output ดิบ (รายละเอียดแต่ละ criterion) อยู่ใน log: ${v.logPath} — อ่านเองด้วย read ถ้าต้องการ`);
+	out.push("", `🧪 raw grader output (per-criterion detail) is in the log: ${v.logPath} — read it yourself if needed`);
 	return out.join("\n");
 };
 
-/** render ข้อความผลของ zense_review — เดิมคืน reviewer.output.slice(0,4_000) ทั้งก้อน; เหลือ TL;DR + counts + log path
- *  (packet เต็มอยู่ใน details{} และ zense-review-packet card ใน transcript) */
+/** Render zense_review's result text — previously the whole reviewer.output.slice(0,4_000);
+ *  now TL;DR + counts + log path (the full packet lives in details{} and the
+ *  zense-review-packet card in the transcript). */
 export const buildReviewResultText = (opts: { ok: boolean; tlDr: string; trajectoryCount: number; escalationCount: number; logPath: string; errorOutput?: string }): string =>
 	opts.ok
-		? `✅ Review packet พร้อม — เปิดดู review card ใน transcript ได้\n\n${opts.tlDr}\n\ntrajectory flags: ${opts.trajectoryCount} · escalations: ${opts.escalationCount}\n\n🧪 packet เต็ม (ทุก section) อยู่ใน log: ${opts.logPath} — อ่านเองด้วย read ถ้าต้องการรายละเอียด`
+		? `✅ Review packet ready — open the review card in the transcript\n\n${opts.tlDr}\n\ntrajectory flags: ${opts.trajectoryCount} · escalations: ${opts.escalationCount}\n\n🧪 the full packet (every section) is in the log: ${opts.logPath} — read it yourself if needed`
 		: `reviewer failed: ${opts.errorOutput ?? "(no output)"}\n\n🧪 log: ${opts.logPath}`;
 
-/** M (comment discipline, spec v2 ข้อ 3): system-prompt appendix เฉพาะ phase implementation
- *  — ลด output token จาก comment เกินจำเป็น (what-comment / JSDoc boilerplate / banner)
- *  ยึดหลัก "comment = WHY, ไม่ใช่ WHAT" และคุมเฉพาะโค้ดใหม่/บรรทัดที่แก้ — ห้ามแตะ decision-comments เดิมของ repo */
+/** M (comment discipline): system-prompt appendix for the implementation phase only — cuts
+ *  output tokens from excess comments (what-comments / JSDoc boilerplate / banners) with
+ *  "comment = WHY, not WHAT" as the rule, scoped to new/touched lines — existing
+ *  decision-recording comments in the repo stay untouched. */
 export const COMMENT_DISCIPLINE_GUIDELINE = [
 	"Code-comment discipline for this implementation phase (saves tokens; keep the code readable):",
 	"- Comment only the non-obvious: WHY a decision was made, an invariant that must hold, or a trap/edge case.",
@@ -1779,8 +1837,9 @@ export interface PacketParse {
 	tldr: string;
 }
 
-/** W2: validate reviewer packet ตาม schema ตายตัว — ตอนเก่า slice ดิบ 900 ตัวอักษร
- *  packet ที่ไม่มี TL;DR เลยก็ผ่านเงียบๆ. ok เมื่อครบทุก section; missing ใช้เป็น feedback ตอน retry */
+/** W2: validate the reviewer packet against its fixed schema — the old raw 900-char slice
+ *  waved packets with no TL;DR through. ok requires every section; missing drives retry
+ *  feedback. */
 export const parseReviewerPacket = (text: string): PacketParse => {
 	const missing = REVIEW_SECTIONS.filter((s) => !new RegExp(`^##\\s*${escapeRe(s)}\\s*$`, "im").test(text));
 	let tldr = "";
@@ -1793,19 +1852,20 @@ export const parseReviewerPacket = (text: string): PacketParse => {
 	return { ok: missing.length === 0, missing, tldr };
 };
 
-/** r4 (2026-09-02): ตัวตรวจ packet หลอน — ดึง token ที่ "อ้างว่าเป็นของจริง" จาก packet แล้วเช็คว่ามี
- *  อยู่ใน evidence ที่ harness feed จริงไหม (BACKLOG item 5: reviewer เคยแต่ง ENTROPY_TIMEOUT_MINS /
- *  SUB_AGENT_KILLED / commit hash ปลอมขึ้นมาเอง) จับ 3 แบบ: SCREAMING_SNAKE ที่มี _ อย่างน้อย 1 ชุด
- *  (กัน false-positive กับ PASS/FAIL/OVERALL), hex 7-40 ตัว (commit hash), ข้อความใน backtick
- *  — backtick หลายคำ = การเน้นประโยค ไม่ใช่ identifier → ข้าม; backtick คำเดียวที่หน้าตาเป็น path
- *  ให้ผ่านถ้าไฟล์มีจริง (pathExists inject เพื่อ unit-test) */
+/** r4 (2026-09-02): hallucination detector for packets — extract tokens that "claim to be
+ *  real" and check they appear in the evidence the harness actually fed (BACKLOG item 5: a
+ *  reviewer once invented ENTROPY_TIMEOUT_MINS / SUB_AGENT_KILLED / a fake commit hash).
+ *  Catches 3 shapes: SCREAMING_SNAKE with at least one _ (avoids PASS/FAIL/OVERALL
+ *  false positives), 7–40-char hex (commit hashes), backticked text — multi-word backticks =
+ *  prose emphasis, skipped; single-word backticks that look like paths pass when the file
+ *  really exists (pathExists injectable for tests). */
 export const findUngroundedTokens = (packet: string, evidence: string, pathExists: (p: string) => boolean = existsSync): string[] => {
 	const found = new Set<string>();
 	const isPathy = (t: string) => t.includes("/") || /\.[a-z]{1,6}$/i.test(t);
 	for (const m of packet.matchAll(/`([^`\n]+)`/g)) {
 		const t = m[1].trim();
 		if (!t || /\s/.test(t) || evidence.includes(t)) continue;
-		const bare = t.replace(/:\d+$/, ""); // file:line → ตัด :line ก่อน (ไม่งั้น regex นามสกุลไม่แมตช์และ path check ไม่ทำงาน)
+		const bare = t.replace(/:\d+$/, ""); // file:line → drop :line first (else the extension regex can't match and the path check breaks)
 		if (isPathy(bare) && pathExists(bare)) continue;
 		found.add(t);
 	}
@@ -1814,10 +1874,11 @@ export const findUngroundedTokens = (packet: string, evidence: string, pathExist
 	return [...found];
 };
 
-/** eval evidence นี้เป็นของรอบปัจจุบันหรือไม่ — stale เมื่อ spec version เปลี่ยน หรือ tree ที่ eval ไม่ตรง tree ที่กำลัง review
- *  (ใช้ tree SHA ไม่ใช่ commit SHA โดยตั้งใจ: หลัง eval PASS harness repin เป็น tree ที่ reviewer จะเห็นจริง
- *   — ตอน apply-back = tree ของ index (write-tree) — ทำให้รอบปกติไม่ stale ปลอม)
- *  current ไม่ส่งมา (legacy callsite) → ไม่เช็ค เพื่อ backward compat */
+/** Is this eval evidence from the current round? Stale when the spec version changed, or the
+ *  evaluated tree differs from the tree under review (tree SHA, not commit SHA, on purpose:
+ *  after eval PASS the harness repins to the tree the reviewer will actually see — the
+ *  index tree at apply-back (write-tree) — so ordinary rounds don't false-stale).
+ *  No current passed (legacy callsite) → no check, for backward compat. */
 export const isLastEvalStale = (
 	lastEval: { specVersion?: number; head?: string } | undefined,
 	current: { specVersion?: number; head?: string } | undefined,
@@ -1828,10 +1889,12 @@ export const isLastEvalStale = (
 	return false;
 };
 
-/** W2: evidence pack ของ reviewer — packet ต้อง facts-grounded ไม่ใช่เดาจาก intent
- *  (เหตุการณ์จริงก่อนอัปเกรด: packet เขียน \"To be implemented\" ทั้งที่งานเสร็จแล้ว เพราะ prompt มีแค่ intent บรรทัดเดียว)
- *  evidence ต้องเป็นของรอบปัจจุบันเท่านั้น: git summary ถูก scope ด้วย baseline ที่ caller + lastEval ที่ไม่ตรง
- *  spec version/tree ตอน review (freshness) ถูกตัดทิ้งพร้อมคำเตือน — reviewer ห้ามตัดสินจาก evidence เก่า */
+/** W2: the reviewer's evidence pack — the packet must be facts-grounded, not guessed from
+ *  the intent (pre-upgrade incident: a packet wrote "To be implemented" about finished work
+ *  because the prompt held only a one-line intent). Evidence must belong to the current round
+ *  only: git summary is baseline-scoped by the caller, and lastEval mismatching the spec
+ *  version / tree at review time (freshness) is dropped with a warning — the reviewer must
+ *  never judge from stale evidence. */
 export const buildReviewerPrompt = (
 	intent: string,
 	lastEval: { verdict?: string; perCriteria?: Record<string, string>; failedIds?: string[]; probes?: ProbeResult[]; specVersion?: number; head?: string } | undefined,
@@ -1840,12 +1903,13 @@ export const buildReviewerPrompt = (
 	escalations: { kind: string; detail: string }[],
 	gitSummary: string,
 	feedback: string,
-	freshness?: { specVersion?: number; head?: string }, // spec version + tree SHA (HEAD^{tree}) ของ tree ที่กำลัง review
-	criteria?: { id?: string; text: string; check?: string }[], // r2: criteria จริงแบบ verbatim (แทน id=verdict ล้วน)
+	freshness?: { specVersion?: number; head?: string }, // spec version + tree SHA (HEAD^{tree}) of the tree under review
+	criteria?: { id?: string; text: string; check?: string }[], // r2: verbatim criteria (instead of bare id=verdict)
 ): string => {
 	const stale = isLastEvalStale(lastEval, freshness);
 	const ev = stale ? undefined : lastEval;
-	// r2: probes แนบ detail จริง (เดิมย่อเหลือ id:status จน reviewer แต่งรายละเอียดเอง — BACKLOG item 5)
+	// r2: probes carry their real detail (used to be compressed to id:status, letting the
+	// reviewer invent the detail — BACKLOG item 5)
 	const probeLines = (ev?.probes ?? [])
 		.map((p) => `  - ${p.id}: ${p.status}${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""} — ${p.detail.split("\n")[0].slice(0, 160)}`)
 		.join("\n");
@@ -1875,10 +1939,11 @@ export const buildReviewerPrompt = (
 	(feedback ? `\n\nSYSTEM FEEDBACK: your previous packet was rejected: ${feedback}. Output the full corrected packet with all headers.` : "");
 };
 
-/** คำนำหน้า git evidence ของ reviewer หลัง apply-back (ADR-003): บอกชัดว่า changes เป็น
- *  staged-but-uncommitted ภายใต้ pendingApply รอมนุษย์ commit (กัน reviewer เข้าใจผิดว่า main ถูก commit แล้ว
- *  — "no new commits since baseline" เป็นเรื่องปกติของ flow นี้) + note กรณีมนุษย์แก้ไฟล์หลัง eval+apply
- *  (index tree ≠ pinned tree). pure builder → unit-test ได้ใน test/eval-review.test.mjs */
+/** Preamble to the reviewer's git evidence after apply-back (ADR-003): states plainly that
+ *  changes are staged-but-uncommitted under pendingApply awaiting a human commit (stops the
+ *  reviewer from assuming main was committed — "no new commits since baseline" is normal in
+ *  this flow) + a note for human edits after eval+apply (index tree ≠ pinned tree).
+ *  Pure builder → unit-tested in test/eval-review.test.mjs */
 export const buildPendingApplyEvidencePrefix = (pendingApply: boolean, humanEdited: boolean): string =>
 	(pendingApply
 		? 'NOTE: the git evidence below shows staged, uncommitted changes in the main working tree (by design — a human commits after this review; "no new commits since baseline" is expected).\n'
@@ -1947,11 +2012,12 @@ const subagentLogPath = (cwd: string, role: string): string => {
 
 /**
  * Spawn an isolated pi sub-agent (--mode json) with a clean context.
- * stdio ignores stdin — ปล่อย stdin pipe ค้างไว้จะทำให้ pi รอ EOF จนหมดเวลา
- * (bug เดิม: execFile ค้างเงียบๆ จนโดน SIGTERM). ใช้ --mode json ไม่ใช่ print เพราะ print mode
- * buffer stdout ทั้งก้อนแล้วปล่อยทีเดียวตอนจบ (ทดลองแล้ว: chunk เดียวก่อน close — log ดูเหมือนค้าง
- * จนงานเสร็จ) ส่วน json mode เป็น JSONL event stream ที่ไหลตั้งแต่ต้น → parse event เป็น text
- * เขียน log live ทุก chunk เพื่อให้ user tail ดูระหว่างรันได้ (/zense agents หรือ ctrl+_).
+ * stdio ignores stdin — leaving the stdin pipe open makes pi wait for EOF until
+ * the timeout (old bug: execFile hung silently until SIGTERM). --mode json, not print:
+ * print mode buffers stdout whole and releases it at exit (tested: one chunk right
+ * before close — the log looks frozen until the very end), while json mode streams
+ * JSONL events from the start → parsed into text and appended live to the log so the
+ * user can tail it during the run (/zense agents or ctrl+_).
  */
 function runSubagent(
 	role: string,
@@ -1960,13 +2026,13 @@ function runSubagent(
 	timeoutMs = subagentTimeout("default", cwd),
 	onChunk?: (chunk: string) => void,
 	logPath: string = subagentLogPath(cwd, role),
-	modelPattern?: string,           // pi --model pattern (เช่น "anthropic/claude-sonnet") — undefined = ปล่อย pi ใช้ default
-	excludeTools?: string[],         // C: role read-only (requirements) → ["write","edit"] (ดู SUBAGENT_EXCLUDE_TOOLS)
-	stripFlags?: string[],           // ext-config: resolved จาก subagentStripFlags(role, subCwd, ctx.cwd) — undefined = built-in map
+	modelPattern?: string,           // pi --model pattern (e.g. "anthropic/claude-sonnet") — undefined = pi default
+	excludeTools?: string[],         // C: read-only roles (requirements) → ["write","edit"] (see SUBAGENT_EXCLUDE_TOOLS)
+	stripFlags?: string[],           // ext-config: resolved from subagentStripFlags(role, subCwd, ctx.cwd) — undefined = built-in map
 ): Promise<{ ok: boolean; output: string; logPath: string; usedModel?: string }> {
 	const relLog = relative(cwd, logPath);
 	return new Promise((res) => {
-		// M: ส่ง role เข้า argv builder เพื่อให้ได้ strip flags ของ role นั้น — log header echo flag จริงเพื่อ audit ได้ในภายหลัง
+		// M: pass role into the argv builder for that role's strip flags — the log header echoes them for later audit
 		const argv = buildSubagentArgv(task, modelPattern, excludeTools, role, stripFlags);
 		const strip = stripFlags ?? SUBAGENT_STRIP_FLAGS[role];
 		writeFileSync(logPath, `$ pi --mode json --no-session${strip?.length ? ` ${strip.join(" ")}` : ""}${excludeTools?.length ? ` --exclude-tools ${excludeTools.join(",")}` : ""}${modelPattern ? ` --model ${modelPattern}` : ""} <task ${task.length} chars>\n--- live output (${role}) ---\n`);
@@ -1975,15 +2041,15 @@ function runSubagent(
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let out = "";
-		let usedModel: string | undefined; // 'provider/id' ของ assistant message แรก — ใช้เทียบ model ที่ config ไว้
-		let finalText = ""; // assistant text ล่าสุดจาก message_end — ใช้เป็น output ตอนสำเร็จ แทน tail ของ raw stdout
+		let usedModel: string | undefined; // 'provider/id' of the first assistant message — compared against the configured model
+		let finalText = ""; // latest assistant text from message_end — the success output, instead of a raw stdout tail
 		const append = (chunk: string) => {
 			out = (out + chunk).slice(-1_000_000);
 			appendFileSync(logPath, chunk);
 			onChunk?.(chunk);
 		};
-		// JSONL parser: stdout เป็น event-per-line แต่ chunk อาจตัดกลางบรรทัด → buffer แยกด้วย \n
-		// event ที่ parse ไม่ได้ (noise/ERROR ก่อน session เริ่ม) append ดิบไว้เหมือนเดิม ไม่ให้หาย
+		// JSONL parser: stdout is event-per-line but chunks may split mid-line → buffer split by \n;
+		// unparseable events (noise/ERROR lines before the session starts) are appended raw, never dropped
 		let lineBuf = "";
 		const fmtArgs = (args: unknown): string => {
 			try {
@@ -2017,16 +2083,18 @@ function runSubagent(
 					break;
 				}
 				case "message_update": {
-					// stream delta — เขียนเฉพาะ text (ข้าม thinking/toolcall delta เพื่อให้ log อ่านง่าย)
+					// stream delta — text only (thinking/toolcall deltas skipped, keeps the log readable)
 					const a = (ev as { assistantMessageEvent?: { type?: string; delta?: string } }).assistantMessageEvent;
 					if (a?.type === "text_delta" && typeof a.delta === "string") append(a.delta);
 					break;
 				}
 				case "message_end": {
-					// จับ final assistant text (เฉพาะ content type text — ข้าม thinking) ไว้เป็น output ตอนสำเร็จ
-					// json mode แนบ message บน top-level field (pi dist/modes/json-event.js — เฉพาะ update events เท่านั้น
-					// ที่ถูกห่อเป็น assistantMessageEvent; โค้ดเดิมอ่านผิด field ทำให้ finalText/usedModel ไม่เคยถูกจับ
-					// → output หล่นเป็น raw tail ที่มี tool-noise ปน = สาเหตุ compile_spec parse draft ไม่เจอบางรอบ)
+					// capture the final assistant text (content type text only — thinking skipped) as the
+					// success output. json mode puts the message on a top-level field (pi
+					// dist/modes/json-event.js — only update events are wrapped as assistantMessageEvent;
+					// the old code read the wrong field so finalText/usedModel were never captured
+					// → output fell back to a raw tail with tool noise mixed in = the reason some
+					// compile_spec rounds couldn't parse a draft)
 					type JsonMsg = { role?: string; provider?: string; model?: string; content?: { type?: string; text?: string }[] };
 					const boxed = ev as { message?: JsonMsg; assistantMessageEvent?: JsonMsg };
 					const msg = boxed.message ?? boxed.assistantMessageEvent;
@@ -2036,7 +2104,7 @@ function runSubagent(
 						const text = msg.content.filter((c) => c?.type === "text" && typeof c.text === "string").map((c) => c.text).join("");
 						if (text.trim()) {
 							finalText = text;
-							append("\n"); // คั่นบรรทัดหลังจบข้อความ assistant
+							append("\n"); // newline after each assistant message
 						}
 					}
 					break;
@@ -2052,10 +2120,11 @@ function runSubagent(
 			for (const line of lines) handleLine(line);
 		});
 		child.stderr?.on("data", (d) => append(String(d)));
-		// A (2026-09-02): timedOut เป็น flag ที่ set ใน timer callback — ห้ามเช็คจาก signal อีกต่อไป
-		// เพราะ pi จับ SIGTERM เองแล้ว exit(143) → close ได้ code=143 signal=null ทำให้เงื่อนไข
-		// signal==="SIGTERM" เดิมไม่เคยจริง = timeout ทุกครั้งถูกรายงานเป็น "exited code=143" ลึกลับ
-		// SIGKILL backstop 5s: กัน pi ค้างใน tool call ยาวไม่ยอมตายหลังรับ SIGTERM
+		// A (2026-09-02): timedOut is a flag set by the timer callback — never inspect the signal:
+		// pi catches SIGTERM itself and exit(143)s → close arrives with code=143, signal=null, so
+		// the old signal==="SIGTERM" check never fired = every timeout got reported as a
+		// mysterious "exited code=143".
+		// SIGKILL backstop after 5s: covers pi hanging in a long tool call after SIGTERM
 		let timedOut = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const timer = setTimeout(() => {
@@ -2071,7 +2140,7 @@ function runSubagent(
 		child.on("close", (code, signal) => {
 			clearTimeout(timer);
 			clearTimeout(killTimer);
-			if (lineBuf.trim()) handleLine(lineBuf); // flush บรรทัดค้างท้าย stream
+			if (lineBuf.trim()) handleLine(lineBuf); // flush a trailing unterminated line
 			appendFileSync(logPath, `\n--- exited code=${code} signal=${signal}${timedOut ? " (timeout SIGTERM)" : ""} ---\n`);
 			appendFileSync(logPath, `--- used model: ${usedModel ?? "(not captured from events)"} ---\n`);
 			const modelInfo = usedModel !== undefined ? { usedModel } : {};
@@ -2089,7 +2158,7 @@ function runSubagent(
 	});
 }
 
-// ----------------------------------------------------------------------------- memory summary (module scope — export เพื่อ unit-test ได้)
+// ----------------------------------------------------------------------------- memory summary (module scope — exported for unit tests)
 
 export interface MemoryAgg {
 	total: number;
@@ -2120,9 +2189,10 @@ export const aggregateMemory = (cwd: string): MemoryAgg => {
 		if ((m = note.match(/^escalation: ([\w-]+):/))) bump(agg.esc, m[1]);
 		else if (note.startsWith("flag: ")) bump(agg.flags, note.slice(6).slice(0, 60));
 		else if ((m = note.match(/^eval: (.*)/)))
-			// เนื้อบทเรียนจาก /zense distill ห้ามตัด 60 ตัวอักษร — สัญญาคือ feed เข้า compile_spec "ครบ";
-			// prefix "distilled · " ถูกผูก 2 ฝั่ง (buildDistilledMemory เขียน / ตรงนี้อ่าน) — แก้ฝั่งเดียว
-			// = บทเรียนตกไป misc หรือโดน truncate เงียบๆ (ค้นคู่กันด้วยสตริง "distilled · ")
+			// distilled lessons (from /zense distill) must not be truncated to 60 chars — the
+			// promise is they feed compile_spec in full; the "distilled · " prefix is coupled at
+			// two places (buildDistilledMemory writes / here it reads) — changing only one side
+			// sends lessons to misc or truncates them silently (search both for "distilled · ")
 			agg.evals.push(m[1].startsWith("distilled · ") ? m[1] : m[1].slice(0, 60));
 		else if ((m = note.match(/^sub-agent failed: (\w+)/))) bump(agg.subFails, m[1]);
 		else agg.misc++;
@@ -2133,7 +2203,7 @@ export const aggregateMemory = (cwd: string): MemoryAgg => {
 export const topEntries = (m: Map<string, number>, n: number): string =>
 	[...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, c]) => `${k} ×${c}`).join(", ");
 
-/** สรุปแบบกลุ่ม — ใช้ทั้งโชว์ใน /zense memory และ feed เข้า requirements sub-agent */
+/** Grouped summary — shown in /zense memory and fed to the requirements sub-agent */
 export const memorySummaryLines = (cwd: string): string[] => {
 	const agg = aggregateMemory(cwd);
 	if (!agg.total) return [];
@@ -2170,25 +2240,26 @@ const dirFileStats = (dir: string): { files: number; bytes: number } => {
 				bytes += st.size;
 			}
 		} catch {
-			/* ข้ามไฟล์ที่ stat ไม่ได้ */
+			/* skip unstatable files */
 		}
 	}
 	return { files, bytes };
 };
 
-/** สถิติผลกระทบสำหรับ confirm dialog ของ /zense distill — นับ memory/specs/subagents แบบอ่านอย่างเดียว */
+/** Impact stats for the /zense distill confirm dialog — read-only counts of memory/specs/subagents */
 export const distillImpact = (cwd: string): DistillImpact => {
 	const zd = zenseDir(cwd);
 	const mem = join(zd, "memory.jsonl");
 	let memoryLines = 0;
 	let memoryBytes = 0;
 	if (existsSync(mem)) {
-		// TOCTOU/permission: file หายหรืออ่านไม่ได้ระหว่าง existsSync → readFileSync นับเป็น 0 เหมือน policy ของ dirFileStats
+		// TOCTOU/permission: the file may vanish or become unreadable between existsSync and
+		// readFileSync — count 0, same policy as dirFileStats
 		try {
 			memoryBytes = statSync(mem).size;
 			memoryLines = readFileSync(mem, "utf8").split("\n").filter((l) => l.trim()).length;
 		} catch {
-			/* นับเป็น 0 */
+			/* count as 0 */
 		}
 	}
 	const sp = dirFileStats(join(zd, "specs"));
@@ -2199,42 +2270,45 @@ export const distillImpact = (cwd: string): DistillImpact => {
 export const fmtBytes = (n: number): string => (n >= 1_048_576 ? `${(n / 1_048_576).toFixed(1)}MB` : n >= 1024 ? `${(n / 1024).toFixed(1)}KB` : `${n}B`);
 
 /**
- * parse + validate output ของ distiller sub-agent — contract: {"lessons": ["...", ...]}
- * (ใช้ extractJsonObject ตัวเดียวกับ requirements draft → ทน prose/fence ที่ model ชอบแถม)
- * เข้ม: 1..50 บทเรียน, ทุกข้อ string ไม่ว่าง, ≤400 ตัวอักษร (บรรทัดเดียว — JSONL ห้ามมี newline ใน note)
- * เพดานตั้งใจ lenient กว่าที่ prompt สั่ง (5-30 ข้อ/≤180 ตัวอักษร) เพื่อไม่ abort โดยไม่จำเป็น — ปลอดภัยเพราะ
- * เนื้อถูก feed เข้า compile_spec ครบ (aggregateMemory ไม่ truncate prefix "distilled · ")
- * invalid ใด ๆ → ok:false →ผู้เรียกต้อง abort (ห้ามลบ/เขียนทับ)
+ * Parse + validate distiller-sub-agent output — contract: {"lessons": ["...", ...]}
+ * (reuses requirements' extractJsonObject → tolerant of the prose/fences models love).
+ * Strict: 1–50 lessons, each a non-empty string, ≤400 chars (one line — JSONL notes can't
+ * contain newlines). The ceiling is deliberately more lenient than the prompt asks (5–30
+ * items/≤180 chars) to avoid needless aborts — safe because content feeds compile_spec in
+ * full (aggregateMemory never truncates the "distilled · " prefix).
+ * Any invalid → ok:false and the caller MUST abort (never delete/overwrite).
  */
 export const parseDistilledLessons = (text: string): { ok: true; lessons: string[] } | { ok: false; error: string } => {
 	const raw = extractJsonObject(text);
 	if (raw === undefined || typeof raw !== "object" || raw === null || Array.isArray(raw))
-		return { ok: false, error: 'output ไม่ใช่ JSON object (ต้องการ {"lessons": [...]})' };
+		return { ok: false, error: 'output is not a JSON object (expected {"lessons": [...]})' };
 	const ls = (raw as Record<string, unknown>).lessons;
-	if (!Array.isArray(ls) || ls.length === 0) return { ok: false, error: "lessons ต้องเป็น array ที่มีอย่างน้อย 1 รายการ" };
-	if (ls.length > 50) return { ok: false, error: `lessons มี ${ls.length} รายการ — เกินเพดาน 50 (สั่งไว้ 5-30)` };
+	if (!Array.isArray(ls) || ls.length === 0) return { ok: false, error: "lessons must be an array with at least 1 item" };
+	if (ls.length > 50) return { ok: false, error: `lessons has ${ls.length} items — over the 50 ceiling (asked for 5-30)` };
 	const lessons: string[] = [];
 	for (let i = 0; i < ls.length; i++) {
 		const l = ls[i];
-		if (typeof l !== "string" || !l.trim()) return { ok: false, error: `lessons[${i}] ว่างหรือไม่ใช่ string` };
+		if (typeof l !== "string" || !l.trim()) return { ok: false, error: `lessons[${i}] is empty or not a string` };
 		const t = l.trim().replace(/\s+/g, " ");
-		if (t.length > 400) return { ok: false, error: `lessons[${i}] ยาว ${t.length} ตัวอักษร — เกินเพดาน 400` };
+		if (t.length > 400) return { ok: false, error: `lessons[${i}] is ${t.length} chars — over the 400 ceiling` };
 		lessons.push(t);
 	}
 	return { ok: true, lessons };
 };
 
 /**
- * แปลงบทเรียนกลับเป็นเนื้อ memory.jsonl — entry {at, phase, note} ตาม format เดิมทุกประการ
- * (สัญญากับผู้ใช้: ไม่แก้ตัวอ่าน aggregateMemory/memorySummaryLines)
- * note ใช้ prefix "eval: distilled · " โดยเจตนา: เป็นช่องเดียวใน parser เดิมที่ส่ง *เนื้อ* ของ
- * ทุก entry เข้า memorySummaryLines (eval history join ทุกบรรทัด) → บทเรียนที่กลั่นแล้วยัง
- * feed เข้า requirements sub-agent ตอน compile_spec ครบเหมือนเดิม ไม่หล่นไปกอง misc ที่โชว์แค่จำนวน
+ * Turn lessons back into memory.jsonl lines — same {at, phase, note} entry format as always
+ * (the promise to users: the readers aggregateMemory/memorySummaryLines never change).
+ * The note takes the "eval: distilled · " prefix on purpose: of the existing parser channels
+ * it's the only one that forwards the *text* of every entry into memorySummaryLines (eval
+ * history joins every line) → distilled lessons still feed the requirements sub-agent in full
+ * at compile_spec instead of landing in the misc pile that only shows a count.
  */
 export const buildDistilledMemory = (lessons: string[], now: number = Date.now()): string =>
 	lessons.map((note) => JSON.stringify({ at: now, phase: "maintenance", note: `eval: distilled · ${note}` })).join("\n") + "\n";
 
-/** ลบไฟล์ทั้งหมดใน dir (ชั้นเดียว ไม่ recursive) ยกเว้นชื่อใน keep — คืนจำนวนที่ลบจริง */
+/** Delete every file in dir (one level, not recursive) except names in keep — returns the
+ *  count actually deleted. */
 export const clearDirFiles = (dir: string, keep: ReadonlySet<string> = new Set()): number => {
 	if (!existsSync(dir)) return 0;
 	let n = 0;
@@ -2247,24 +2321,27 @@ export const clearDirFiles = (dir: string, keep: ReadonlySet<string> = new Set()
 				n++;
 			}
 		} catch {
-			/* ข้ามไฟล์ที่ลบไม่ได้ */
+			/* skip undeletable files */
 		}
 	}
 	return n;
 };
 
-/** เพดาน memory.jsonl ที่จะฝังเข้า prompt ของ distiller ทั้งก้อน — เกินนี้ให้ abort ก่อน (ไม่ให้กลั่นจาก history บางส่วนเงียบๆ) */
+/** Ceiling on memory.jsonl size embeddable whole into the distiller prompt — beyond this,
+ *  abort first (never distill silently from partial history). */
 export const MAX_DISTILL_MEMORY_BYTES = 250_000;
 
-/** เขียนทับไฟล์แบบ atomic: tmp ข้างๆ + rename (fs เดียวกัน) — process ตายกลางเขียนไฟล์เดิมไม่เสียหาย */
+/** Atomic file overwrite: sibling tmp + rename (same fs) — a mid-write crash can't corrupt
+ *  the original. */
 export const replaceFileAtomic = (path: string, content: string): void => {
 	const tmp = `${path}.${process.pid}.tmp`;
 	writeFileSync(tmp, content);
 	renameSync(tmp, path);
 };
 
-/** prompt ของ distiller sub-agent — เนื้อ log ฝัง inline เต็มก้อน (read tool ของ pi ตัดไฟล์ยาว ทำกลั่นจาก
- *  history บางส่วนเงียบๆ) — sub-agent ไม่ต้องเปิดไฟล์เอง เหลือแค่คืน JSON เดียว */
+/** Distiller-sub-agent prompt — the log is embedded inline in full (pi's read tool truncates
+ *  long files, which would distill silently from partial history) — the sub-agent opens
+ *  nothing, just returns one JSON. */
 export const distillTaskPrompt = (memoryContent: string, totalLines: number): string =>
 	`You are the DISTILLER sub-agent for a spec-gated SDLC harness. The FULL learning log is inlined below, between the markers — do not try to read any file.\n` +
 	`It is JSONL, one {at, phase, note} object per line (${totalLines} entries), accumulated from escalations, trajectory flags, eval verdicts and sub-agent failures.\n\n` +
@@ -2280,8 +2357,9 @@ export const distillTaskPrompt = (memoryContent: string, totalLines: number): st
 // ----------------------------------------------------------------------------- sub-agent model config (per-role)
 
 /**
- * อ่าน .zense/models.json — map role → pi --model pattern (เช่น "anthropic/claude-sonnet",
- * "openai/gpt-4o-mini", "sonnet:high"). ไม่มีไฟล์/parse ไม่ได้ → {} (ใช้ model ของ agent หลักแทน).
+ * Read .zense/models.json — role → pi --model pattern map (e.g. "anthropic/claude-sonnet",
+ * "openai/gpt-4o-mini", "sonnet:high"). Missing/unparseable → {} (the main agent's model
+ * is used instead).
  */
 export const readModelsConfig = (cwd: string): Record<string, string> => {
 	const f = join(zenseDir(cwd), "models.json");
@@ -2300,9 +2378,9 @@ export const readModelsConfig = (cwd: string): Record<string, string> => {
 };
 
 /**
- * Resolve model pattern สำหรับ role ตามลำดับ: .zense/models.json[role] →
- * ctx.model (provider/id ของ agent หลัก) → undefined (ปล่อย pi ใช้ default).
- * undefined จะทำให้ runSubagent ไม่ส่ง --model ไป
+ * Resolve the model pattern for a role, in order: .zense/models.json[role] → ctx.model
+ * (the main agent's provider/id) → undefined (let pi use its default).
+ * undefined means runSubagent sends no --model.
  */
 export const resolveModelPattern = (cwd: string, role: string, mainModel?: { provider: string; id: string }): string | undefined => {
 	const cfg = readModelsConfig(cwd);
@@ -2313,8 +2391,9 @@ export const resolveModelPattern = (cwd: string, role: string, mainModel?: { pro
 };
 
 /**
- * เขียน/ลบ model override ของ role หนึ่งใน .zense/models.json — สร้าง dir ให้ถ้ายังไม่มี,
- * คง key อื่นของไฟล์เดิมไว้ (อ่าน raw เอง เพราะ readModelsConfig ตัดค่าที่ไม่ใช่ string ทิ้ง)
+ * Write/remove one role's model override in .zense/models.json — creates the dir as needed,
+ * preserves the file's other keys (reads the raw file itself because readModelsConfig drops
+ * non-string values).
  */
 export const writeModelsConfig = (cwd: string, role: string, pattern: string | null): void => {
 	const dir = zenseDir(cwd);
@@ -2326,7 +2405,7 @@ export const writeModelsConfig = (cwd: string, role: string, pattern: string | n
 			const raw = JSON.parse(readFileSync(f, "utf8"));
 			if (raw && typeof raw === "object") cfg = raw as Record<string, unknown>;
 		} catch {
-			/* malformed เดิม — เริ่มจาก {} ใหม่ */
+			/* previously malformed — start from a fresh {} */
 		}
 	}
 	if (pattern && pattern.trim()) cfg[role] = pattern.trim();
@@ -2335,8 +2414,8 @@ export const writeModelsConfig = (cwd: string, role: string, pattern: string | n
 };
 
 /**
- * รายการ model ที่เลือกได้สำหรับ picker: scopedModels ของ session ก่อน (mirror ของ /model picker)
- * ถ้าไม่มี scoping ค่อย fallback เป็น catalogue ทั้งหมดจาก modelRegistry.getAvailable()
+ * Model choices for the picker: the session's scopedModels first (mirror of the /model
+ * picker); without scoping, fall back to the full modelRegistry.getAvailable() catalogue.
  */
 const availableModelChoices = (ctx: ExtensionContext): { pattern: string; label: string; description: string }[] => {
 	try {
@@ -2361,13 +2440,15 @@ const availableModelChoices = (ctx: ExtensionContext): { pattern: string; label:
 	}
 };
 
-/** panelize(theme, lines, w): ทำให้ dialog "ลอย" ออกจาก transcript: pad ทุกบรรทัดเต็มความกว้าง w (นับด้วย visibleWidth —
- *  ANSI escape ไม่กินจอ) แล้วทาพื้นหลังด้วย theme.bg("selectedBg") — token เดียวกับ
- *  user message bubble ของ pi จึงตาม theme dark/light อัตโนมัติ (ห้าม hardcode ANSI/hex เอง)
- *  theme.bg() reset เฉพาะ SGR 49 (bg) เลยไม่กินสี fg ภายในบรรทัด
- *  theme param เป็น structural type — inject fake theme.bg ใน unit-test ได้โดยไม่ต้อง import Theme class */
-//  generic บน color param — Theme จริงคือ (color: ThemeBg) => string ซึ่ง assign ไม่เข้า (color: string)
-//  เพราะ contravariance; "selectedBg" อยู่ใน ThemeBg union อยู่แล้วจึง cast ปลอดภัย (test fake ใช้ string ได้เหมือนเดิม)
+/** panelize(theme, lines, w): makes a dialog "float" over the transcript: pads every line to
+ *  full width w (measured with visibleWidth — ANSI escapes take no screen) and backgrounds it
+ *  with theme.bg("selectedBg") — the same token pi's user-message bubble uses, so it follows
+ *  dark/light themes automatically (never hardcode ANSI/hex). theme.bg() resets only SGR 49
+ *  (bg), leaving in-line fg colors intact. The theme param is structural — a fake theme.bg is
+ *  injectable in unit tests without importing the Theme class. */
+//  generic over the color param — the real Theme is (color: ThemeBg) => string, unassignable
+//  to (color: string) by contravariance; "selectedBg" is a ThemeBg member so the cast is safe
+//  (test fakes passing plain strings still work)
 export const panelize = <T extends string>(theme: { bg: (color: T, text: string) => string }, lines: string[], w: number): string[] =>
 	lines.map((ln) => theme.bg("selectedBg" as T, ln + " ".repeat(Math.max(0, w - visibleWidth(ln)))));
 
@@ -2392,25 +2473,25 @@ export default function (pi: ExtensionAPI) {
 			.join("\n---\n")
 			.slice(0, 12_000);
 
-	// ----- git worktree helpers (per-session isolation: redirect ทุก tool call ของ main
-	//       agent เข้า worktree จนกว่า eval PASS จะ merge กลับ — กัน 2 session เขียนทับกัน)
-	// (git helpers gitOk/createWorktree/applyWorktreeBack/discardPendingApply อยู่ที่ module scope เพื่อ export ให้ test ได้)
+	// ----- git worktree isolation (per-session: every main-agent tool call is redirected into
+	//       the worktree until eval PASS applies it back — two sessions can't stomp each other)
+	// (git helpers gitOk/createWorktree/applyWorktreeBack/discardPendingApply live at module scope for tests)
 
-	/** fullscreen default ให้คนติดตั้ง pi-zense โดยไม่ต้อง setup เอง: ตั้งครั้งเดียวต่อ file-ตอน key ยังว่าง
-	 *  interactive TUI เท่านั้น (sub-agent bail ตั้งแต่ต้น factory ด้วย PI_ZENSE_SUBAGENT แล้ว) — best-effort,
-	 *  ห้ามให้ startup ของ harness พังเพราะเขียน settings ไม่ได้ */
+	/** Fullscreen default so pi-zense installs require no manual setup: set once, only when the
+	 *  key is absent, interactive TUI only (sub-agents bail at factory start via
+	 *  PI_ZENSE_SUBAGENT) — best-effort; a settings-write failure must never break startup. */
 	const ensureFullscreenDefault = (ctx: ExtensionContext): void => {
 		if (ctx.mode !== "tui") return;
 		try {
 			const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
 			const raw = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : undefined;
 			const merged = applyFullscreenDefault(raw);
-			if (!merged || !merged.changed) return; // null=ไฟล์เดิมเสีย (ข้าม), !changed=user เลือกเองแล้ว (respect)
+			if (!merged || !merged.changed) return; // null = corrupt existing file (skip); !changed = user already chose (respect)
 			mkdirSync(dirname(settingsPath), { recursive: true });
 			writeFileSync(settingsPath, merged.text);
-			learn(ctx, "fullscreen default: tuiMode=fullscreen (install default — มีผล pi ครั้งถัดไป)");
+			learn(ctx, "fullscreen default: tuiMode=fullscreen (install default — takes effect on the next pi launch)");
 			ctx.ui.notify(
-				"🖥 zense: ตั้ง fullscreen TUI mode เป็น default ใน ~/.pi/agent/settings.json แล้ว — มีผล pi ครั้งถัดไป (สลับ session นี้ทันที: /settings → TUI mode; ไม่ต้องการ: เปลี่ยนค่า tuiMode ในไฟล์เดียวกัน)",
+				"🖥 zense: fullscreen TUI mode is now the default in ~/.pi/agent/settings.json — takes effect on the next pi launch (this session: /settings → TUI mode; to opt out: change tuiMode in that file)",
 				"info",
 			);
 		} catch {
@@ -2420,10 +2501,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_ev, ctx) => {
 		ensureFullscreenDefault(ctx);
-		// ESC guard: (re-)register ทุก session_start — pi ล้าง extension input listeners ตอน session
-		// invalidate/reload (resetExtensionUI) ทำให้ listener เก่าหาย; unsubscribe ref เดิมก่อนเป็น no-op
-		// ที่ปลอดภัย (pi-tui เก็บ listeners เป็น Set + หัว function เดิม → ไม่ซ้ำ/ไม่พัง)
-		escGuard.reset(); // overlay ของ session ก่อนถูก pi pop ทิ้งไปแล้ว — อย่าให้ entry ค้างกิน ESC ของ session ใหม่
+		// ESC guard: (re-)register on every session_start — pi clears extension input listeners
+		// on session invalidation/reload (resetExtensionUI), dropping the old listener; calling
+		// the old unsubscribe first is a safe no-op (pi-tui keeps a Set keyed by function → no
+		// duplicates, no crashes)
+		escGuard.reset(); // the previous session's overlays were popped by pi — don't let stale entries eat the new session's ESC
 		if (ctx.mode === "tui") {
 			escGuardUnsubscribe?.();
 			escGuardUnsubscribe = ctx.ui.onTerminalInput(escGuard.handleInput);
@@ -2431,23 +2513,25 @@ export default function (pi: ExtensionAPI) {
 		for (const e of ctx.sessionManager.getEntries())
 			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
-		lastWidget = undefined; // pi ล้าง widget ตอน session switch/reload → ต้องส่งใหม่แม้ข้อความเดิม
-		// reconcile pendingApply ข้าม session/restart: change ที่ apply ค้างไว้ยัง staged อยู่ใน main ไหม
+		lastWidget = undefined; // pi clears widgets on session switch/reload → resend even identical text
+		// reconcile pendingApply across sessions/restarts: is the applied change still staged in main?
 		if (state.pendingApply) {
 			const pa = state.pendingApply;
 			if (gitOk(["diff", "--cached", "--quiet"], ctx.cwd).ok) {
-				// index ว่างแล้ว → มนุษย์ commit เองหรือทิ้งเองนอก flow → ล้าง pointer เงียบๆ + เก็บกวาดไฟล์ช่วยค้าง
-				learn(ctx, `pendingApply reconcile: spec v${pa.specVersion} — index ว่างแล้ว (commit/discard นอก flow)`);
+				// index is empty → the human committed or dropped it outside the flow → clear the
+				// pointer quietly + sweep the helper files
+				learn(ctx, `pendingApply reconcile: spec v${pa.specVersion} — index is empty (committed/discarded outside the flow)`);
 				state.pendingApply = undefined;
 				rmSync(join(zenseDir(ctx.cwd), PENDING_PATCH), { force: true });
 				rmSync(join(zenseDir(ctx.cwd), PENDING_MSG), { force: true });
-				// เดิม 'ล้าง pointer เงียบๆ' = agent หลงว่างานค้าง + version รันต่อ — ตอนนี้บอกผ่าน bulletin + reset cycle
+				// a silent clear used to leave the agent believing work was still pending (and the
+				// version counter running on) — now announced via bulletin + cycle reset
 				state.contextBulletin = buildReconcileBulletin(pa.specVersion);
 				resetCycleState(state);
 				persist();
 			} else {
 				ctx.ui.notify(
-					`⏳ zense: มี change จาก spec v${pa.specVersion} (${pa.paths.length} ไฟล์) ค้าง staged ใน main รอ commit — review แล้ว git commit -F .zense/pending-apply.msg · รับงานหลัง commit → /zense accept · ไม่พอใจ → /zense discard (reverse patch)`,
+					`⏳ zense: changes from spec v${pa.specVersion} (${pa.paths.length} file(s)) are staged in main awaiting a commit — review, then git commit -F .zense/pending-apply.msg · after committing → /zense accept · unhappy → /zense discard (reverse patch)`,
 					"warning",
 				);
 			}
@@ -2460,10 +2544,10 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
-	/** cache ข้อความ widget ล่าสุดที่ส่งจริง — setWidget สร้าง Text/Container ใหม่ทุกครั้ง
-	 *  แม้เนื้อหาเหมือนเดิม ทำให้ dock ใต้ transcript relayout ซ้ำๆ ตอน sub-agent รัน (tick 2s
-	 *  + hook ต่างๆ เรียก updateWidget ถี่) → view กระตุก/เด้ง. dedupe ที่ระดับ string:
-	 *  ส่ง setWidget เฉพาะตอนข้อความเปลี่ยนจริงเท่านั้น (fields ยังครบเหมือนเดิม ไม่ truncate). */
+	/** Cache of the widget text last actually sent — setWidget builds fresh Text/Container
+	 *  components even for identical content, making the dock below the transcript relayout
+	 *  during sub-agent runs (2s tick + hooks call updateWidget often) → the view jitters.
+	 *  Dedupe at string level: setWidget only when the text really changed. */
 	let lastWidget: string | undefined;
 
 	const updateWidget = (ctx: ExtensionContext) => {
@@ -2473,24 +2557,26 @@ export default function (pi: ExtensionAPI) {
 		const line =
 			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
 			` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
-			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+_ ดูสด)` : "") +
+			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+_ live)` : "") +
 			(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
 			(state.pendingApply ? ` · ⏳staged v${state.pendingApply.specVersion}` : "") +
 			(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 			(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : "");
-		if (line === lastWidget) return; // เนื้อหาเดิม → ไม่ rebuild component (กัน dock relayout)
+		if (line === lastWidget) return; // same content → don't rebuild the component (prevents dock relayout)
 		lastWidget = line;
 		ctx.ui.setWidget("zense", [line]);
 	};
 
-	/** redirect tool call ของ main agent เข้า worktree (mutate event.input) — ทำให้ agent
-	 *  ทำงานใน worktree โดยไม่รู้ตัว. sub-agent เป็นคนละ process จึงไม่ถูกตัวนี้ (และใช้ cwd ของมันเอง). */
+	/** Redirect main-agent tool calls into the worktree (mutates event.input) — the agent
+	 *  works inside the worktree without knowing. Sub-agents are separate processes and
+	 *  unaffected (they carry their own cwd). */
 	const applyRedirect = (ev: any, ctx: ExtensionContext) => {
 		let wt = state.worktree;
-		// self-heal: worktree ถูก apply/ลบนอก flow (เช่น applyWorktreeBack ถูกเรียกด้วยมือหลัง auto-apply พลาด)
-		// → pointer ค้างใน session state ทำทุก bash โดนต่อ "cd <wtRoot>" ที่ไม่มีแล้ว — ถ้า dir หายไปให้ล้างเงียบๆ
+		// self-heal: the worktree got applied/deleted outside the flow (e.g. applyWorktreeBack
+		// called manually after an auto-apply miss) → a stale pointer would prefix every bash
+		// with a "cd <wtRoot>" that no longer exists — clear silently when the dir is gone
 		if (wt && !existsSync(wt.root)) {
-			learn(ctx, "worktree self-heal: " + wt.root + " ไม่มีแล้ว (merge นอก flow?) — ล้าง pointer ที่ค้าง");
+			learn(ctx, "worktree self-heal: " + wt.root + " is gone (applied out-of-band?) — clearing the stale pointer");
 			state.worktree = null;
 			persist(); updateWidget(ctx);
 			wt = null;
@@ -2505,14 +2591,14 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	/** launch wrapper: ลงทะเบียน run (widget แสดงสด) + เขียน log live ทุก chunk
-	 *  model ของ sub-agent: resolve ตาม role จาก .zense/models.json, ถ้าไม่มี entry ใช้ model
-	 *  ปัจจุบันของ agent หลัก (ctx.model), ถ้าไม่มีอีก ปล่อย pi ใช้ default (ไม่ส่ง --model) */
-	/** provider-missing auto-heal (2026-09-17): เรียกเมื่อ diagnosis เจอ provider ใน pattern หายจาก bare boot.
-	 *  หา extension ผู้ลง provider (findProviderExtension) → retry 1 ครั้งด้วย '-e <path>';
-	 *  สำเร็จ (ok + model ตรง pattern จริง — กัน include ผิดตัวแล้วยัง fallback เงียบ) → merge persist เข้า include list
-	 *  ของ role ผ่าน writeSubagentExtIncludes (main repo เท่านั้น — worktree fallback อ่านมาอยู่แล้ว) + แจ้งช่องยกเลิก;
-	 *  retry พัง/หา ext ไม่เจอ/ambiguous/include อยู่แล้ว (nghi auth) → mark failed พร้อม guidance per-role ไม่ persist อะไร */
+	/** provider-missing auto-heal (2026-09-17): called when diagnosis finds the pattern's
+	 *  provider missing from bare boot. Find the providing extension (findProviderExtension) →
+	 *  retry once with '-e <path>'; on success (ok + the model genuinely matches the pattern —
+	 *  guards against including the wrong extension and still silently falling back) → merge +
+	 *  persist into the role's include list via writeSubagentExtIncludes (main repo only — the
+	 *  worktree fallback reads it already) + announce the opt-out path; failed retry / no ext
+	 *  found / ambiguous / already included (suspect auth) → mark failed with per-role guidance,
+	 *  persist nothing. */
 	const healProviderMismatch = async (
 		ctx: ExtensionContext,
 		role: string,
@@ -2529,21 +2615,21 @@ export default function (pi: ExtensionAPI) {
 		const hit = findProviderExtension(patternProvider, await listInstalledExtensions(subCwd));
 		const alreadyIncluded = hit ? include.includes(hit.path) : false;
 		if (hit && !alreadyIncluded) {
-			ctx.ui.notify(`🔁 zense: provider "${patternProvider}" ไม่พร้อมใช้ใน sub-agent (${role}) — retry โดยโหลด extension '${hit.label}'`, "info");
+			ctx.ui.notify(`🔁 zense: provider "${patternProvider}" is unavailable in the sub-agent (${role}) — retrying with extension '${hit.label}' loaded`, "info");
 			run.retried = true;
 			const r2 = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, r0.logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], [...stripFlags, "-e", hit.path]);
 			if (r2.ok && r2.usedModel && modelMatchesPattern(r2.usedModel, modelPattern)) {
 				const merged = mergeExtInclude(include, hit.path);
 				if (merged !== include) writeSubagentExtIncludes(ctx.cwd, role, merged);
 				run.autoIncluded = true;
-				learn(ctx, `provider auto-heal: ${role} — auto-include '${hit.label}' ให้ provider "${patternProvider}" (merge persist ลง .zense/config.json แล้ว)`);
-				ctx.ui.notify(`✅ zense: auto-include '${hit.label}' ให้ role ${role} แล้ว (provider "${patternProvider}") — ยกเลิกได้ด้วย /zense ext-config-show ${role} off ${hit.path}`, "info");
+				learn(ctx, `provider auto-heal: ${role} — auto-included '${hit.label}' for provider "${patternProvider}" (merged + persisted into .zense/config.json)`);
+				ctx.ui.notify(`✅ zense: auto-included '${hit.label}' for role ${role} (provider "${patternProvider}") — undo with /zense ext-config-show ${role} off ${hit.path}`, "info");
 				return r2;
 			}
-			learn(ctx, `provider auto-heal failed: ${role} — include '${hit.label}' แล้วยังพัง (ok=${r2.ok} used=${r2.usedModel ?? "?"} ต้องการ ${modelPattern})`);
+			learn(ctx, `provider auto-heal failed: ${role} — still broken with '${hit.label}' included (ok=${r2.ok} used=${r2.usedModel ?? "?"} wanted ${modelPattern})`);
 			return { ...r2, ok: false, output: `${buildProviderMissingGuidance(role, patternProvider, { hit, autoRetried: true })}\n---\n${r2.output}` };
 		}
-		learn(ctx, `provider missing: ${role} ต้องการ "${patternProvider}" แต่ heal ไม่ได้ — ${hit ? (alreadyIncluded ? "extension include อยู่แล้ว แต่ยัง fallback (nghi auth)" : "extension ambiguous/ใช้ไม่ได้") : "ไม่พบ extension ผู้ลง provider"}`);
+		learn(ctx, `provider missing: ${role} needs "${patternProvider}" but can't heal — ${hit ? (alreadyIncluded ? "extension already included, still falling back (suspect auth)" : "extension ambiguous/unusable") : "no provider extension found"}`);
 		return { ...r0, ok: false, output: `${buildProviderMissingGuidance(role, patternProvider, { hit, alreadyIncluded })}\n---\n${r0.output}` };
 	};
 
@@ -2559,17 +2645,18 @@ export default function (pi: ExtensionAPI) {
 		const run: SubagentRun = { role, ok: false, summary: "", at: Date.now(), startedAt: Date.now(), logPath, status: "running" };
 		state.subagentRuns.push(run);
 		updateWidget(ctx);
-		const tick = setInterval(() => updateWidget(ctx), 2_000); // elapsed วิ่งใน widget
+		const tick = setInterval(() => updateWidget(ctx), 2_000); // keeps the elapsed counter moving in the widget
 		try {
-			// ใช้ worktree root เป็น cwd ถ้ามี worktree active → grader/reviewer รัน/เทสใน worktree (โค้ดที่แก้จริง)
+			// use the worktree root as cwd when one is active → grader/reviewer run/test what was actually changed
 			const subCwd = state.worktree?.root ?? ctx.cwd;
-			// C: role ถูกล็อก read-only (SUBAGENT_EXCLUDE_TOOLS) → sub-agent ร่าง spec/อ่าน repo ได้แต่แก้โค้ดไม่ได้
-			// B: timeout ต่อ role — built-in map + ช่องของ agent: .zense/config.json (subagentTimeoutMs)
-			// ส่ง subCwd ก่อนแล้ว ctx.cwd (worktree ไม่มี .zense ของตัวเอง → config อยู่ที่ main repo)
+			// C: read-only roles (SUBAGENT_EXCLUDE_TOOLS) can draft specs/read the repo but not edit code
+			// B: per-role timeout — built-in map + agent-visible knob .zense/config.json (subagentTimeoutMs);
+			// subCwd first, then ctx.cwd (a worktree has no .zense of its own → config lives in the main repo)
 			const stripFlags = await subagentStripFlagsAsync(role, subCwd, ctx.cwd);
 			const r0 = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], stripFlags);
-			// provider-missing diagnosis (2026-09-17, pure fn diagnoseProviderMissing): silent fallback
-			// (usedModel คนละ provider กับ pattern) / hard error (stderr ตรง PROVIDER_MISSING_RX) → heal
+			// provider-missing diagnosis (2026-09-17, pure fn diagnoseProviderMissing): silent
+			// fallback (usedModel has a different provider than the pattern) / hard error (stderr
+			// matches PROVIDER_MISSING_RX) → heal
 			const diagnosis = diagnoseProviderMissing(modelPattern, r0);
 			let r = r0;
 			let healHandled = false;
@@ -2581,11 +2668,12 @@ export default function (pi: ExtensionAPI) {
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
 			if (r.usedModel) run.model = r.usedModel;
-			// verify model ที่รันจริงตรง config — pi fallback ไป default เงียบๆ ได้เมื่อ pattern resolve ไม่ได้
-			// (provider/id ไม่รู้จัก → ไม่มี error, หล่นไป saved default = มักเป็น model ของ agent หลัก)
+			// verify the actually-run model matches the config — pi can fall back to its default
+			// silently when a pattern won't resolve (unknown provider/id → no error, lands on the
+			// saved default = usually the main agent's model)
 			if (!healHandled && modelPattern && r.usedModel && !modelMatchesPattern(r.usedModel, modelPattern)) {
 				learn(ctx, `sub-agent model mismatch: ${role} requested ${modelPattern} but ran ${r.usedModel}`);
-				ctx.ui.notify(`⚠ sub-agent model mismatch: ${role} — config ขอ "${modelPattern}" แต่รันจริง "${r.usedModel}" (pi fallback? ตรวจ .zense/models.json / /zense models)`, "warning");
+				ctx.ui.notify(`⚠ sub-agent model mismatch: ${role} — config asked for "${modelPattern}" but actually ran "${r.usedModel}" (pi fallback? check .zense/models.json / /zense models)`, "warning");
 			}
 			if (!r.ok) learn(ctx, `sub-agent failed: ${role} — ${r.output.split("\n")[0].slice(0, 160)}`);
 			return r;
@@ -2600,54 +2688,54 @@ export default function (pi: ExtensionAPI) {
 	// ----- Phase 1 gate: no implementation on unapproved spec (hard enforcement)
 
 	pi.on("tool_call", async (ev, ctx) => {
-		// gate ปิด → ข้าม gate/scope/ADR แต่ยัง redirect เข้า worktree (ถ้า active)
+		// gate off → skip gate/scope/ADR but still redirect into the worktree (when active)
 		if (!state.gateEnabled) { applyRedirect(ev, ctx); return; }
 		const isWrite = ev.toolName === "write" || ev.toolName === "edit";
-		// read/bash: ไม่ผ่าน gate/scope (write-only) — แค่ redirect ถ้ามี worktree แล้วจบ
+		// read/bash bypass gate/scope (write-only) — only redirect when a worktree exists
 		if (!isWrite) { applyRedirect(ev, ctx); return; }
 
 		if (state.phase === "requirements" || !state.spec?.approved) {
 			if (!ctx.hasUI) {
 				escalate("need-permission", "write blocked: spec unsigned (no UI)", ctx);
-				// no-spec = approve ใช้ไม่ได้ตั้งแต่ต้น → สั่ง agent commit spec ก่อน อย่าชี้ไป /zense approve
+				// no-spec → /zense approve can never work → tell the agent to commit a spec first
 				return { block: true, reason: state.spec
-					? "Zense gate: spec ยังไม่ได้เซ็น — ให้ user เซ็นผ่าน dialog ครั้งต่อไปหรือ /zense approve ก่อน"
-					: "Zense gate: ยังไม่มี spec ในระบบเลย — เรียก zense_spec (แนะนำ action=compile_spec) เพื่อ commit spec ก่อน แล้ว user จะเซ็นจาก dialog ทันที; spec ในแชทไม่ถือว่ามี spec" };
+					? "Zense gate: the spec is not yet signed — the user must sign via the next dialog or /zense approve first"
+					: "Zense gate: there is no spec in the system at all — call zense_spec (recommended: action=compile_spec) to commit one first; the user can then sign from the dialog immediately. A spec pasted in chat does not count" };
 			}
-			// ลายเซ็นอยู่ที่ dialog นี่เอง — เลือกเซ็นแล้วทำงานต่อได้ทันที ไม่ต้อง /zense approve ย้ำ
-			// (TUI: โชว์ spec เต็มใน dialog ก่อนเซ็น; RPC: fallback เป็น select ธรรมดา)
+			// the signature lives on this dialog — signing continues the work immediately, no
+			// follow-up /zense approve needed (TUI: full spec shown before signing; RPC: plain select)
 			const s = state.spec;
 			let choice: string | null | undefined;
 			if (s && ctx.mode === "tui") {
-				choice = await specSignDialog(ctx, s, `Zense gate: ${ev.toolName} จะเขียนโค้ดทั้งที่ spec v${s.version} ยังไม่ได้เซ็น — อ่านก่อนเซ็น`, [
-					{ value: "sign", label: "🔏 เซ็นอนุมัติ spec แล้วทำงานต่อ", description: "เซ็น = เปิด gate, ปล่อย write นี่ผ่านทันที" },
-					{ value: "override", label: "⚠️ อนุญาตรอบนี้รอบเดียว (override โดยไม่เซ็น)", description: "จะติด trajectory flag" },
-					{ value: "block", label: "⛔ บล็อกไว้ก่อน", description: "ให้ agent รอเซ็น / compile spec ใหม่" },
+				choice = await specSignDialog(ctx, s, `Zense gate: ${ev.toolName} is about to write code while spec v${s.version} is unsigned — read before signing`, [
+					{ value: "sign", label: "🔏 Sign & approve the spec, then continue", description: "signing opens the gate; this write passes immediately" },
+					{ value: "override", label: "⚠️ Allow this once (override without signing)", description: "adds a trajectory flag" },
+					{ value: "block", label: "⛔ Block for now", description: "the agent waits for a signature / a fresh spec" },
 				]);
 			} else {
 				choice = await ctx.ui.select(
-					`Zense gate: ${ev.toolName} จะเขียนโค้ดทั้งที่ spec ยังไม่ได้เซ็น${s ? ` (v${s.version}: ${s.title} — อ่านเต็มที่ .zense/spec.md)` : " (ยังไม่มี spec)"}`,
+					`Zense gate: ${ev.toolName} is about to write code with an unsigned spec${s ? ` (v${s.version}: ${s.title} — full text at .zense/spec.md)` : " (no spec yet)"}`,
 					[
-						...(s ? ["🔏 เซ็นอนุมัติ spec แล้วทำงานต่อ"] : []),
-						"⚠️ อนุญาตรอบนี้รอบเดียว (override โดยไม่เซ็น)",
-						"⛔ บล็อกไว้ก่อน (ให้ agent compile spec/รอเซ็น)",
+						...(s ? ["🔏 Sign & approve the spec, then continue"] : []),
+						"⚠️ Allow this once (override without signing)",
+						"⛔ Block for now (the agent compiles a spec / waits for a signature)",
 					],
 				);
 			}
-			if (choice === "sign" || choice?.startsWith("🔏")) approveCurrentSpec(ctx); // เซ็น = เปิด gate, ทำงานต่อเลย
+			if (choice === "sign" || choice?.startsWith("🔏")) approveCurrentSpec(ctx); // sign = gate opens, continue right away
 			else if (choice === "override" || choice?.startsWith("⚠️")) {
 				state.trajectoryFlags.push(`unsigned override: ${ev.toolName}`);
 				learn(ctx, `flag: unsigned override: ${ev.toolName}`);
-				// H: spec ที่ compile จาก sub-agent แล้วยังถูก override โดยไม่เซ็น = สัญญาณคุณภาพ draft
-				//    → log เด่นๆ เป็น lesson ให้ compile รอบหน้า reflect (loop H ปิดตรงนี้)
+				// H: a compiled spec still overridden unsigned is a draft-quality signal → logged
+				//    loudly as a lesson for the next compile to reflect on (loop H closes here)
 				if (state.specSource === "compile" && state.spec)
 					learn(ctx, `flag: compiled spec v${state.spec.version} overridden unsigned (${ev.toolName})`);
-				ctx.ui.notify("⚠ override โดยไม่เซ็น spec — เพิ่ม trajectory flag", "warning");
+				ctx.ui.notify("⚠ overriding without a signed spec — trajectory flag added", "warning");
 			} else {
 				escalate("need-permission", "write blocked: spec unsigned", ctx);
 				return { block: true, reason: state.spec
-					? "Zense gate: spec ยังไม่ได้เซ็น — เลือก 🔏 เซ็นจาก dialog ครั้งหน้า หรือให้ user รัน /zense approve"
-					: "Zense gate: ยังไม่มี spec ในระบบเลย — เรียก zense_spec (แนะนำ action=compile_spec) เพื่อ commit spec ก่อน แล้ว user จะเซ็นจาก dialog ทันที; การวาง spec ในแชทไม่ทำให้ approve อะไรได้" };
+					? "Zense gate: the spec is not yet signed — pick 🔏 Sign in the next dialog, or ask the user to run /zense approve"
+					: "Zense gate: there is no spec in the system at all — call zense_spec (recommended: action=compile_spec) to commit one first; the user can then sign from the dialog immediately. Pasting a spec in chat does not approve anything" };
 			}
 		}
 
@@ -2666,23 +2754,26 @@ export default function (pi: ExtensionAPI) {
 		// Design-constraint checker: complete ADR "DENY:" constraints block matching write targets.
 		const adrViolation = firstAdrDenyViolation(target, adrText(ctx.cwd));
 		if (adrViolation) return { block: true, reason: adrViolation };
-		// redirect write นี้เข้า worktree ที่ท้ายสุด (หลัง scope/ADR ที่ใช้ path เดิมของ main)
+		// redirect this write into the worktree last (after scope/ADR checks run on the original
+		// main-repo path)
 		applyRedirect(ev, ctx);
 	});
 
-	// ----- M (spec v2 ข้อ 3): comment-discipline guideline append เข้า system prompt เฉพาะตอน implementation
-	// (system prompt ถูกส่งทุก turn — จ่ายเฉพาะช่วงที่มีการเขียนโค้ดจริงเท่านั้น; ออกจาก implementation แล้วหายไปเอง)
+	// ----- M (comment discipline): guideline appended to the system prompt only during
+	// implementation (the system prompt ships every turn — pay for it only while code is
+	// actually being written; leaving implementation removes it again)
 	pi.on("before_agent_start", async (event, ctx) => {
 		let sp = event.systemPrompt;
 		if (state.phase === "implementation") sp += "\n\n" + COMMENT_DISCIPLINE_GUIDELINE;
-		// cycle-closure bulletin (2026-09-17): one-shot — consume แล้ว persist ทันที ไม่ติดทุก turn;
-		// ไม่ใช้ sendUserMessage จงใจ (trigger turn ใหม่เสมอ = เปลือง LLM call + surprise ตอนเปิด session)
+		// cycle-closure bulletin (2026-09-17): one-shot — consumed and persisted at once so it
+		// never rides every turn; sendUserMessage is avoided on purpose (it always triggers a new
+		// turn = a wasted LLM call + a surprise at session open)
 		const bulletin = takeContextBulletin(state);
 		if (bulletin) {
 			sp += "\n\n" + bulletin;
 			persist();
 		}
-		// fast path เดิม: ไม่มีอะไรเปลี่ยน → undefined ไม่สร้าง systemPrompt copy ใหม่
+		// old fast path: nothing changed → undefined, no new systemPrompt copy
 		if (sp === event.systemPrompt) return;
 		return { systemPrompt: sp };
 	});
@@ -2691,8 +2782,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("turn_end", async (ev, ctx) => {
 		state.turnsUsed++;
-		// นับเฉพาะ AssistantMessage (มนุษย์อนุมัติ 2026-09-09): widget "tok" = LLM tokens เท่านั้น —
-		// usage ของ ToolResultMessage คือ tool-execution usage ที่ pi-ai ระบุชัดว่า "not part of main LLM context accounting"
+		// count AssistantMessages only (human-approved 2026-09-09): widget "tok" = LLM tokens —
+		// ToolResultMessage usage is tool-execution usage, explicitly "not part of main LLM
+		// context accounting" per pi-ai
 		const m = ev.message as { role?: string; usage?: { totalTokens?: number } } | undefined;
 		state.tokensUsed += m?.role === "assistant" ? (m.usage?.totalTokens ?? 0) : 0;
 		updateWidget(ctx);
@@ -2717,10 +2809,11 @@ export default function (pi: ExtensionAPI) {
 		if (calls.length >= 5 && failed / calls.length > 0.5)
 			flag(`retry storm: ${failed}/${calls.length} tool calls failed`, ctx);
 
-		// worktree ยัง active ตอน agent run จบ (eval ยังไม่ PASS) → แจ้ง 1 ครั้ง/การสร้าง (dedupe) ให้มนุษย์รู้ว่ามี worktree ค้างอยู่
+		// worktree still active when the agent run ends (eval hasn't PASSed) → notify once per
+		// creation (dedupe) so the human knows one is lying around
 		if (state.worktree && !state.worktreeLeaveNotified) {
 			state.worktreeLeaveNotified = true;
-			ctx.ui.notify(`🌳 worktree ค้างอยู่ (ยังไม่ apply เข้า main): ${state.worktree.dir}\nbranch ${state.worktree.branch} — จะ apply แบบ staged (ไม่ commit) อัตโนมัติเมื่อ eval PASS`, "info");
+			ctx.ui.notify(`🌳 worktree left unmerged (not yet applied to main): ${state.worktree.dir}\nbranch ${state.worktree.branch} — will be applied as staged changes (no commit) automatically when eval passes`, "info");
 			persist();
 		}
 		persist();
@@ -2741,25 +2834,29 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	};
 
-	// ----- ESC guard: instance เดียวต่อ extension — dialog ทุกตัวของ zense เปิด/ปิดผ่าน zenseCustom ข้างล่าง
+	// ----- ESC guard: one instance per extension — every zense dialog opens/closes through
+	// zenseCustom below
 
 	const escGuard = createEscGuard();
 	let escGuardUnsubscribe: (() => void) | undefined;
 
-	/** ครอบ ctx.ui.custom ของ dialog ทุกตัวใน harness — track เปิด/ปิดเข้า escGuard เพื่อให้ ESC ขณะ dialog
-	 *  เปิดอยู่ถูก consume โดย guard (ซึ่งสั่งปิด dialog บนสุด = ตัวนี้) แทนที่จะรั่วไปชน defaultEditor.onEscape
-	 *  ของ pi (abort streaming) ในกรณี focus หลุดจาก overlay; dialog ไม่ต้องเปลี่ยน handleInput เดิมของตัวเอง —
-	 *  เมื่อ focus อยู่ที่ dialog จริง ESC ก็เข้า guard ก่อนอยู่ดี (input listener ทำงานก่อน component routing) */
+	/** Wraps ctx.ui.custom for every harness dialog — registers open/close with escGuard so ESC
+	 *  while a dialog is open gets consumed by the guard (closing the topmost dialog = this
+	 *  one) instead of leaking into pi's defaultEditor.onEscape (streaming abort) when focus
+	 *  slips off the overlay. Dialogs need no changes to their own handleInput: when focus is
+	 *  genuinely on the dialog, ESC hits the guard first anyway (input listeners run before
+	 *  component routing). */
 	const zenseCustom = <T>(
 		ctx: ExtensionContext,
-		options: unknown, // pi เก็บ options เป็น overlay/non-overlay 2 shapes — cast ผ่านเข้าไปตรงๆ
+		options: unknown, // pi keeps options in 2 shapes (overlay/non-overlay) — passed through via cast
 		factory: (tui: any, theme: any, kb: any, done: (v: T) => void) => any,
 	): Promise<T> =>
 		ctx.ui.custom<T>((tui, theme, kb, done) => {
 			let closed = false;
-			// ปิดด้วย null semantics = cancel เหมือน ESC เดิมของทุก dialog (callsite ทุกตัวรับ T ที่มี null อยู่แล้ว)
+			// closing with null semantics = cancel, matching every dialog's original ESC (every
+			// callsite already accepts a T that includes null)
 			const trackedDone = (v: T) => {
-				if (closed) return; // กัน done ซ้ำ (เช่น factory throw หลัง resolve แล้ว)
+				if (closed) return; // guards against double done (e.g. factory throws after resolve)
 				closed = true;
 				handle.close();
 				done(v);
@@ -2768,24 +2865,26 @@ export default function (pi: ExtensionAPI) {
 			try {
 				return factory(tui, theme, kb, trackedDone);
 			} catch (e) {
-				trackedDone(null as T); // factory พังก่อนคืน component — ถอด guard entry ไม่ให้ค้าง
+				trackedDone(null as T); // factory died before returning a component — drop the guard entry, don't leak it
 				throw e;
 			}
 		}, options as never);
 
-	// ----- spec presentation: dialog ต้องโชว์ spec เต็มๆ ให้อ่านก่อนตัดสินใจเซ็น
-	// (ScrollView ของ pi-tui ต้องการ layout integration เลย scroll เองด้วย offset + slice)
+	// ----- spec presentation: the dialog must show the full spec before a signing decision
+	// (pi-tui's ScrollView needs layout integration, so we scroll manually via offset + slice)
 
-	// dialogs ของ zense render เป็น overlay ลอยทับ transcript แทนการ render inline ก่อเต็มจอ —
-	// ปิดแล้วกลับไปเห็น context เดิมทันที (กไก่ pi: ctx.ui.custom({ overlay: true, overlayOptions }))
+	// zense dialogs render as overlays floating above the transcript instead of inline walls
+	// of text — closing returns to the previous context instantly
+	// (pi mechanism: ctx.ui.custom({ overlay: true, overlayOptions }))
 
-	const OVERLAY_LG = { overlay: true, overlayOptions: { width: "92%", minWidth: 60, maxHeight: "85%" } } as const; // spec sign dialog (ต้องอ่าน spec ยาว)
-	const OVERLAY_MD = { overlay: true, overlayOptions: { width: "80%", minWidth: 56, maxHeight: "80%" } } as const; // pickers กลาง
+	const OVERLAY_LG = { overlay: true, overlayOptions: { width: "92%", minWidth: 60, maxHeight: "85%" } } as const; // spec sign dialog (long spec to read)
+	const OVERLAY_MD = { overlay: true, overlayOptions: { width: "80%", minWidth: 56, maxHeight: "80%" } } as const; // mid-size pickers
 	const OVERLAY_XL = { overlay: true, overlayOptions: { width: "95%", minWidth: 60, maxHeight: "90%" } } as const; // live tail
 
-	/** scroll key-map เดียวใช้ร่วมทุก dialog (spec sign / live tail) — ห้าม duplicate ไปคนละชุดเดี๋ยว drift:
-	 *  ↑/↓ ทีละบรรทัด, ←/→ ทีละหน้า, g = บนสุด, G = ล่างสุด (printable เดี่ยว กดได้แน่ทุก terminal ไม่ชน fn-key ของ Mac)
-	 *  ไม่มี Ctrl chord ตาม spec v3 — เลือกชุดสั้นสุดที่ทำงานตรงกันทั้งสอง dialog */
+	/** One scroll keymap shared by all dialogs (spec sign / live tail) — never fork it, it
+	 *  would drift: ↑/↓ one line, ←/→ one page, g top, G bottom (plain printable keys, work in
+	 *  every terminal, no clash with Mac fn-keys). No Ctrl chords — the shortest set that works
+	 *  identically across both dialogs. */
 	type ScrollAction = { dir: 1 | -1; page: boolean } | "top" | "bottom" | null;
 	const scrollKeyAction = (data: string): ScrollAction => {
 		if (matchesKey(data, Key.up)) return { dir: -1, page: false };
@@ -2804,14 +2903,15 @@ export default function (pi: ExtensionAPI) {
 			const hint = new Text(
 				theme.fg(
 					"warning",
-					`อ่าน spec ข้างล่างให้ครบก่อนตัดสินใจเซ็น` +
-						(state.lastCompileLessons ? ` · 📚 fed ${state.lastCompileLessons} lessons from memory ตอน compile` : ""),
+					`Read the entire spec below before deciding to sign` +
+						(state.lastCompileLessons ? ` · 📚 fed ${state.lastCompileLessons} lessons from memory at compile time` : ""),
 				),
 				1,
 				0,
 			);
-			// เนื้อ spec ผ่าน Markdown เดิม แต่ตัด section Changes ออก (changesFrom: undefined) —
-			// section Changes render แยกผ่าน renderSpecChangesTui (ตัด label ซ้ำ heading + สีแทน +/−)
+			// spec body via plain Markdown, minus the Changes section (changesFrom: undefined) —
+			// Changes render separately via renderSpecChangesTui (drops the redundant heading label
+			// + colors instead of +/− markers)
 			const md = new Markdown(renderSpecMd({ ...spec, changesFrom: undefined }), 0, 0, {
 				heading: (t) => theme.fg("accent", theme.bold(t)),
 				link: (t) => theme.fg("accent", t),
@@ -2831,9 +2931,9 @@ export default function (pi: ExtensionAPI) {
 			let lines: string[] = [];
 			let cachedWidth = -1;
 			let offset = 0;
-			// ความสูงเนื้อ spec: ใช้พื้นที่ terminal ได้เต็ม overlay (85% ของ rows ตาม OVERLAY_LG)
-			// reserve 9 บรรทัดสำหรับ border/title/hint/range/option ≤3 บรรทัด/bottomHint — ถ้าเกิน maxHeight
-			// ของ overlay จะถูก clip (จูน reserve กับ maxHeight คู่กันเสมอ)
+			// spec-body height: use the overlay's full share of the terminal (85% of rows per
+			// OVERLAY_LG) — reserve 9 lines for border/title/hint/range/options ≤3/bottomHint or
+			// the overlay's maxHeight clips it (tune reserve and maxHeight together, always)
 			const bodyRows = () => Math.max(4, Math.floor(tui.terminal.rows * 0.85) - 9);
 			const maxOffset = () => Math.max(0, lines.length - bodyRows());
 
@@ -2842,7 +2942,7 @@ export default function (pi: ExtensionAPI) {
 					if (w !== cachedWidth) {
 						cachedWidth = w;
 						const wBody = Math.max(20, w - 6);
-						// section Changes (สี +/−/~) ก่อน ตามด้วยเนื้อ spec จาก Markdown — wrap ทั้งคู่ที่ความกว้างเดียวกัน
+						// the Changes section (colored +/−/~) first, then the spec body from Markdown — both wrapped at the same width
 						const changeLines = renderSpecChangesTui(spec, (role, t) => theme.fg(role, t)).flatMap((ln) =>
 							ln ? wrapTextWithAnsi(ln, wBody) : [""],
 						);
@@ -2854,19 +2954,20 @@ export default function (pi: ExtensionAPI) {
 					out.push(...border.render(w), ...title.render(w), ...hint.render(w));
 					const slice = lines.slice(offset, offset + h);
 					for (const ln of slice) out.push("  " + ln);
-					for (let i = slice.length; i < h; i++) out.push(""); // รักษาความสูง dialog ให้นิ่ง
+					for (let i = slice.length; i < h; i++) out.push(""); // keep the dialog height steady
 					const range =
 						lines.length > h
 							? `— spec lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} —`
-							: `— spec ครบทุกบรรทัด (${lines.length} lines) —`;
+							: `— full spec shown (${lines.length} lines) —`;
 					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
-					// action เป็น hotkey ตรง (ไม่ใช่ SelectList) — arrows เลยว่างไว้เลื่อนอ่าน spec:
-					//   y = item แรก (🔏 เซ็น) / o = item กลาง (⚠️ override — มีเฉพาะ gate dialog 3 ตัวเลือก) / n,Esc = ตัวสุดท้ายหรือยกเลิก
+					// actions are direct hotkeys (not a SelectList) so the arrows stay free for scrolling:
+					//   y = first item (🔏 sign) / o = middle item (⚠️ override — only in the 3-option
+					//   gate dialog) / n,Esc = last item or cancel
 					out.push(`  ${theme.fg("accent", theme.bold(`[y] ${items[0].label}`))}`);
 					if (items.length > 2) out.push(`  ${theme.fg("muted", `[o] ${items[1].label}`)}`);
-					const nLabel = (items.length > 2 ? items[2] : items[1])?.label ?? "ตัดสินใจทีหลัง";
+					const nLabel = (items.length > 2 ? items[2] : items[1])?.label ?? "Decide later";
 					out.push(`  ${theme.fg("muted", `[n] ${nLabel}`)}`);
-					out.push(...new Text(theme.fg("dim", "↑↓ เลื่อนทีละบรรทัด • ←→ ทีละหน้า • g บนสุด • G ล่างสุด"), 1, 0).render(w));
+					out.push(...new Text(theme.fg("dim", "↑↓ line • ←→ page • g top • G bottom"), 1, 0).render(w));
 					out.push(...border.render(w));
 					return panelize(theme, out, w);
 				},
@@ -2874,8 +2975,9 @@ export default function (pi: ExtensionAPI) {
 					cachedWidth = -1;
 				},
 				handleInput: (data: string) => {
-					// hotkey ตรงแทน ↑↓+Enter: y เซ็น / o override (gate dialog เท่านั้น) / n,Esc ทีหลัง —
-					// ค่าที่ done() ต้องเหมือนเดิมทุก callsite (gate/approve flow อ่าน 'sign'/'override'/null)
+					// direct hotkeys instead of ↑↓+Enter: y sign / o override (gate dialog only) /
+					// n,Esc later — the done() values must stay identical at every callsite
+					// (the gate/approve flow reads 'sign'/'override'/null)
 					if (data === "y") done(items[0].value);
 					else if (data === "o" && items.length > 2) done(items[1].value);
 					else if (data === "n" || matchesKey(data, Key.escape)) done(null);
@@ -2890,8 +2992,9 @@ export default function (pi: ExtensionAPI) {
 			};
 		});
 
-	/** ext-config: checkbox dialog เลือก extensions ที่ sub-agent จะโหลด — default all-ticked (user tick ออก)
-	 *  คืน array ของ path ที่ tick ไว้ = จะโหลด (includes) หรือ null เมื่อ cancel; ไม่ใช้ SelectList เพราะเป็น single-select */
+	/** ext-config: checkbox dialog picking the extensions a sub-agent will load — default
+	 *  all-unticked (the user opts in). Returns the array of ticked paths = to be loaded
+	 *  (includes), or null on cancel; not a SelectList (that's single-select). */
 	const extConfigDialog = (ctx: ExtensionContext, role: string, items: { path: string; label: string; checked: boolean }[]): Promise<string[] | null> =>
 		zenseCustom<string[] | null>(ctx, OVERLAY_MD, (tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
@@ -2904,8 +3007,8 @@ export default function (pi: ExtensionAPI) {
 					const start = Math.max(0, Math.min(cursor - 2, Math.max(0, items.length - h)));
 					const out: string[] = [];
 					out.push(...border.render(w));
-					out.push(...new Text(theme.fg("accent", theme.bold(`🧩 sub-agent extensions — role "${role}" (default: boot เปลือย · space = เลือกโหลดเพิ่ม)`)), 1, 0).render(w));
-					out.push(...new Text(theme.fg("dim", "↑↓ เลื่อน • space toggle • a = โหลดทั้งหมด • n = ไม่โหลดเลย • enter บันทึก • esc ยกเลิก"), 1, 0).render(w));
+					out.push(...new Text(theme.fg("accent", theme.bold(`🧩 sub-agent extensions — role "${role}" (default: bare boot · space = opt into loading)`)), 1, 0).render(w));
+					out.push(...new Text(theme.fg("dim", "↑↓ move • space toggle • a = load all • n = load none • enter save • esc cancel"), 1, 0).render(w));
 					for (let i = start; i < Math.min(items.length, start + h); i++) {
 						const box = checked[i] ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
 						const mark = i === cursor ? theme.fg("accent", "▸") : " ";
@@ -2913,7 +3016,7 @@ export default function (pi: ExtensionAPI) {
 						out.push(i === cursor ? theme.bold(line) : line);
 					}
 					if (items.length > h) out.push(...new Text(theme.fg("dim", `— ${start + 1}-${Math.min(start + h, items.length)}/${items.length} —`), 1, 0).render(w));
-					out.push(...new Text(theme.fg("dim", `จะโหลด ${checked.filter(Boolean).length}/${items.length} extensions`), 1, 0).render(w));
+					out.push(...new Text(theme.fg("dim", `${checked.filter(Boolean).length}/${items.length} extensions will load`), 1, 0).render(w));
 					out.push(...border.render(w));
 					return panelize(theme, out, w);
 				},
@@ -2925,7 +3028,8 @@ export default function (pi: ExtensionAPI) {
 					else if (data === "a") checked.fill(true);
 					else if (data === "n") checked.fill(false);
 					else if (matchesKey(data, Key.enter)) {
-						// includes = ตัวที่ tick — เดิมส่งกลับเป็น exclusions (!checked) ทำผล flip (ติ๊กไม่เอาดันโหลด)
+						// includes = the ticked ones — this used to return exclusions (!checked),
+						// flipping the effect (unticked ones got loaded)
 						done(items.filter((_, i) => checked[i]).map((it) => it.path));
 						return;
 					} else if (matchesKey(data, Key.escape)) {
@@ -2937,7 +3041,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		});
 
-	// ----- picker กลางของ zense: title + search filter + SelectList (ใช้ซ้ำได้ทั้งเลือก role/model)
+	// ----- zense's shared picker: title + search filter + SelectList (reused for role/model picking)
 
 	const zensePick = (ctx: ExtensionContext, title: string, items: SelectItem[], hint = ""): Promise<string | null> =>
 		zenseCustom<string | null>(ctx, OVERLAY_MD, (tui, theme, _kb, done) => {
@@ -2957,16 +3061,16 @@ export default function (pi: ExtensionAPI) {
 					panelize(theme, [
 						...border.render(w),
 						...new Text(theme.fg("accent", theme.bold(title)), 1, 0).render(w),
-						...new Text(theme.fg("dim", `filter: ${filter || "(พิมพ์เพื่อคัดกรอง)"}${hint ? ` • ${hint}` : ""}`), 1, 0).render(w),
+						...new Text(theme.fg("dim", `filter: ${filter || "(type to filter)"}${hint ? ` • ${hint}` : ""}`), 1, 0).render(w),
 						...selectList.render(w),
-						...new Text(theme.fg("dim", "↑↓ เลือก • Enter ยืนยัน • Esc ยกเลิก • พิมพ์ = filter"), 1, 0).render(w),
+						...new Text(theme.fg("dim", "↑↓ select • Enter confirm • Esc cancel • type = filter"), 1, 0).render(w),
 						...border.render(w),
 					], w),
 				invalidate: () => {
 					selectList.invalidate();
 				},
 				handleInput: (data: string) => {
-					// ปุ่มนำทาง/ยืนยัน/ยกเลิกส่งให้ SelectList — ตัวอักษร printable เข้า search filter แทน
+					// navigation/confirm/cancel keys go to SelectList — printable chars feed the filter
 					if (matchesKey(data, Key.backspace)) {
 						filter = filter.slice(0, -1);
 						selectList.setFilter(filter);
@@ -2981,34 +3085,37 @@ export default function (pi: ExtensionAPI) {
 			};
 		});
 
-	// ----- คำถาม clarify ของ requirements: มี choices → picker (เลือกจากตัวเลือก หรือ "อื่นๆ (พิมพ์เอง)"), ไม่มี → input ตรง
+	// ----- requirements' clarify questions: with choices → picker (pick an option, or "Other
+	// (type your own)"); without → direct input
 
-	/** ถามคำถาม clarify 1 ข้อ: choices ว่าง → free-text input เหมือนเดิม; มี choices → zensePick ที่ต่อท้ายด้วย
-	 *  "อื่นๆ (พิมพ์เอง)" ซึ่งเปิด free-text input ต่อ. Esc (picker/input) → undefined = ข้าม (semantics เดิมของ Esc ใน input) */
+	/** Ask one clarify question: empty choices → the old free-text input; with choices →
+	 *  zensePick ending in "Other (type your own)", which opens a free-text input. Esc
+	 *  (picker/input) → undefined = skip (matches input's original Esc semantics). */
 	const askClarifyQuestion = async (ctx: ExtensionContext, q: ClarifyQuestion): Promise<string | undefined> => {
-		if (!q.choices.length) return ctx.ui.input(`❓ requirements ถาม: ${q.question}`, "(ตอบสั้นๆ ได้ — Esc/ว่าง = ข้าม)");
+		if (!q.choices.length) return ctx.ui.input(`❓ requirements asks: ${q.question}`, "(a short answer is fine — Esc/empty = skip)");
 		const FREE_TEXT = "__clarify_free_text__";
-		const picked = await zensePick(ctx, `❓ requirements ถาม: ${q.question}`, [
+		const picked = await zensePick(ctx, `❓ requirements asks: ${q.question}`, [
 			...q.choices.map((c) => ({ value: c, label: c })),
-			{ value: FREE_TEXT, label: "อื่นๆ (พิมพ์เอง)", description: "เลือกแล้วพิมพ์คำตอบเอง" },
+			{ value: FREE_TEXT, label: "Other (type your own)", description: "pick this, then type your answer" },
 		]);
 		if (picked === null) return undefined;
-		if (picked === FREE_TEXT) return ctx.ui.input(`❓ requirements ถาม: ${q.question}`, "(พิมพ์คำตอบเอง — Esc/ว่าง = ข้าม)");
+		if (picked === FREE_TEXT) return ctx.ui.input(`❓ requirements asks: ${q.question}`, "(type your answer — Esc/empty = skip)");
 		return picked;
 	};
 
-	// ----- live sub-agent observability: ดู output สดระหว่างรัน (กันลังเลว่าค้างหรือเปล่า)
+	// ----- live sub-agent observability: watch output as it runs (is it stuck or not?)
 
 	const tailViewer = (ctx: ExtensionContext, run: SubagentRun): Promise<null> =>
 		zenseCustom<null>(ctx, OVERLAY_XL, (tui, theme, _kb, done) => {
 			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
-			const tick = setInterval(() => tui.requestRender(), 1_000); // auto-refresh ทุก 1s
-			// wrap log เต็มไฟล์ด้วย wrapTextWithAnsi (รักษา ANSI) แทน truncate — บรรทัดยาวอ่านครบ ไม่โดนตัดเป็น "…"
-			// cache ตาม (width,size,mtime) — log ใหญ่จะได้ไม่ wrap ใหม่ทุก frame (refresh 1s)
+			const tick = setInterval(() => tui.requestRender(), 1_000); // auto-refresh every 1s
+			// whole log wrapped with wrapTextWithAnsi (ANSI preserved) instead of truncate — long
+			// lines read fully, not chopped to "…"; cached on (width,size,mtime) so a big log
+			// isn't re-wrapped every frame (1s refresh)
 			let cacheKey = "";
 			let wrapped: string[] = [];
 			let offset = 0;
-			let follow = true; // default ติดท้าย log เหมือนพฤติกรรมเดิม — scroll ขึ้น = pause, ถึงล่างสุด = ตามต่อ
+			let follow = true; // default: stick to the tail like before — scrolling up pauses, hitting bottom resumes
 			const rows = () => Math.max(4, Math.floor(tui.terminal.rows * 0.9) - 6);
 			const maxOffset = () => Math.max(0, wrapped.length - rows());
 			const readWrapped = (wWrap: number): string[] => {
@@ -3024,9 +3131,9 @@ export default function (pi: ExtensionAPI) {
 			return {
 				render: (w: number) => {
 					const lines = readWrapped(Math.max(20, w - 4));
-					// 90% ของ rows ตาม OVERLAY_XL − 6 บรรทัดหัว/tail/border — กัน clip ตอน render เป็น overlay
+					// 90% of rows per OVERLAY_XL − 6 lines of header/tail/border — prevents clipping when rendered as an overlay
 					const h = rows();
-					if (follow) offset = maxOffset(); // ติดท้ายเสมอจนกว่า user จะเลื่อนขึ้น
+					if (follow) offset = maxOffset(); // stick to the tail until the user scrolls up
 					offset = Math.max(0, Math.min(offset, maxOffset()));
 					const status =
 						run.status === "running"
@@ -3040,12 +3147,12 @@ export default function (pi: ExtensionAPI) {
 					out.push(...new Text(theme.fg("dim", run.logPath ? relative(ctx.cwd, run.logPath) : "(no log)"), 1, 0).render(w));
 					const slice = lines.slice(offset, offset + h);
 					for (const ln of slice) out.push("  " + ln);
-					for (let i = slice.length; i < h; i++) out.push(""); // ความสูงนิ่งเหมือน spec sign dialog
+					for (let i = slice.length; i < h; i++) out.push(""); // steady height, like the spec sign dialog
 					const range = follow
-						? "▶ tail (ติดตามท้าย log)"
-						: `⏸ lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — กด G กลับไปติดตาม`;
+						? "▶ tail (following end of log)"
+						: `⏸ lines ${offset + 1}-${Math.min(offset + h, lines.length)}/${lines.length} — press G to resume following`;
 					out.push(...new Text(theme.fg("dim", range), 1, 0).render(w));
-					out.push(...new Text(theme.fg("dim", "auto refresh 1s • ↑↓ เลื่อน • ←→ หน้า • g/G บนสุด/ล่างสุด • Esc ปิด (sub-agent ยังรันต่อ)"), 1, 0).render(w));
+					out.push(...new Text(theme.fg("dim", "auto refresh 1s • ↑↓ scroll • ←→ page • g/G top/bottom • Esc close (sub-agent keeps running)"), 1, 0).render(w));
 					out.push(...border.render(w));
 					return panelize(theme, out, w);
 				},
@@ -3056,9 +3163,9 @@ export default function (pi: ExtensionAPI) {
 					if (act === "top") { offset = 0; follow = false; }
 					else if (act === "bottom") { follow = true; offset = maxOffset(); }
 					else if (act) {
-						if (act.dir < 0) follow = false; // เลื่อนขึ้น = หยุดติดตาม
+						if (act.dir < 0) follow = false; // scrolling up = stop following
 						offset = Math.max(0, Math.min(maxOffset(), offset + act.dir * (act.page ? rows() : 1)));
-						if (offset >= maxOffset()) follow = true; // เลื่อนลงถึงล่างสุด = ติดตามต่อ
+						if (offset >= maxOffset()) follow = true; // scrolling back to the bottom = resume following
 					}
 					tui.requestRender();
 				},
@@ -3072,10 +3179,10 @@ export default function (pi: ExtensionAPI) {
 	const openAgentsViewer = async (ctx: ExtensionContext): Promise<void> => {
 		const runs = state.subagentRuns;
 		if (!runs.length) {
-			ctx.ui.notify("ยังไม่มี sub-agent run ในเซสชันนี้", "info");
+			ctx.ui.notify("no sub-agent runs in this session yet", "info");
 			return;
 		}
-		const recent = runs.slice(-15).map((r, i) => ({ run: r, idx: runs.length - Math.min(runs.length, 15) + i })).reverse(); // ใหม่สุดขึ้นบน
+		const recent = runs.slice(-15).map((r, i) => ({ run: r, idx: runs.length - Math.min(runs.length, 15) + i })).reverse(); // newest first
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify(
 				recent.map(({ run: r }) => `${runLabel(r)}  log: ${r.logPath ? relative(ctx.cwd, r.logPath) : "—"}`).join("\n"),
@@ -3086,7 +3193,7 @@ export default function (pi: ExtensionAPI) {
 		const picked = await zenseCustom<string | null>(ctx, OVERLAY_MD, (tui, theme, _kb, done) => {
 			const container = new Container();
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-			container.addChild(new Text(theme.fg("accent", theme.bold("🧪 Zense sub-agent runs (เลือกเพื่อดู live tail)")), 1, 0));
+			container.addChild(new Text(theme.fg("accent", theme.bold("🧪 Zense sub-agent runs (pick one for a live tail)")), 1, 0));
 			const list = new SelectList(
 				recent.map(({ run: r, idx }) => ({
 					value: String(idx),
@@ -3122,23 +3229,27 @@ export default function (pi: ExtensionAPI) {
 		await tailViewer(ctx, state.subagentRuns[runIdx]);
 	};
 
-	/** 🔏 ลายเซ็น spec — helper เดียวใช้ร่วมกันโดย zense_spec dialog, gate dialog และ /zense approve */
+	/** 🔏 The spec signature — one helper shared by the zense_spec dialog, the gate dialog and
+	 *  /zense approve */
 	const approveCurrentSpec = (ctx: ExtensionContext) => {
 		if (!state.spec) return false;
 		state.spec.approved = true;
 		state.spec.approvedAt = Date.now();
 		state.phase = "implementation";
-		// git-evidence baseline ของรอบนี้: HEAD ของ main repo ก่อนสร้าง worktree (best-effort — ไม่ใช่ repo ก็ปล่อย undefined)
+		// this round's git-evidence baseline: main repo HEAD before worktree creation
+		// (best-effort — not a repo → undefined)
 		{
 			const baseRef = gitOk(["rev-parse", "HEAD"], ctx.cwd);
 			state.baselineHead = baseRef.ok ? baseRef.out.trim() : undefined;
 		}
-		// auto worktree-per-session: สร้าง worktree ของ session นี้ตอนเริ่ม implementation
-		// (ก่อนหน้านี้ไม่มี source write เพราะ gate กั้น) → redirect ทุก tool call เข้า worktree จนกว่า eval PASS
-		// reuse ของเดิมถ้ายังอยู่: เซ็น spec version ใหม่กลาง implement ต้องไม่ทำให้งานค้างใน worktree เก่าหลุด
-		// (branch name จะติดเลข version เก่า — cosmetic เท่านั้น merge message ใช้ spec.version ปัจจุบันอยู่แล้ว)
+		// auto worktree-per-session: create this session's worktree at implementation start
+		// (no source writes could exist before — the gate blocks them) → every tool call is
+		// redirected into it until eval PASS. Reuse the existing one when still on disk:
+		// signing a new spec version mid-implementation must not orphan pending work in the old
+		// worktree (the branch name keeps the old version number — cosmetic only; the merge
+		// message already uses the current spec.version)
 		if (canReuseWorktree(state.worktree)) {
-			learn(ctx, `worktree reused: ${state.worktree!.branch} สำหรับ spec v${state.spec.version}`);
+			learn(ctx, `worktree reused: ${state.worktree!.branch} for spec v${state.spec.version}`);
 		} else {
 			const wt = createWorktree(ctx.cwd, state.spec);
 			if (wt) {
@@ -3146,14 +3257,16 @@ export default function (pi: ExtensionAPI) {
 				state.worktreeLeaveNotified = false;
 				learn(ctx, `worktree created: ${wt.branch} @ ${wt.root}`);
 			} else {
-				ctx.ui.notify(`🌳 worktree สร้างไม่ได้ — ทำงานใน main ตามปกติ (ไม่มี isolation ระหว่าง session)`, "warning");
+				ctx.ui.notify(`🌳 couldn't create a worktree — working in main as normal (no per-session isolation)`, "warning");
 			}
 		}
-		// spec.json/spec.md + archive บน disk ยังเขียนเป็น approved:false อยู่ (ตอน commit) — sync ลายเซ็นลงไฟล์ก่อนจบ
+		// spec.json/spec.md + the archive are still written approved:false (at commit time) —
+		// sync the signature into the files before finishing
 		syncApprovedSpecFiles(ctx.cwd, state.spec, { json: state.specJsonPath, md: state.specMdPath });
-		// guard: ยังมี change ของ spec ก่อนค้าง staged รอ commit → เตือนล่วงหน้า (apply ครั้งถัดไปจะเจอ dirty-main guard อยู่ดี)
+		// guard: an earlier spec's change is still staged awaiting a commit → warn early (the
+		// next apply hits the dirty-main guard anyway)
 		if (state.pendingApply)
-			ctx.ui.notify(`⚠ spec v${state.pendingApply.specVersion} ยังค้าง staged รอ commit อยู่ใน main — ควร commit หรือ discard ก่อนเริ่มงานใหม่ (ไม่เช่นนั้น apply ของ spec v${state.spec.version} จะถูก guard ปฏิเสธ)`, "warning");
+			ctx.ui.notify(`⚠ spec v${state.pendingApply.specVersion} still has staged changes awaiting a commit in main — commit or discard them before starting new work (otherwise spec v${state.spec.version}'s apply will be refused by the guard)`, "warning");
 		learn(ctx, `signed spec v${state.spec.version}`);
 		persist();
 		updateWidget(ctx);
@@ -3161,31 +3274,34 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	};
 
-	/** B: commit spec ในขั้นตอนเดียว — version ใหม่ + archive append-only ลง specs/ + latest copies +
-	 *  เด้ง sign dialog ทันที. helper เดียวใช้ร่วมทั้ง action=set (agent เขียนเอง) และ compile_spec
-	 *  (sub-agent ดราฟต์) — สองทาง behavior เหมือนกันเป๊ะ ไม่ diverge เวลาแก้ทีหลัง */
+	/** B: commit a spec in one step — new version + append-only archive into specs/ + latest
+	 *  copies + immediate sign dialog. One helper shared by action=set (agent-authored) and
+	 *  compile_spec (sub-agent-drafted) — identical behavior on both paths, no drift. */
 	const commitSpec = async (
 		ctx: ExtensionContext,
 		fields: { title?: string; intent?: string; approach?: string[]; scope?: string[]; constraints?: string[]; criteria?: Criterion[]; specDebt?: string[] },
 		source: "set" | "compile",
 	): Promise<{ version: number; signed: boolean; mdPath: string; changes?: string[]; lint?: string[] }> => {
 		const version = (state.spec?.version ?? 0) + 1;
-		// deterministic commit-time check lint (chooser เดียวของทั้ง action=set และ compile_spec):
-		// check เสียฝั่ง spec (คำสั่งพัง/placeholder/ไม่ runnable) ต้องไม่หลุดไปถึง eval (probe-primacy ลูป)
-		// → บังคับลง specDebt ให้มนุษย์เห็นตอนเซ็น; artifact-fail (คำสั่งดีแต่ของยังไม่ implement) = ปกติ → เงียบ
+		// deterministic commit-time check lint (one choke point for both action=set and
+		// compile_spec): spec-side broken checks (dead command/placeholder/unrunnable) must
+		// never reach eval (probe-primacy loops) → forced into specDebt so the human sees them
+		// at signing; artifact-fail (good command, work not yet implemented) = normal → quiet
 		let lintNotes: string[] = [];
 		if (fields.criteria?.length) {
 			const lint = lintSpecChecks(ctx.cwd, fields.criteria);
 			if (lint.broken.length) {
 				const existing = fields.specDebt ?? [];
-				// dedupe กับ applyQualityGate ที่ลง debt ให้ id เดียวกันไปแล้ว (placeholder/manual-check)
+				// dedupe against applyQualityGate entries already added for the same id
+				// (placeholder/manual-check)
 				const covered = (id: string): boolean => existing.some((d) => d.startsWith("quality-gate:") && d.includes(id));
 				lintNotes = lint.notes.filter((_, i) => !covered(lint.broken[i]));
 				fields = { ...fields, specDebt: [...existing, ...lintNotes] };
 			}
 		}
-		// resolve prev spec ก่อนหน้าก่อน overwrite — state ใน session ถ้ามี; reload/resume แล้ว state หาย
-		// → fallback อ่าน .zense/spec.json (latest copy ตอนนี้ยังเป็น version เก่า) แบบ best-effort
+		// resolve the previous spec before overwriting — session state if present; after a
+		// reload/resume the state is gone → best-effort fallback to .zense/spec.json (the latest
+		// copy is still the old version at this point)
 		let prevSpec: Spec | undefined = state.spec;
 		if (!prevSpec) {
 			try {
@@ -3195,7 +3311,7 @@ export default function (pi: ExtensionAPI) {
 					if (p && typeof p.version === "number") prevSpec = p;
 				}
 			} catch {
-				/* best-effort: อ่านไม่ได้ → ไม่มี changes section เฉยๆ ไม่ให้ commit พัง */
+				/* best-effort: unreadable → simply no Changes section; never break the commit */
 			}
 		}
 		state.spec = {
@@ -3209,16 +3325,17 @@ export default function (pi: ExtensionAPI) {
 			specDebt: fields.specDebt ?? [],
 			approved: false,
 		};
-		// re-spec (v>=2): คำนวณ change summary เทียบ version ก่อนเสมอ — ผู้เซ็นต้องเห็นว่า version นี้
-		// แก้อะไร ห้ามนำเสนอ spec เดิมซ้ำเงียบๆ; identical → buildSpecChanges คืนบรรทัดเตือน + log lesson
-		// (ไม่ block: บาง flow ตั้งใจ re-version) | v1 ไม่มี prev → ไม่ตั้ง changesFrom, behavior คงเดิม
+		// re-spec (v>=2): always compute the change summary vs the previous version — the signer
+		// must see what this version changes; never re-present an identical spec silently.
+		// identical → buildSpecChanges returns a warning line + a lesson is logged (no block:
+		// some flows re-version on purpose) | v1 has no prev → no changesFrom, unchanged behavior
 		if (prevSpec && version >= 2) {
 			const changes = buildSpecChanges(prevSpec, state.spec);
 			state.spec.changesFrom = changes;
 			if (changes.length === 1 && changes[0].startsWith("⚠️"))
 				learn(ctx, `spec v${version} re-spec identical to v${version - 1} (no changes)`);
 		}
-		state.specSource = source; // H: จำที่มาของ spec — ใช้ telemetry ตอน gate override
+		state.specSource = source; // H: remember the spec's origin — telemetry at gate overrides
 		// Specs are append-only: every version gets a unique timestamped file in
 		// .zense/specs/ so any past spec can be re-read. spec.{json,md} stay as
 		// always-latest convenience copies.
@@ -3235,24 +3352,25 @@ export default function (pi: ExtensionAPI) {
 		writeFileSync(mdPath, renderSpecMd(state.spec));
 		copyFileSync(jsonPath, join(zenseDir(ctx.cwd), "spec.json"));
 		copyFileSync(mdPath, join(zenseDir(ctx.cwd), "spec.md"));
-		state.specMdPath = mdPath;     // zense_eval จะ append ผลการประเมินท้ายไฟล์นี้
+		state.specMdPath = mdPath;     // zense_eval appends its outcome to this file
 		state.specJsonPath = jsonPath;
-		// ช่วงเวลาเซ็น (zense/sign): ถามอนุมัติทันทีตอน spec ถูกนำเสนอ
-		// spec ถูก archive ลงไฟล์ก่อนแล้ว — dialog โชว์เนื้อ spec เต็มให้อ่านก่อนเซ็น (TUI)
+		// signing moment (zense/sign): ask for approval as soon as the spec is presented.
+		// The spec was archived to disk first — the dialog shows the full text to read before
+		// signing (TUI)
 		let signed = false;
 		if (ctx.hasUI && ctx.mode === "tui") {
-			const choice = await specSignDialog(ctx, state.spec, `เซ็น Spec v${version}: ${state.spec.title}?`, [
-				{ value: "sign", label: "🔏 เซ็นอนุมัติ — เปิด implementation gate", description: "ลายเซ็นมนุษย์ = agent เริ่ม implement ได้" },
-				{ value: "later", label: "✏️ ยังไม่เซ็น (จะแก้ spec ก่อน)", description: "เซ็นทีหลังได้ด้วย /zense approve" },
+			const choice = await specSignDialog(ctx, state.spec, `Sign spec v${version}: ${state.spec.title}?`, [
+				{ value: "sign", label: "🔏 Sign & approve — open the implementation gate", description: "a human signature = the agent may start implementing" },
+				{ value: "later", label: "✏️ Not yet (I want to amend the spec first)", description: "sign later with /zense approve" },
 			]);
 			signed = choice === "sign";
 			if (signed) approveCurrentSpec(ctx);
 		} else if (ctx.hasUI) {
 			const choice = await ctx.ui.select(
-				`🔏 เซ็น Spec v${version}: ${state.spec.title}? (อ่านเต็มที่ .zense/spec.md)`,
+				`🔏 Sign spec v${version}: ${state.spec.title}? (full text at .zense/spec.md)`,
 				[
-					"🔏 เซ็นอนุมัติ — เปิด implementation gate",
-					"✏️ ยังไม่เซ็น (จะแก้ spec ก่อน / เซ็นทีหลังด้วย /zense approve)",
+					"🔏 Sign & approve — open the implementation gate",
+					"✏️ Not yet (amend the spec first / sign later with /zense approve)",
 				],
 			);
 			signed = !!choice && choice.startsWith("🔏");
@@ -3263,8 +3381,9 @@ export default function (pi: ExtensionAPI) {
 		return { version, signed, mdPath, ...(state.spec.changesFrom?.length ? { changes: state.spec.changesFrom } : {}), ...(lintNotes.length ? { lint: lintNotes } : {}) };
 	};
 
-	/** suffix ของ tool result ของ zense_spec: re-spec (v>=2) ต้องแนบ change summary ให้ agent/มนุษย์เห็นใน
-	 *  transcript ด้วย — ไม่ใช่แค่ใน dialog/archive (identical → บรรทัดเตือน ⚠️ จาก buildSpecChanges ติดมาด้วย) */
+	/** Suffix appended to zense_spec's tool result: a re-spec (v>=2) must also surface the
+	 *  change summary to the agent/human in the transcript — not just in the dialog/archive
+	 *  (an identical spec carries a ⚠️ warning line from buildSpecChanges). */
 	const changesText = (r: { version: number; changes?: string[] }): string =>
 		r.changes?.length
 			? `\n\nChanges in v${r.version} (vs v${r.version - 1}):\n${r.changes.map((x) => `- ${x}`).join("\n")}`
@@ -3304,65 +3423,70 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _sig, _on, ctx) {
 			if (params.action === "compile_spec") {
 				if (!params.intent?.trim())
-					return { content: [{ type: "text", text: "compile_spec ต้องการ intent — ส่งสรุป request ของผู้ใช้มาใน intent แล้วเรียกใหม่" }], details: {}, isError: true };
-				// pre-spec dirty guard: worktree ของ spec นี้จะ branch จาก HEAD ตอน approve — uncommitted change
-				// ใน main จะไม่ตามเข้า worktree และหลุดจาก baseline (baselineHead=HEAD) → ถามมนุษย์ก่อนเผา budget sub-agent
+					return { content: [{ type: "text", text: "compile_spec requires intent — pass the user's request summary as intent and call again" }], details: {}, isError: true };
+				// pre-spec dirty guard: this spec's worktree will branch from the HEAD at approval —
+				// uncommitted changes in main would neither follow into the worktree nor be covered
+				// by the baseline (baselineHead=HEAD) → ask the human before burning sub-agent budget
 				let preSpecNote = "";
-				// ไม่ใช่ git repo → feature นี้ปิดสนิท (ไม่เช็ค/ไม่ถาม/ไม่เตือน) — โปรเจกต์ยังไม่ init git ไม่มี baseline อยู่แล้ว
+				// not a git repo → this feature is fully off (no check/ask/warn) — a project without
+				// git has no baseline anyway
 				const preDirty = isGitRepo(ctx.cwd) ? uncommittedChanges(ctx.cwd) : [];
 				if (preDirty.length && ctx.hasUI) {
 					persist(); updateWidget(ctx);
-					const preview = preDirty.slice(0, 10).join("\n") + (preDirty.length > 10 ? `\n… (+${preDirty.length - 10} รายการ)` : "");
+					const preview = preDirty.slice(0, 10).join("\n") + (preDirty.length > 10 ? `\n… (+${preDirty.length - 10} more)` : "");
 					const choice = await ctx.ui.select(
-						`⚠️ มี uncommitted change ${preDirty.length} รายการค้างอยู่ใน main (นอก .zense):\n${preview}\n\nspec ใหม่ = baseline ที่ HEAD ตอนนี้ — ของที่ยังไม่ commit จะไม่เข้า worktree เมื่อเริ่ม implement`,
+						`⚠️ ${preDirty.length} uncommitted change(s) pending in main (outside .zense):\n${preview}\n\na new spec = baseline at the current HEAD — anything still uncommitted will not follow into the worktree when implementation starts`,
 						[
-							"📦 commit ให้เลย (snapshot ของที่ค้างไว้ แล้ว compile ต่อ)",
-							"⏩ ข้าม — compile ต่อโดยไม่ commit",
-							"🖐 เดี๋ยวจัดการเอง — ยกเลิก compile รอบนี้ก่อน (Esc ก็ยกเลิก)",
+							"📦 commit for me (snapshot the pending changes, then continue compiling)",
+							"⏩ skip — continue compiling without committing",
+							"🖐 I'll handle it myself — cancel this compile for now (Esc also cancels)",
 						],
 					);
 					if (choice === undefined || choice.startsWith("🖐")) {
-						return { content: [{ type: "text", text: `⏸ compile ถูกยกเลิกตามที่เลือก — มี uncommitted change ${preDirty.length} รายการใน main\n\nรอมนุษย์จัดการ (commit/stash) แล้วเรียก zense_spec compile_spec ใหม่ได้เลย — ห้าม compile ต่อเองจนกว่ามนุษย์จะสั่ง` }], details: { preSpec: "aborted-dirty", dirty: preDirty }, isError: true };
+						return { content: [{ type: "text", text: `⏸ compile cancelled as chosen — ${preDirty.length} uncommitted change(s) in main\n\nWait for the human to deal with them (commit/stash), then call zense_spec compile_spec again — do not continue compiling on your own until the human says so` }], details: { preSpec: "aborted-dirty", dirty: preDirty }, isError: true };
 					}
 					if (choice.startsWith("📦")) {
 						const snap = snapshotUncommitted(ctx.cwd, composeSnapshotMessage(preDirty));
 						if (!snap.ok)
-							return { content: [{ type: "text", text: `⚠️ snapshot commit ไม่สำเร็จ: ${snap.msg}\ncommit ด้วยมือแล้วเรียก zense_spec compile_spec ใหม่` }], details: { preSpec: "snapshot-failed", dirty: preDirty }, isError: true };
-						ctx.ui.notify(`📦 snapshot ของที่ค้าง ${preDirty.length} รายการ → ${snap.msg} — compile ต่อ`, "info");
+							return { content: [{ type: "text", text: `⚠️ snapshot commit failed: ${snap.msg}\ncommit manually, then call zense_spec compile_spec again` }], details: { preSpec: "snapshot-failed", dirty: preDirty }, isError: true };
+						ctx.ui.notify(`📦 snapshotted ${preDirty.length} pending change(s) → ${snap.msg} — continuing compile`, "info");
 						learn(ctx, `spec-compile: pre-spec snapshot commit ${snap.msg} (${preDirty.length} files)`);
 					} else {
-						state.trajectoryFlags.push(`spec compiled บน dirty main (${preDirty.length} uncommitted files)`);
-						learn(ctx, `flag: pre-spec dirty skip — compile โดย main มี uncommitted change ${preDirty.length} รายการ`);
-						preSpecNote = ` ⚠️ main มี uncommitted change ${preDirty.length} รายการ (มนุษย์เลือกข้าม) — baseline=HEAD ไม่ครอบของเหล่านี้`;
+						state.trajectoryFlags.push(`spec compiled on a dirty main (${preDirty.length} uncommitted files)`);
+						learn(ctx, `flag: pre-spec dirty skip — compiled while main had ${preDirty.length} uncommitted change(s)`);
+						preSpecNote = ` ⚠️ main has ${preDirty.length} uncommitted change(s) (the human chose to skip) — baseline=HEAD does not cover them`;
 					}
 				} else if (preDirty.length) {
-					// ไม่มี UI ถามไม่ได้ — compile ต่อแต่บันทึก flag + เตือนในผลลัพธ์ให้ agent แจ้งมนุษย์
-					state.trajectoryFlags.push(`spec compiled บน dirty main (${preDirty.length} uncommitted files, no UI to ask)`);
-					learn(ctx, `flag: pre-spec dirty (no UI) — compile โดย main มี uncommitted change ${preDirty.length} รายการ`);
-					preSpecNote = ` ⚠️ ถามมนุษย์ไม่ได้ (no UI): main มี uncommitted change ${preDirty.length} รายการ — baseline=HEAD ไม่ครอบของเหล่านี้; ควรให้มนุษย์ commit/stash ก่อนเริ่ม implement`;
+					// no UI to ask with — keep compiling, but flag it and warn in the result so the
+					// agent can tell the human
+					state.trajectoryFlags.push(`spec compiled on a dirty main (${preDirty.length} uncommitted files, no UI to ask)`);
+					learn(ctx, `flag: pre-spec dirty (no UI) — compiled while main had ${preDirty.length} uncommitted change(s)`);
+					preSpecNote = ` ⚠️ couldn't ask the human (no UI): main has ${preDirty.length} uncommitted change(s) — baseline=HEAD does not cover them; the human should commit/stash before implementation starts`;
 				}
 				const t0 = Date.now();
-				// Layer 3 (learning loop): ป้อนบทเรียนสะสมจาก memory.jsonl เข้า prompt เหมือนเดิม
-				// ให้ spec ใหม่สะท้อน incident เก่า เช่น scope เคยกว้างเกิน/เคย override บ่อย
+				// Layer 3 (learning loop): accumulated lessons from memory.jsonl go into the prompt as
+				// before, so the new spec reflects past incidents (scope once too wide, frequent overrides…)
 				const lessons = memorySummaryLines(ctx.cwd);
 				state.lastCompileLessons = lessons.length ? aggregateMemory(ctx.cwd).total : 0;
-				// W3: context priming + few-shot exemplar — harness เตรียมหลักฐาน/ตัวอย่างให้เลย
-				// ไม่ปล่อยให้ขึ้นกับว่า model จะexploreเองไหม (prompt สั่งได้แค่ชั้นเดียว)
+				// W3: context priming + few-shot exemplar — the harness prepares the evidence/example
+				// up front instead of hoping the model explores on its own
 				const facts = gatherRepoFacts(ctx.cwd);
 				const exemplar = loadSpecExemplar(ctx.cwd);
 				let intent = params.intent.trim();
 				let launches = 0;
-				let clarifyRounds = 0;      // F: รอบถาม-ตอบกับมนุษย์ (max 4 — wayfinder-style grilling วนได้หลายรอบ แต่มีเพดานกันรำคาญผู้ใช้)
-				let parseRetried = false;   // A: retry ตอน JSON invalid ได้ 1 ครั้ง
-				let clarifyClosed = false;  // คำถามถูกโยนลง specDebt แล้ว — ห้าม clarify ซ้ำ (กันลูปไม่รู้จบ)
-				// ลูปเดียวจัดการทั้ง clarify (F) และ parse-retry (A) — budget รวม 7 launches กันลูปพัง (4 clarify + retry + draft สุดท้ายพอดี)
+				let clarifyRounds = 0;      // F: Q&A rounds with the human (max 4 — wayfinder-style grilling may loop, capped to avoid nagging)
+				let parseRetried = false;   // A: one retry on invalid JSON
+				let clarifyClosed = false;  // questions were pushed to specDebt — never clarify again (prevents an endless loop)
+				// one loop handles both clarify (F) and parse-retry (A) — total budget 7 launches
+				// (4 clarify + retry + final draft fit exactly)
 				while (launches < 7) {
 					launches++;
 					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons, facts, exemplar, subagentTimeout("requirements", state.worktree?.root ?? ctx.cwd, ctx.cwd)));
 					if (!draft.ok) return { content: [{ type: "text", text: `sub-agent failed: ${draft.output}` }], details: draft };
 					const parsed = parseSpecDraft(draft.output);
 					if (parsed.kind === "clarify" && !clarifyClosed && clarifyRounds < 4 && ctx.hasUI) {
-						// F: ถามมนุษย์ทีละข้อ (Esc/เว้นว่าง = ข้าม) — คำถามที่ไม่ได้คำตอบโยนลง specDebt แล้วดราฟต์ต่อแบบ conservative
+						// F: ask the human one question at a time (Esc/blank = skip) — unanswered
+						// questions go to specDebt, drafting continues conservatively
 						clarifyRounds++;
 						learn(ctx, `spec-draft: clarify round ${clarifyRounds} — ${parsed.questions.length} questions`);
 						const answers: string[] = [];
@@ -3380,48 +3504,53 @@ export default function (pi: ExtensionAPI) {
 						continue;
 					}
 					if (parsed.kind === "clarify") {
-						// ถามมนุษย์ไม่ได้จริงๆ (ไม่มี UI / ครบรอบ / ถูกข้าม) — โยนคำถามลง specDebt ให้ดราฟต์ต่อแบบ conservative
+						// genuinely can't ask (no UI / rounds exhausted / skipped) — questions go to
+						// specDebt, drafting continues conservatively
 						clarifyClosed = true;
 						learn(ctx, `spec-draft: clarify forfeited (${!ctx.hasUI ? "no UI" : "rounds exhausted"}) — questions → specDebt`);
 						intent += `\n\nClarifying questions that could NOT be asked — list them in specDebt and draft the spec with conservative, explicit assumptions:\n${parsed.questions.map((q) => `- ${q.question}`).join("\n")}`;
 						continue;
 					}
 					if (parsed.kind === "error") {
-						// A: retry 1 ครั้งพร้อม feedback ที่เจาะจง — model แก้ output ตาม error ได้แม่นกว่าสั่งซ้ำเปล่าๆ
+						// A: one retry with specific feedback — the model fixes its output far more
+						// accurately against a pointed error than against a bare "try again"
 						if (!parseRetried) {
 							parseRetried = true;
-							learn(ctx, `spec-draft: JSON invalid — retry พร้อม feedback (${parsed.error.slice(0, 120)})`);
+							learn(ctx, `spec-draft: JSON invalid — retrying with feedback (${parsed.error.slice(0, 120)})`);
 							intent += `\n\nSYSTEM FEEDBACK: your previous output failed validation: ${parsed.error}. Return ONLY the corrected JSON object under the same rules — no fences, no commentary.`;
 							continue;
 						}
-						learn(ctx, `spec-draft: JSON invalid after retry — คืน raw draft ให้ agent หลักจัดการเอง (legacy path)`);
+						learn(ctx, `spec-draft: JSON invalid after retry — returning the raw draft for the main agent to handle (legacy path)`);
 						return { content: [{ type: "text", text: `draft validation failed (${parsed.error}) — raw output:\n${draft.output}` }], details: draft };
 					}
-					// G: quality gate ฝั่ง harness ก่อน commit (scope ว่าง / check รันไม่ได้ / ซ้ำของเก่า → specDebt)
+					// G: harness-side quality gate before committing (empty scope / unrunnable check /
+					// duplicate → specDebt)
 					const gated = applyQualityGate(ctx.cwd, parsed.draft);
 					if (gated.notes.length) learn(ctx, `spec-draft: quality-gate → ${gated.notes.join(", ")}`);
-					// B: parse ผ่าน → commit + เด้ง sign dialog ในขั้นตอนเดียว (ตัด round-trip action=set)
+					// B: parsed OK → commit + sign dialog in one step (no action=set round-trip)
 					const r = await commitSpec(ctx, gated.draft, "compile");
-					// H: telemetry สรุป 1 บรรทัดต่อ compile — loop เรียนรู้เองได้ว่าช้าไหม/ถามกี่รอบ/gate เจออะไร
+					// H: one-line telemetry per compile — the loop teaches itself whether it's slow,
+					// how many questions it asked, what the gate found
 					learn(ctx, `spec-compile: v${r.version} launches=${launches} clarify=${clarifyRounds} gate=[${gated.notes.join(",")}] check-lint=${r.lint?.length ?? 0} ${Date.now() - t0}ms signed=${r.signed}`);
 					const verb = r.signed
-						? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
-						: "NOT approved — เซ็นทีหลังด้วย /zense approve";
+						? "SIGNED 🔏 — human signature complete, implementation gate open"
+						: "NOT approved — sign later with /zense approve";
 					return {
-						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (รายละเอียดใน specDebt).` : ""}${r.lint?.length ? ` check-lint: ${r.lint.length} check(s) probe รันไม่ได้ — แก้ check แล้ว re-spec (รายละเอียดใน specDebt).` : ""}` + changesText(r) + preSpecNote }],
+						content: [{ type: "text", text: `Spec v${r.version} compiled by requirements sub-agent → committed one-step, archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${clarifyRounds ? ` clarify rounds: ${clarifyRounds}.` : ""}${gated.notes.length ? ` quality-gate: ${gated.notes.join(", ")} (details in specDebt).` : ""}${r.lint?.length ? ` check-lint: ${r.lint.length} check(s) the probe can't run — fix the check, then re-spec (details in specDebt).` : ""}` + changesText(r) + preSpecNote }],
 						details: { version: r.version, approved: r.signed, clarifyRounds, qualityGate: gated.notes, logPath: draft.logPath, ...(r.lint?.length ? { checkLint: r.lint } : {}) },
 					};
 				}
-				return { content: [{ type: "text", text: `compile_spec ใช้ครบ ${launches} launches แล้วยังได้แต่ clarify/error — ระบุ intent ให้ชัดขึ้นแล้วเรียกใหม่` }], details: {}, isError: true };
+				return { content: [{ type: "text", text: `compile_spec used all ${launches} launches and still only got clarify/error — make the intent clearer and call again` }], details: {}, isError: true };
 			}
-			// action=set: agent เขียน spec เองแล้ว commit — commitSpec เดียวกับ compile (B) → behavior เหมือนกันเป๊ะ
+			// action=set: the agent writes the spec itself, then commits — the same commitSpec as
+			// compile (B) → identical behavior
 			const r = await commitSpec(ctx, params, "set");
-			if (r.lint?.length) learn(ctx, `spec-set: v${r.version} check-lint → ${r.lint.length} broken check(s) ลง specDebt`);
+			if (r.lint?.length) learn(ctx, `spec-set: v${r.version} check-lint → ${r.lint.length} broken check(s) pushed to specDebt`);
 			const verb = r.signed
-				? "SIGNED 🔏 — ลายเซ็นมนุษย์ครบแล้ว, implementation gate open"
-				: "NOT approved — เซ็นทีหลังด้วย /zense approve";
+				? "SIGNED 🔏 — human signature complete, implementation gate open"
+				: "NOT approved — sign later with /zense approve";
 			return {
-				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${r.lint?.length ? ` check-lint: ${r.lint.length} check(s) probe รันไม่ได้ — แก้ check แล้ว re-spec (รายละเอียดใน specDebt).` : ""}` + changesText(r) }],
+				content: [{ type: "text", text: `Spec v${r.version} archived at ${r.mdPath} (latest copies: .zense/spec.{json,md}). ${verb}.${r.lint?.length ? ` check-lint: ${r.lint.length} check(s) the probe can't run — fix the check, then re-spec (details in specDebt).` : ""}` + changesText(r) }],
 				details: { version: r.version, approved: r.signed, ...(r.lint?.length ? { checkLint: r.lint } : {}) },
 			};
 		},
@@ -3464,14 +3593,16 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, _p, _s, onUpdate, ctx) {
 			if (!state.spec) return { content: [{ type: "text", text: "No spec yet." }], details: {}, isError: true };
 			onUpdate?.({ content: [{ type: "text", text: "running probes + grader sub-agent…" }], details: {} });
-			// W3: probes — harness รัน criteria[].check เองก่อน (deterministic) เป็น ground truth ให้ grader
-			// และทับ verdict ทีหลัง (probe primacy). รันใน worktree ถ้ามี (โค้ดที่แก้จริง) ไม่งั้น main
+			// W3: probes — the harness runs criteria[].check itself first (deterministic) as
+			// ground truth for the grader, overriding verdicts later (probe primacy). Runs in the
+			// worktree when present (the code actually changed), otherwise main
 			const evalRoot = state.worktree?.root ?? ctx.cwd;
 			const probes = runCheckProbes(evalRoot, state.spec.criteria);
 			const probeSummary = probes.map((p) => `${p.id}:${p.status}`).join(",");
 			learn(ctx, `eval-probes: spec v${state.spec.version} → ${probeSummary}`);
 			const diffSummary = gitChangeSummary(evalRoot, state.baselineHead);
-			// stream output ของ grader เข้า transcript สดๆ (throttled) — user เห็นมันทำงานจริง ไม่ต้องเดาว่าค้างไหม
+			// stream the grader's output into the transcript live (throttled) — the user sees it
+			// actually working instead of guessing whether it's stuck
 			let tail = "";
 			let lastPush = 0;
 			const streamTail = (chunk: string) => {
@@ -3482,10 +3613,13 @@ export default function (pi: ExtensionAPI) {
 					onUpdate?.({ content: [{ type: "text", text: `🧪 grader ▶ running… (full log via /zense agents)\n${tail}` }], details: {} });
 				}
 			};
-			// W2: retry loop (budget 3 launches) — output ผิด contract (ครบทุก id ไหม / มี OVERALL ไหม /
-			// PASS ทุกอันมี evidence ไหม) → ส่ง feedback เจาะจงกลับให้แก้ตัว แทน parse ครั้งเดียวแล้วเมินส่วนที่หาย
-			// (bug เก่าที่เจอตอน refactor: regex per-criteria เดิมเขียน `\b` ใน template literal → ถูก materialize
-			//  เป็น backspace byte ในไฟล์เลย → parse ไม่เคยเจอ verdict รายตัวมาก่อน ระบบพึ่ง OVERALL บรรทัดเดียว!)
+			// W2: retry loop (budget 3 launches) — contract-violating output (missing ids / no
+			// OVERALL / PASS-without-evidence) → pointed feedback goes back for a self-fix instead
+			// of one parse that silently ignores gaps.
+			// (old bug found while refactoring: the per-criteria regex once wrote `\b` inside a
+			//  template literal → materialized as a literal backspace byte in the file → individual
+			//  verdicts were never parsed at all; the whole system leaned on the single OVERALL
+			//  line!)
 			let parsed: GradeParse | null = null;
 			let grade: { ok: boolean; output: string; logPath: string } = { ok: false, output: "(not launched)", logPath: "" };
 			let feedback = "";
@@ -3502,26 +3636,30 @@ export default function (pi: ExtensionAPI) {
 				feedback = problems.join("; ");
 				parsed = null;
 			}
-			// section เดียวใช้ร่วมทั้ง FAIL/PASS/deadlock/inconclusive — M: บีบด้วย buildCompactProbeSection
-			// (pass รวมบรรทัดเดียว ลงรายละเอียดเฉพาะ fail/skipped; grade.output ดิบชี้ไป log แทนการฝังใน transcript)
-			// ต้องคำนวณก่อน inconclusive branch ด้านล่าง — เดิมประกาศหลัง branch ทำให้ eval inconclusive
-			// crash TDZ "Cannot access 'probeSection' before initialization" แทนที่จะ escalate ให้มนุษย์
+			// one probe section shared by FAIL/PASS/deadlock/inconclusive — compacted by M via
+			// buildCompactProbeSection (pass collapses to one line; detail only for fail/skipped;
+			// raw grade.output points at the log instead of embedding in the transcript).
+			// Must be computed before the inconclusive branch below — it used to be declared after
+			// it, so an inconclusive eval crashed TDZ "Cannot access 'probeSection' before
+			// initialization" instead of escalating to the human
 			const probeSection = buildCompactProbeSection(probes);
-			// W2 (G): inconclusive — เดิม "unknown ไหลเป็น PASS เงียบๆ" (= merge เข้า main ฟรี) → ตอนนี้ escalate
-			// ให้มนุษย์ตัดสินแทน พร้อม probe results (หลักฐานแข็งที่มีแน่ๆ) และทางออกที่ไม่ตัน loop (eval ซ้ำได้)
+			// W2 (G): inconclusive — used to be "unknown silently flows to PASS" (= free merge
+			// into main) → now escalates for the human to decide, with probe results (hard
+			// evidence that's guaranteed to exist) and a non-looping way out (re-eval allowed)
 			if (!grade.ok || !parsed || !parsed.overall) {
 				const reason = !grade.ok ? "grader sub-agent failed" : "grader output invalid after retries";
-				escalate("need-decision", `eval inconclusive: ${reason} — มนุษย์ตัดสินจาก probes เองหรือสั่ง eval ใหม่`, ctx);
+				escalate("need-decision", `eval inconclusive: ${reason} — the human decides from the probes or orders a re-eval`, ctx);
 				learn(ctx, `eval: spec v${state.spec.version} → inconclusive (${reason})`);
 				persist(); updateWidget(ctx);
 				return {
-					content: [{ type: "text", text: `⚠️ Eval INCONCLUSIVE — ${reason}\nprobes: ${probeSummary}${probeSection}\n\nตัดสินไม่ได้อย่างน่าเชื่อถือ: ให้มนุษย์ดู probe results ข้างบนแล้วตัดสินเอง (escalation need-decision ถูกบันทึกแล้ว — /zense status) หรือสั่งเรียก zense_eval อีกครั้ง\n\n🧪 grader output ดิบอยู่ใน log: ${relative(ctx.cwd, grade.logPath)} — อ่านเองด้วย read ถ้าต้องการ` }],
+					content: [{ type: "text", text: `⚠️ Eval INCONCLUSIVE — ${reason}\nprobes: ${probeSummary}${probeSection}\n\ncannot decide reliably: the human should read the probe results above and decide themselves (a need-decision escalation has been recorded — /zense status), or order another zense_eval\n\n🧪 raw grader output is in the log: ${relative(ctx.cwd, grade.logPath)} — read it yourself if needed` }],
 					details: { inconclusive: true, reason, probes, logPath: grade.logPath },
 					isError: true,
 				};
 			}
-			// W3: probe primacy — probe fail = criterion FAIL ทับ verdict ของ grader
-			// (probe คือสิ่งที่ harness รันเอง; grader ให้ PASS ทั้งที่ probe แดง = เชื่อไม่ได้/โดนหลอก)
+			// W3: probe primacy — probe fail = criterion FAIL, overriding the grader's verdict
+			// (probes are what the harness ran itself; a PASS from the grader on a red probe can't
+			// be trusted — fooled)
 			const probeOverrides: string[] = [];
 			for (const p of probes)
 				if (p.status === "fail" && parsed.perCriteria[p.id] !== "FAIL") {
@@ -3533,7 +3671,8 @@ export default function (pi: ExtensionAPI) {
 			if (probeOverrides.length) learn(ctx, `grader: probe overrides → FAIL [${probeOverrides.join(",")}]`);
 			const failedCriteria = parsed.failedIds;
 			const verdict = failedCriteria.length || parsed.overall === "FAIL" ? "FAIL" : "PASS";
-			// M: view กลางของทุก branch — pure builder render ข้อความให้ (PASS/FAIL); deadlock/inconclusive ต่อ directives เอง
+			// M: the shared view for every branch — a pure builder renders the text (PASS/FAIL);
+			// deadlock/inconclusive append their own directives
 			const evalView: EvalResultView = {
 				verdict,
 				criteria: state.spec.criteria,
@@ -3547,16 +3686,19 @@ export default function (pi: ExtensionAPI) {
 				logPath: relative(ctx.cwd, grade.logPath),
 			};
 			learn(ctx, `eval: spec v${state.spec.version} → grader.ok=${grade.ok} verdict=${verdict} judged=${Object.keys(parsed.perCriteria).length}/${state.spec.criteria.length} failed=[${failedCriteria.join(",")}]${probeOverrides.length ? ` probeOverrides=[${probeOverrides.join(",")}]` : ""}`);
-			// W2: เก็บ evidence ไว้เป็น input ของ reviewer (zense_review สร้าง evidence pack จาก lastEval)
-			// ผูก evidence กับรอบปัจจุบัน: specVersion + tree SHA ของ tree ที่ eval (HEAD^{tree} — ตั้งใจใช้ tree ไม่ใช่ commit SHA
-		// เพราะ apply-back หลัง PASS ให้ content เดิมเป๊ะ (repin เป็น tree ของ index ด้วย write-tree) ไม่ควรทำให้รอบปกติกลายเป็น stale; reviewer จะเช็คซ้ำตอน review)
+			// W2: keep evidence as reviewer input (zense_review builds its pack from lastEval).
+			// Evidence is pinned to the current round: specVersion + tree SHA of the evaluated
+			// tree (HEAD^{tree} — a tree, not a commit SHA, on purpose: apply-back after PASS
+			// yields identical content (repinned as the index tree via write-tree), so an
+			// ordinary round must not turn stale; the reviewer re-checks at review time)
 		const evalTree = gitOk(["rev-parse", "HEAD^{tree}"], evalRoot);
 		state.lastEval = {
 			verdict, perCriteria: parsed.perCriteria, failedIds: failedCriteria, probes, at: Date.now(),
 			specVersion: state.spec.version,
 			...(evalTree.ok ? { head: evalTree.out.trim() } : {}),
 		};
-			// บันทึกผล eval ลง spec .md (archive + latest copy) เป็น section ใหม่ท้ายไฟล์ (append-only, ไม่เขียนทับเนื้อเดิม)
+			// record the eval outcome into spec .md (archive + latest copy) as a new trailing
+			// section (append-only, never overwrites)
 			const evalTs = new Date().toISOString();
 			const evalSection =
 				`\n\n## Eval ${evalTs}\nverdict: **${verdict}** (grader.ok=${grade.ok})\n` +
@@ -3568,25 +3710,28 @@ export default function (pi: ExtensionAPI) {
 			const latestMd = join(zenseDir(ctx.cwd), "spec.md");
 			if (existsSync(latestMd)) appendFileSync(latestMd, evalSection);
 			if (verdict === "FAIL") {
-				// วงจร FAIL → ส่งกลับแก้: phase กลับ implementation, escalation need-fix, return isError สั่งแก้+eval ใหม่
+				// FAIL loop → back to fixing: phase returns to implementation, a need-fix
+				// escalation, isError telling the agent to fix + re-eval
 				state.phase = "implementation";
-				// anti-loop guard: FAIL ที่เกิดจาก probe override ล้วน (grader ให้ PASS หมดแต่ harness probe แดง) ซ้ำด้วย id set
-				// เดิมบน spec เวอร์ชันเดิม — agent แก้ต่อไม่ได้แล้ว (artifact ถูกตามผู้ตัดสิน แต่ check แดงซ้ำอาจมาจาก check เสีย)
-				// → DEADLOCK escalate ให้มนุษย์ตัดสิน แทนส่ง "กลับไปแก้" วนไม่จบ (เคสจริง: c2-c6 override ซ้ำทุกรอบ)
+				// anti-loop guard: a FAIL made purely of probe overrides (grader passes everything,
+				// harness probes stay red) repeating with the same id set on the same spec version —
+				// the agent can no longer fix anything (the artifact is correct per the judge; the
+				// red checks may stem from a broken check) → DEADLOCK-escalate for a human decision
+				// instead of looping "go fix it" forever (real case: c2-c6 overridden every round)
 				const soleOverride = failedCriteria.length > 0 && probeOverrides.length === failedCriteria.length;
 				const overrideKey = [...probeOverrides].sort().join(",");
 				const prevOvf = state.evalOverrideFails;
 				const sameOvf = !!(prevOvf && prevOvf.specVersion === state.spec.version && [...prevOvf.ids].sort().join(",") === overrideKey);
 				if (soleOverride) {
 					if (sameOvf && prevOvf && prevOvf.count >= 1) {
-						escalate("need-decision", `eval deadlock: probes and grader irreconcilably disagree [${overrideKey}] (spec v${state.spec.version}) — probe fail ซ้ำแต่ grader PASS หมด`, ctx);
+						escalate("need-decision", `eval deadlock: probes and grader irreconcilably disagree [${overrideKey}] (spec v${state.spec.version}) — probes keep failing while the grader passes everything`, ctx);
 						state.evalOverrideFails = { specVersion: state.spec.version, ids: [...probeOverrides], count: prevOvf.count + 1 };
 						persist(); updateWidget(ctx);
 						return {
 							content: [{ type: "text", text:
-								`⚠️ Eval DEADLOCK — probes and grader irreconcilably disagree (spec v${state.spec.version}; escalation need-decision ถูกบันทึกแล้ว — /zense status)\n` +
-								`harness probes fail [${overrideKey}] ซ้ำ แต่ grader ให้ PASS พร้อมหลักฐานทั้งหมด — วน "กลับไปแก้" ไม่ได้ผล (ถ้า artifact ถูกแล้วจะไม่มีอะไรให้แก้)${probeSection}\n\n` +
-								`มนุษย์ตัดสิน: ถ้า check command ใน spec เสีย (placeholder/path ผิด) → re-spec ด้วย zense_spec เวอร์ชันใหม่แล้วเซ็นใหม่; ถ้า artifact ผิดจริง → บอกสิ่งที่ต้องแก้โดยตรง` }],
+								`⚠️ Eval DEADLOCK — probes and grader irreconcilably disagree (spec v${state.spec.version}; a need-decision escalation has been recorded — /zense status)\n` +
+								`harness probes keep failing [${overrideKey}] while the grader passes everything with evidence — looping "go fix it" achieves nothing (if the artifact is already right, there's nothing to fix)${probeSection}\n\n` +
+								`human decides: if the spec's check commands are broken (placeholder/wrong path) → re-spec with zense_spec as a new version and re-sign; if the artifact is genuinely wrong → say exactly what to change` }],
 							details: { deadlock: true, verdict, failedCriteria, probes, trajectory: state.trajectoryFlags },
 							isError: true,
 						};
@@ -3595,54 +3740,60 @@ export default function (pi: ExtensionAPI) {
 				}
 				state.escalations.push({ kind: "need-fix", detail: `criteria failed: ${failedCriteria.join(",") || "grader FAIL"}`, at: Date.now() });
 				persist(); updateWidget(ctx);
-				// M: ข้อความจาก pure builder — grade.output ดิบไม่ฝังใน transcript อีก (ชี้ log แทน); เฉพาะ evidence ของ criteria ที่ FAIL
+				// M: text from the pure builder — raw grade.output no longer embeds in the
+				// transcript (points at the log instead); only failing criteria's evidence shows
 				return { content: [{ type: "text", text: buildEvalResultText(evalView) }], details: { ok: grade.ok, verdict, failedCriteria, probes, perCriteria: parsed.perCriteria, evidence: parsed.evidence, probeOverrides, trajectory: state.trajectoryFlags, logPath: grade.logPath }, isError: true };
 			}
-			// PASS: เดินไป review (unknown เป็นไปไม่ได้แล้ว — inconclusive ถูกดักไป escalate ก่อนหน้านี้)
-			// ต้องสั่งขั้นต่อไป explicit ในข้อความที่คืนให้ agent (เหมือน FAIL branch) —
-			// ถ้าไม่เขียนบอก agent จะถือว่างานจบแล้วตอบ user ทันที ทำให้ reviewer ไม่ถูกเรียกเลย
-			delete state.evalOverrideFails; // anti-loop guard: รอบจบสมบูรณ์ → ล้างตัวนับ
-			// r1 (2026-09-02): PASS = "กลับไปแก้" resolve แล้ว → ล้าง escalation need-fix ที่ค้างจากรอบ FAIL
-			// ไม่ล้าง = reviewer เห็น "criteria failed: c2,c3,c6" เก่าปน evidence แล้วเขียน TL;DR ขัด verdict PASS
-			// (เคสจริงรอบ spec v1) — need-decision คงไว้เพราะยังรอมนุษย์ตัดสิน
+			// PASS: on to review (unknown is impossible here — inconclusive already escalated).
+			// The next step must be spelled out in the returned text (like the FAIL branch) —
+			// without it the agent considers itself done and answers the user, so the reviewer
+			// never runs.
+			delete state.evalOverrideFails; // anti-loop guard: a clean finish resets the counter
+			// r1 (2026-09-02): PASS resolves the "go fix it" loop → clear need-fix escalations
+			// left over from FAIL rounds; not clearing them lets the reviewer see a stale
+			// "criteria failed: c2,c3,c6" in evidence and write a TL;DR contradicting the PASS
+			// (real case at spec v1) — need-decision stays (still awaiting a human)
 			state.escalations = state.escalations.filter((e) => e.kind !== "need-fix");
-			// M: PASS ก็ผ่าน builder เดียวกัน (verdict เป็นตัวเลือก branch ของข้อความ); directives "เรียก zense_review ทันที" คงไว้ใน builder
+			// M: PASS goes through the same builder (verdict selects the text branch); the
+			// "call zense_review immediately" directive lives in the builder
 			const report = buildEvalResultText(evalView);
-			// auto apply-back (ADR-003): เมื่อ eval PASS → apply change จาก worktree เข้า main แบบ **staged-only
-			// ไม่ auto-commit** — มนุษย์ review diff ใน main ก่อน แล้ว commit ชั้นสุดท้ายเอง (หรือสั่ง agent commit)
+			// auto apply-back (ADR-003): on eval PASS → apply the worktree change into main
+			// **staged-only, never auto-committed** — the human reviews the diff in main, then
+			// makes the final commit (or asks the agent to)
 			if (state.worktree) {
 				const wtBranch = state.worktree.branch;
-				const preHead = gitOk(["rev-parse", "HEAD"], ctx.cwd); // ไม่ขยับระหว่าง apply (squash ไม่ commit) — เก็บไว้เทียบตอน reconcile
+				const preHead = gitOk(["rev-parse", "HEAD"], ctx.cwd); // doesn't move during apply (squash never commits) — kept for reconcile
 				const ar = applyWorktreeBack(ctx.cwd, state.spec, state.worktree);
 				if (!ar.ok) {
 					escalate("need-decision", `worktree apply: ${ar.msg}`, ctx);
-					ctx.ui.notify(`⚠ ${ar.msg}`, "warning"); // guard/conflict → เก็บ worktree ไว้ — reviewer ยังอ่าน worktree ได้
+					ctx.ui.notify(`⚠ ${ar.msg}`, "warning"); // guard/conflict → worktree kept — the reviewer can still read it
 				} else {
 					learn(ctx, `worktree applied: ${ar.msg}`);
 					state.worktree = null;
-					// reviewer จะอ่าน main หลัง apply — repin lastEval.head เป็น tree ของ **index** (staged changes)
-					// (HEAD^{tree} ไม่มี change ที่ stage ไว้ → ใช้ HEAD^{tree} จะ stale ปลอมทุกรอบ)
+					// the reviewer reads main after apply — repin lastEval.head to the **index** tree
+					// (staged changes); HEAD^{tree} lacks them → would false-stale every round
 					const idxTree = gitOk(["write-tree"], ctx.cwd);
 					if (idxTree.ok && state.lastEval) state.lastEval.head = idxTree.out.trim();
 					if (ar.paths.length) {
 						state.pendingApply = { specVersion: state.spec.version, branch: wtBranch, paths: ar.paths, appliedAt: Date.now(), ...(preHead.ok ? { preApplyHead: preHead.out.trim() } : {}) };
-						// commit message สำเร็จรูป (เขียนเป็นไฟล์ — message หลายบรรทัด quote ในคำสั่งเดียวพลาดง่าย)
+						// ready-made commit message (written to a file — a multi-line message quoted in one
+						// command breaks easily)
 						try {
 							writeFileSync(join(zenseDir(ctx.cwd), PENDING_MSG), ar.commitMsg ?? composeCommitMessage(state.spec, []));
 						} catch {
 							/* best-effort */
 						}
 						ctx.ui.notify(
-							`🌳 apply เข้า main แล้ว แบบ **staged — ยังไม่ commit** (${ar.paths.length} ไฟล์จาก ${wtBranch})\n` +
-								`review ได้เลย: git status · git diff --cached\n` +
-								`➡️ เมื่อ review ผ่าน → commit: git commit -F .zense/pending-apply.msg (หรือสั่ง agent commit)\n` +
-								`⚠️ change ยังไม่ durable จนกว่าจะ commit — git stash / reset --hard / checkout . จะลบทิ้ง\n` +
-								`✅ review รับงาน + commit เรียบร้อย → /zense accept — ปิดบัญชี pendingApply + บันทึก lesson ลง memory\n` +
-								`↩️ ไม่พอใจ → zense_discard (หรือ /zense discard) — reverse patch คืนสภาพก่อน apply เป๊ะ`,
+							`🌳 applied into main as **staged — not yet committed** (${ar.paths.length} file(s) from ${wtBranch})\n` +
+								`review now: git status · git diff --cached\n` +
+								`➡️ once the review passes → commit: git commit -F .zense/pending-apply.msg (or ask the agent to commit)\n` +
+								`⚠️ not durable until committed — git stash / reset --hard / checkout . would destroy it\n` +
+								`✅ reviewed + committed → /zense accept — closes the pendingApply and records a lesson\n` +
+								`↩️ unhappy → zense_discard (or /zense discard) — reverse patch restores main exactly`,
 							"info",
 						);
 					} else {
-						ctx.ui.notify(`🌳 worktree applied → main — ไม่มี source change ให้ stage (interim แตะเฉพาะ .zense)`, "info");
+						ctx.ui.notify(`🌳 worktree applied → main — nothing to stage (interim commits touched only .zense)`, "info");
 					}
 				}
 			}
@@ -3658,21 +3809,25 @@ export default function (pi: ExtensionAPI) {
 		description: "Phase 5: build the exception-based review packet (TL;DR first, evidence linked, anomalies highlighted).",
 		parameters: Type.Object({}),
 		async execute(_id, _p, _s, _o, ctx) {
-			// guard ลำดับ phase: review ต้องมาหลัง eval PASS เท่านั้น (phase ถูก set เป็น "review" ใน zense_eval)
+			// phase-order guard: review comes only after eval PASS (phase is set to "review" in
+			// zense_eval)
 			if (state.phase !== "review")
 				return {
-					content: [{ type: "text", text: `⛔ ยัง review ไม่ได้ — phase ปัจจุบันคือ "${state.phase}" (ต้อง eval PASS ก่อน)\nไปเรียก \`zense_eval\` ก่อน แล้วค่อยกลับมาเรียก zense_review` }],
+					content: [{ type: "text", text: `⛔ can't review yet — current phase is "${state.phase}" (eval must pass first)\ncall \`zense_eval\` first, then come back to zense_review` }],
 					details: { phase: state.phase },
 					isError: true,
 				};
-			// W2: evidence pack — ส่ง lastEval (verdicts+probes), flags, specDebt, escalations, git summary
-			// ให้ reviewer ด้วย (เดิมมีแค่ intent บรรทัดเดียว → packet เดา/เลื่อยลอย เช่นเขียน "To be implemented" ทั้งที่งานเสร็จแล้ว)
-			// evidence ต้องเป็นของรอบปัจจุบันเท่านั้น: git summary scope ด้วย baseline ตอน spec approval + lastEval ที่ไม่ตรง
-			// spec version/tree ปัจจุบันถูกตัดออกจาก prompt (ดู isLastEvalStale ใน buildReviewerPrompt) แทนที่จะหลุดไปให้ตัดสินจากของเก่า
+			// W2: evidence pack — lastEval (verdicts+probes), flags, specDebt, escalations and a
+			// git summary go to the reviewer (previously a one-line intent → packets guessed,
+			// e.g. "To be implemented" written about finished work). Evidence must belong to the
+			// current round only: the git summary is scoped to the spec-approval baseline, and a
+			// lastEval mismatching the current spec version/tree is cut from the prompt (see
+			// isLastEvalStale in buildReviewerPrompt) instead of leaking stale judgments
 			const reviewRoot = state.worktree?.root ?? ctx.cwd;
-			// ADR-003: หลัง apply change อยู่ใน index ไม่ใช่ HEAD — pin freshness ด้วย tree ตอน apply (lastEval.head
-			// ถูก repin เป็น tree ของ index ด้วย write-tree แล้ว) แทน HEAD^{tree} ไม่งั้น stale ปลอมทุกรอบ;
-			// มนุษย์แก้ไฟล์ระหว่าง review ไม่ถือเป็น stale แต่ note ให้ reviewer รู้ด้านล่าง
+			// ADR-003: after apply, the change lives in the index, not HEAD — pin freshness to the
+			// tree at apply time (lastEval.head was repinned to the index tree via write-tree)
+			// instead of HEAD^{tree}, else every round turns false-stale; human edits during
+			// review aren't stale, just noted for the reviewer below
 			const headNow = state.pendingApply
 				? state.lastEval?.head
 					? { ok: true, out: state.lastEval.head, err: "" }
@@ -3680,14 +3835,15 @@ export default function (pi: ExtensionAPI) {
 				: gitOk(["rev-parse", "HEAD^{tree}"], reviewRoot);
 			const freshness = { specVersion: state.spec?.version, ...(headNow.ok ? { head: headNow.out.trim() } : {}) };
 			if (isLastEvalStale(state.lastEval, freshness))
-				learn(ctx, `review: lastEval stale (spec v${state.lastEval?.specVersion ?? "?"} ≠ v${freshness.specVersion ?? "?"} หรือ tree เปลี่ยนหลัง eval) — ตัด eval evidence เก่าออกจาก reviewer prompt`);
-			// มนุษย์แก้ไฟล์หลัง eval+apply → tree ของ index ต่างจาก pin — review ดำเนินต่อปกติ แค่ note ใน prompt
+				learn(ctx, `review: lastEval stale (spec v${state.lastEval?.specVersion ?? "?"} ≠ v${freshness.specVersion ?? "?"} or the tree changed after eval) — old eval evidence cut from the reviewer prompt`);
+			// human edits after eval+apply → the index tree differs from the pin — review
+			// continues normally, just noted in the prompt
 			const humanEdited = (() => {
 				if (!state.pendingApply || !state.lastEval?.head) return false;
 				const w = gitOk(["write-tree"], reviewRoot);
 				return w.ok && w.out.trim() !== state.lastEval.head;
 			})();
-			if (humanEdited) learn(ctx, "review: มีการแก้ไฟล์หลัง apply (human edit ระหว่าง review) — note ใน packet");
+			if (humanEdited) learn(ctx, "review: files edited after apply (human edit during review) — noted in the packet");
 			const gitEvidencePrefix = buildPendingApplyEvidencePrefix(!!state.pendingApply, humanEdited);
 			let packetFeedback = "";
 			const packetInput = (): string =>
@@ -3695,16 +3851,17 @@ export default function (pi: ExtensionAPI) {
 					(gitEvidencePrefix ? gitEvidencePrefix + "\n" : "") + gitChangeSummary(reviewRoot, state.baselineHead), packetFeedback, freshness, state.spec?.criteria);
 			let reviewer = await launchSubagent(ctx, "reviewer", packetInput());
 			let packetParse = parseReviewerPacket(reviewer.output);
-			// A (schema): section ไม่ครบ → retry 1 ครั้งพร้อม feedback (แทน slice ดิบ 900 ตัวอักษรที่ผ่านทุกกรณี)
+			// A (schema): missing sections → one retry with feedback (replaces the raw 900-char
+			// slice that waved anything through)
 			if (reviewer.ok && !packetParse.ok) {
 				learn(ctx, `reviewer: packet missing sections [${packetParse.missing.join(",")}] — retry`);
 				packetFeedback = packetParse.missing.join(", ");
 				reviewer = await launchSubagent(ctx, "reviewer", packetInput());
 				packetParse = parseReviewerPacket(reviewer.output);
 			}
-			// r5 (grounding): token ใน packet ที่ไม่มีใน evidence = แต่งขึ้นเอง → retry 1 ครั้งพร้อมรายชื่อ
-			// รอบสองยังโดย → trajectory flag "reviewer hallucination" ให้มนุษย์รู้ว่าต้องตรวจ packet ก่อนเชื่อ
-			// (review เป็น advisory — ไม่ block packet)
+			// r5 (grounding): packet tokens absent from the evidence = inventions → one retry with
+			// the list; a second strike → trajectory flag "reviewer hallucination" so the human
+			// knows to verify the packet before trusting it (review is advisory — never blocks)
 			const checkGrounding = (text: string): string[] =>
 				findUngroundedTokens(text, packetInput(), (p) => existsSync(join(reviewRoot, p)));
 			let ungrounded = reviewer.ok ? checkGrounding(reviewer.output) : [];
@@ -3716,7 +3873,7 @@ export default function (pi: ExtensionAPI) {
 				if (ungrounded.length) {
 					state.trajectoryFlags.push(`reviewer hallucination: ${ungrounded.slice(0, 5).join(",")}`);
 					learn(ctx, `flag: reviewer hallucination: ${ungrounded.slice(0, 5).join(",")}`);
-					ctx.ui.notify(`⚠ reviewer อ้าง token ที่ไม่มีใน evidence: ${ungrounded.slice(0, 3).join(", ")} — เพิ่ม trajectory flag ตรวจ packet ก่อนใช้`, "warning");
+					ctx.ui.notify(`⚠ reviewer cites tokens absent from the evidence: ${ungrounded.slice(0, 3).join(", ")} — trajectory flag added; verify the packet before using it`, "warning");
 				}
 			}
 			const packet = {
@@ -3727,7 +3884,9 @@ export default function (pi: ExtensionAPI) {
 			};
 			pi.appendEntry("zense-review-packet", packet);
 			learn(ctx, `review packet: flags=${packet.trajectory.length}, escalations=${packet.escalations.length}, sections-ok=${packetParse.ok}${packetParse.missing.length ? ` missing=[${packetParse.missing.join(",")}]` : ""}`);
-			// M: ข้อความผลบีบด้วย pure builder — เดิม slice(0,4_000) ของ packet ดิบเข้า history ถาวร; packet เต็มยังอยู่ใน details{} + review card + log
+			// M: result text via the pure builder — previously the raw packet's slice(0,4_000)
+			// entered the history permanently; the full packet still lives in details{} + the
+			// review card + the log
 			const reviewText = reviewer.ok
 				? buildReviewResultText({ ok: true, tlDr: packet.tlDr, trajectoryCount: packet.trajectory.length, escalationCount: packet.escalations.length, logPath: relative(ctx.cwd, reviewer.logPath) })
 				: buildReviewResultText({ ok: false, tlDr: "", trajectoryCount: 0, escalationCount: 0, logPath: relative(ctx.cwd, reviewer.logPath), errorOutput: reviewer.output.slice(-2_000) });
@@ -3739,12 +3898,12 @@ export default function (pi: ExtensionAPI) {
 		name: "zense_discard",
 		label: "Zense Discard Pending Apply",
 		description:
-			"ย้อน change ที่ apply เข้า main แบบ staged หลัง eval PASS (ยังไม่ commit) — unstage + reverse-apply patch ที่เก็บไว้ คืนสภาพ main เหมือนก่อน apply เป๊ะ; เรียกเมื่อมนุษย์ review แล้วไม่พอใจและสั่ง discard/ทิ้งงาน",
+			"Roll back the change staged into main after eval PASS (not yet committed) — unstage + reverse-apply the stored patch, restoring main to its exact pre-apply state; call this when the human reviewed the change and ordered it discarded.",
 		parameters: Type.Object({}),
 		async execute(_id, _p, _s, _o, ctx) {
 			if (!state.pendingApply)
 				return {
-					content: [{ type: "text", text: "ไม่มี pending apply ให้ discard (change ถูก commit ไปแล้ว หรือยังไม่เคย apply)" }],
+					content: [{ type: "text", text: "no pending apply to discard (the change was already committed, or never applied)" }],
 					details: { discarded: false },
 					isError: true,
 				};
@@ -3753,42 +3912,46 @@ export default function (pi: ExtensionAPI) {
 			if (!dr.ok) {
 				escalate("need-decision", `discard: ${dr.msg}`, ctx);
 				return {
-					content: [{ type: "text", text: `⚠️ discard ไม่สำเร็จ: ${dr.msg}\nescalation need-decision ถูกบันทึกแล้ว — มนุษย์จัดการด้วย git เอง` }],
+					content: [{ type: "text", text: `⚠️ discard failed: ${dr.msg}\na need-decision escalation has been recorded — the human resolves it with git themselves` }],
 					details: { discarded: false },
 					isError: true,
 				};
 			}
 			state.pendingApply = undefined;
-			// บันทึกเป็น escalation ด้วย — reject คือ signal สำคัญของวงจร (reviewer packet/telemetry ครั้งหน้าควรเห็น)
+			// record it as an escalation too — a rejection is a key signal for the cycle (the next
+			// reviewer packet/telemetry should see it)
 			state.escalations.push({ kind: "discarded", detail: `spec v${v} apply discarded after human review`, at: Date.now() });
 			learn(ctx, `spec v${v} discarded after review (reverse-applied patch)`);
-			resetCycleState(state); // closure พัง = จบรอบเช่นกัน (tool path: agent ได้ tool result อยู่แล้ว ไม่ set bulletin)
+			resetCycleState(state); // a failed closure still ends the round (tool path: the agent already got the tool result — no bulletin)
 			persist();
 			updateWidget(ctx);
 			return {
-				content: [{ type: "text", text: `🗑 discarded change ของ spec v${v} — ${dr.msg}\nงานรอบนี้ถูกปิด: ถ้าจะทำต่อด้วยแนวทางอื่น → re-spec ด้วย zense_spec version ใหม่` }],
+				content: [{ type: "text", text: `🗑 discarded spec v${v}'s change — ${dr.msg}\nthis round of work is closed: to try a different approach → re-spec with zense_spec as a new version` }],
 				details: { discarded: true, specVersion: v },
 			};
 		},
 	});
 
-		/** accept ของ pendingApply (ใช้ร่วมกันทั้ง /zense accept และ zense_accept tool):
-	 *  ปิดบัญชี → learn outcome ลง memory (accepted cleanly / with amendments / warnings) → maintenance
-	 *  commitIfStaged=true คือ "มนุษย์ขอให้ commit แทน" — helper จะ commit จาก message ที่เตรียมไว้ (hook ทำงานปกติ) */
+	/** Accept side of pendingApply (shared by /zense accept and the zense_accept tool):
+	 *  closes the account → learns the outcome into memory (accepted cleanly / with
+	 *  amendments / warnings) → maintenance.
+	 *  commitIfStaged=true means "the human asked for a commit on their behalf" — the helper
+	 *  commits with the prepared message (hooks run normally). */
 	const acceptPending = (ctx: ExtensionContext, commitIfStaged: boolean, notifyViaBulletin = false): { ok: boolean; text: string; specVersion?: number } => {
 		if (!state.pendingApply)
-			return { ok: false, text: "ไม่มี pending apply ให้ accept (change accept/commit ไปแล้ว หรือยังไม่เคย apply)" };
+			return { ok: false, text: "no pending apply to accept (already accepted/committed, or never applied)" };
 		const v = state.pendingApply.specVersion;
-		const specTitle = state.spec?.title ?? ""; // เก็บก่อน reset — bulletin ต้องใช้
+		const specTitle = state.spec?.title ?? ""; // captured before the reset — the bulletin needs it
 		const r = acceptPendingApply(ctx.cwd, { evalTree: state.lastEval?.head, preApplyHead: state.pendingApply.preApplyHead, commitIfStaged });
-		if (!r.ok) return { ok: false, text: `⚠️ accept ไม่สำเร็จ: ${r.msg}` };
+		if (!r.ok) return { ok: false, text: `⚠️ accept failed: ${r.msg}` };
 		state.pendingApply = undefined;
-		// outcome เชิงบวกก็เป็น signal ของวงจรเช่นกัน — push escalation kind "accepted" (pattern เดียวกับ "discarded")
-		// ให้ reviewer packet/telemetry รอบถัดไปเห็นทั้งฝั่งรับและฝั่งทิ้ง ไม่ใช่เห็นแต่ของพัง
+		// a positive outcome is a cycle signal too — push an "accepted" escalation (same
+		// pattern as "discarded") so the next reviewer packet/telemetry sees both sides, not
+		// just failures
 		state.escalations.push({ kind: "accepted", detail: `spec v${v} accepted by human${r.amendedFiles.length ? ` — amended: ${r.amendedFiles.join(", ")}` : ""}`, at: Date.now() });
 		const headNow = gitOk(["rev-parse", "HEAD"], ctx.cwd).out.trim().slice(0, 12);
 		const amendLine = r.amendedFiles.length
-			? `\n✏️ มนุษย์แก้เพิ่มหลัง grader ผ่าน (${r.amendedFiles.length} ไฟล์): ${r.amendedFiles.join(", ")} — ถ้าแก้โดยไม่ตั้งใจ ตรวจด้วย git show HEAD`
+			? `\n✏️ the human amended ${r.amendedFiles.length} file(s) after the grader passed: ${r.amendedFiles.join(", ")} — if unintended, inspect with git show HEAD`
 			: "";
 		learn(
 			ctx,
@@ -3798,8 +3961,9 @@ export default function (pi: ExtensionAPI) {
 		);
 		if (r.committedOnBehalf) learn(ctx, `spec v${v} accepted: harness committed staged change on human request`);
 		for (const w of r.warnings) learn(ctx, `accept warning spec v${v}: ${w}`);
-		// cycle closure (2026-09-17): accept สำเร็จ = จบรอบงาน — reset cycle state ให้งานถัดไปเริ่ม spec v1;
-		// bulletin เฉพาะ command path (/zense accept): tool path agent ได้ tool result อยู่แล้ว กันข้อมูลซ้ำ
+		// cycle closure (2026-09-17): a successful accept ends the round — reset cycle state so
+		// the next job starts at spec v1; the bulletin only on the command path (/zense
+		// accept): the tool path already hands the agent a tool result
 		if (notifyViaBulletin) state.contextBulletin = buildAcceptBulletin(v, specTitle, r.amendedFiles.length);
 		resetCycleState(state);
 		persist();
@@ -3808,19 +3972,18 @@ export default function (pi: ExtensionAPI) {
 		return {
 			ok: true,
 			specVersion: v,
-			text: `✅ รับงาน spec v${v} — ${r.msg}${r.committedOnBehalf ? " (harness commit แทนด้วย message ที่เตรียมไว้)" : ""}${amendLine}${warnText}\nวงจรปิดแล้ว: งานชิ้นต่อไปเริ่มด้วย zense_spec เวอร์ชันใหม่`,
+			text: `✅ spec v${v} accepted — ${r.msg}${r.committedOnBehalf ? " (harness committed with the prepared message)" : ""}${amendLine}${warnText}\ncycle closed: the next piece of work starts with a new zense_spec (v1)`,
 		};
 	};
 
 	pi.registerTool({
 		name: "zense_accept",
 		label: "Zense Accept Pending Apply",
-		// ดูเฉพาะเมื่อมี pendingApply ค้าง — ไม่มีคือไม่เกี่ยวกับรอบนี้เลยไม่ต้องเสนอ tool
 		description:
-			"ปิด pending apply ฝั่ง 'รับงาน' (คู่กับ zense_discard ฝั่งทิ้ง) — เรียกเฉพาะเมื่อ (1) มนุษย์บอกชัดว่ารับงานและ commit เรียบร้อยแล้ว หรือ (2) มนุษย์สั่งให้ agent commit แทน (กรณีนี้ยังมี staged change ค้าง → ส่ง commitIfStaged=true เพื่อ commit ด้วย .zense/pending-apply.msg โดยให้ hook ทำงานปกติ); ห้ามเรียกเองถ้ามนุษย์ไม่ได้สั่ง. ผลลัพธ์รายงานไฟล์ที่มนุษย์แก้เพิ่มหลัง grader ผ่าน (ถ้ามี) และบันทึก lesson ลง memory",
+			"Close the pending apply on the 'accept' side (zense_discard's counterpart) — call ONLY when (1) the human explicitly said they accept the work and already committed, or (2) the human asks the agent to commit for them (staged changes still pending → pass commitIfStaged=true to commit with .zense/pending-apply.msg, hooks running normally); never call unprompted. The result reports any files the human amended after the grader passed, and a lesson is recorded to memory.",
 		parameters: Type.Object({
 			commitIfStaged: Type.Optional(
-				Type.Boolean({ description: "true เฉพาะตอนมนุษย์ 'สั่งให้ commit ให้หน่อย': commit staged change ที่ค้างแทนด้วย message ที่เตรียมไว้ แล้วค่อย accept", default: false }),
+				Type.Boolean({ description: "true only when the human said 'commit it for me': commit the pending staged changes with the prepared message, then accept", default: false }),
 			),
 		}),
 		async execute(_id, p, _s, _o, ctx) {
@@ -3850,24 +4013,26 @@ export default function (pi: ExtensionAPI) {
 
 	// ----- human gates: commands
 
-	// ทางเลือก shortcut ที่พิจารณาแล้ว: ctrl+letter ถูก pi จองหมด (docs/keybindings.md — undo ถึง ctrl+-),
-	// alt+letter เสียบน macOS เพราะ Option key default ส่งอักขระแทน Escape-prefix (กดไม่ติดเด็ดขาด)
-	// → ctrl+_ (payload 0x1F): pi-tui keys.js รองรับชัดเจน + ไม่ชน default binding ไหนของ pi เลย (fallback: /zense agents)
+	// Shortcut options considered: ctrl+letter is all reserved by pi (docs/keybindings.md —
+	// undo occupies ctrl+-); alt+letter is broken on macOS where Option sends a literal char
+	// instead of an Escape prefix (unpressable) → ctrl+_ (payload 0x1F): clearly supported by
+	// pi-tui keys.js and clashes with no pi default binding (fallback: /zense agents)
 	pi.registerShortcut(Key.ctrl("_"), {
-		description: "Zense: ดู sub-agent runs สดๆ (live tail)",
+		description: "Zense: watch sub-agent runs live (live tail)",
 		handler: (ctx) => openAgentsViewer(ctx),
 	});
 
-	// runExtConfig: logic รวมของ ext-config ต่อ role — ใช้ร่วมกันระหว่าง /zense ext-config <role> (arg เดิม
-// backward compat) กับ per-role commands /zense:ext-config:<role> (autocomplete จากชื่อ command ตรงๆ —
-// pi API ส่งแค่ prefix ของคำปัจจุบัน ทำ positional completion ไม่ได้)
+	// runExtConfig: shared ext-config logic per role — used by both /zense ext-config <role>
+// (legacy arg, backward compat) and the per-role commands /zense:ext-config:<role>
+// (autocompletes straight from the command name — pi's API supplies only the current
+// word's prefix, making positional completion impossible)
 	const runExtConfig = async (ctx: ExtensionContext, role: string, action?: string, vals: string[] = []): Promise<void> => {
 		const exts = (await listInstalledExtensions(ctx.cwd)).filter((e) => e.enabled);
 		const cur = new Set(subagentExtIncludes(role, ctx.cwd));
 		const apply = (includes: string[]) => {
 			const { globalSeeded } = writeSubagentExtIncludes(ctx.cwd, role, includes);
 			ctx.ui.notify(
-				`✅ ${role}: จะโหลด ${includes.length}/${exts.length} extensions${includes.length ? "" : " (boot เปลือย)"} — save ลง local .zense/config.json แล้ว${globalSeeded ? " (+ seed global ~/.pi/agent/zense/config.json ครั้งแรก)" : ""} · มีผล sub-agent run ถัดไปทันที`,
+				`✅ ${role}: will load ${includes.length}/${exts.length} extensions${includes.length ? "" : " (bare boot)"} — saved to local .zense/config.json${globalSeeded ? " (+ first-time global seed ~/.pi/agent/zense/config.json)" : ""} · takes effect on the next sub-agent run`,
 				"info",
 			);
 		};
@@ -3877,20 +4042,21 @@ export default function (pi: ExtensionAPI) {
 				role,
 				exts.map((e) => ({ path: e.path, label: `${extDisplayLabel(e)} · ${e.source}`, checked: cur.has(e.path) })),
 			);
-			if (includes === null) return ctx.ui.notify("ยกเลิก — config เดิมไม่เปลี่ยน", "info");
+			if (includes === null) return ctx.ui.notify("cancelled — config unchanged", "info");
 			apply(includes);
 			return;
 		}
-		// text actions (non-TUI หรือระบุ action ชัดเจน) — on/off รับเลขลำดับ (1-based จาก list ด้านล่าง) หรือ substring ของ path
+		// text actions (non-TUI or an explicit action) — on/off takes a 1-based index (from the
+		// list below) or a path substring
 		if (action === "all") apply(exts.map((e) => e.path));
 		else if (action === "none" || action === "default") apply([]);
 		else if (action === "on" || action === "off") {
 			const target = vals.join(" ").trim();
-			if (!target) return ctx.ui.notify(`ขาดเป้าหมาย — /zense ext-config-show ${role} ${action} <เลขลำดับ|path>`, "warning");
+			if (!target) return ctx.ui.notify(`missing target — /zense ext-config-show ${role} ${action} <index|path>`, "warning");
 			const asNum = Number(target);
 			const hit =
 				Number.isInteger(asNum) && asNum >= 1 && asNum <= exts.length ? exts[asNum - 1].path : exts.find((e) => e.path.includes(target))?.path;
-			if (!hit) return ctx.ui.notify(`หา extension "${target}" ไม่เจอ — ดู list ด้วย /zense ext-config-show ${role} (ไม่ใส่ action)`, "warning");
+			if (!hit) return ctx.ui.notify(`extension "${target}" not found — see the list with /zense ext-config-show ${role} (no action)`, "warning");
 			const next = new Set(cur);
 			if (action === "on") next.add(hit);
 			else next.delete(hit);
@@ -3898,83 +4064,88 @@ export default function (pi: ExtensionAPI) {
 		} else if (!action) {
 			ctx.ui.notify(
 				[
-					`extensions ที่ install ไว้ (enabled) — ${role} โหลด ${cur.size}/${exts.length}:`,
+					`installed (enabled) extensions — ${role} loads ${cur.size}/${exts.length}:`,
 					...exts.map((e, i) => `  ${i + 1}. ${cur.has(e.path) ? "[x]" : "[ ]"} ${e.path}`),
-					`toggle: /zense ext-config ${role} on|off <เลขลำดับ|path> · all = โหลดทั้งหมด · none = ไม่โหลดเลย (default)`,
+					`toggle: /zense ext-config ${role} on|off <index|path> · all = load everything · none = load nothing (default)`,
 				].join("\n"),
 				"info",
 			);
 		} else {
-			return ctx.ui.notify(`action ไม่รู้จัก: "${action}" — ไม่ใส่ action (TUI=checkbox / non-TUI=list) | all | none | on|off <เลขลำดับ|path>`, "warning");
+			return ctx.ui.notify(`unknown action: "${action}" — no action (TUI=checkbox / non-TUI=list) | all | none | on|off <index|path>`, "warning");
 		}
 	};
 
-	/** /zense distill — กลั่น memory.jsonl เป็นบทเรียนชุดเดียว + ล้าง specs/ และ subagents/ logs
-	 *  safety order (ห้ามสลับ): นับผลกระทบ → confirm y/n → distiller sub-agent (read-only) →
-	 *  validate output เข้ม → ค่อยเขียนทับ memory + ลบ history. ล้มเหลวจุดไหนก็ abort ไม่ลบอะไรเลย */
+	/** /zense distill — condense memory.jsonl into one lesson set + clear specs/ and
+	 *  subagents/ logs. Safety order (never reshuffle): count the impact → confirm y/n →
+	 *  distiller sub-agent (read-only) → strict output validation → only then overwrite
+	 *  memory + delete history. Any failure aborts without deleting anything. */
 	const runDistill = async (ctx: ExtensionContext): Promise<void> => {
 		const zd = zenseDir(ctx.cwd);
 		const memPath = join(zd, "memory.jsonl");
 		const impact = distillImpact(ctx.cwd);
 		if (!impact.memoryLines)
-			return ctx.ui.notify("📚 memory ยังว่าง — ไม่มีอะไรให้กลั่น (specs/subagents จะไม่ถูกแตะตามกฎ: ไม่มีบทเรียน = ไม่ลบ)", "info");
-		// hard guard: เนื้อจะถูกฝังเข้า prompt ทั้งก้อน — เกินเพดาน abort ชัดๆ ดีกว่ากลั่นจาก history บางส่วนเงียบๆ
+			return ctx.ui.notify("📚 memory is empty — nothing to distill (per the rule no lessons = no deletion, specs/subagents stay untouched)", "info");
+		// hard guard: the content is embedded whole into the prompt — over the ceiling, an
+		// explicit abort beats silently distilling from partial history
 		if (impact.memoryBytes > MAX_DISTILL_MEMORY_BYTES)
-			return ctx.ui.notify(`⚠ memory.jsonl ใหญ่ ${fmtBytes(impact.memoryBytes)} — เกินเพดาน ${fmtBytes(MAX_DISTILL_MEMORY_BYTES)} ที่ฝังเข้า prompt ได้ทั้งก้อน; ตัด/กรองเองก่อนแล้วค่อย distill (ยังไม่มีอะไรถูกแตะ)`, "warning");
+			return ctx.ui.notify(`⚠ memory.jsonl is ${fmtBytes(impact.memoryBytes)} — over the ${fmtBytes(MAX_DISTILL_MEMORY_BYTES)} ceiling for embedding whole into a prompt; trim/filter it yourself first, then distill (nothing has been touched)`, "warning");
 		let memoryContent: string;
 		try {
 			memoryContent = readFileSync(memPath, "utf8");
 		} catch (e) {
-			return ctx.ui.notify(`⚠ อ่าน memory.jsonl ไม่ได้: ${String(e).slice(0, 120)} — abort ไม่มีอะไรถูกแตะ`, "warning");
+			return ctx.ui.notify(`⚠ can't read memory.jsonl: ${String(e).slice(0, 120)} — aborted, nothing touched`, "warning");
 		}
 		const running = state.subagentRuns.filter((r) => r.status === "running").map((r) => r.role);
 		const detail = [
-			`บทเรียน memory.jsonl : ${impact.memoryLines} บรรทัด (${fmtBytes(impact.memoryBytes)}) → กลั่นเหลือชุดเดียวแล้วเขียนทับ (format เดิม)`,
-			`specs archive        : ${impact.specFiles} ไฟล์ (${fmtBytes(impact.specBytes)}) → ลบทิ้งทั้งหมด`,
-			`subagent logs        : ${impact.logFiles} ไฟล์ (${fmtBytes(impact.logBytes)}) → ลบทิ้งทั้งหมด`,
-			"ไม่แตะ               : adr/ · config.json · models.json · spec.json · spec.md",
+			`memory.jsonl lessons : ${impact.memoryLines} lines (${fmtBytes(impact.memoryBytes)}) → distilled into one set and rewritten (same format)`,
+			`specs archive        : ${impact.specFiles} file(s) (${fmtBytes(impact.specBytes)}) → deleted entirely`,
+			`subagent logs        : ${impact.logFiles} file(s) (${fmtBytes(impact.logBytes)}) → deleted entirely`,
+			"untouched            : adr/ · config.json · models.json · spec.json · spec.md",
 			"",
-			"⚠ ลบแล้วกู้ไม่ได้ (ไม่ archive) — ถ้า sub-agent กลั่นไม่สำเร็จจะ abort ไม่ลบอะไรเลย",
-			...(running.length ? [`⚠ sub-agent กำลังรันอยู่: ${running.join(", ")} — log ของมันจะถูกลบกลางทาง; แนะนำรอจบก่อน`] : []),
+			"⚠ deletion is unrecoverable (no archive) — if the sub-agent fails to distill, it aborts and deletes nothing",
+			...(running.length ? [`⚠ sub-agent(s) still running: ${running.join(", ")} — their logs will be deleted mid-run; better to wait for them`] : []),
 		].join("\n");
-		const ok = await ctx.ui.confirm("🧹 /zense distill — ยืนยันกลั่น memory + ลบ history?", detail);
-		if (!ok) return ctx.ui.notify("ยกเลิก distill — ไม่มีไฟล์ใดถูกเปลี่ยน", "info");
-		ctx.ui.notify(`🧪 กำลังกลั่น ${impact.memoryLines} บทเรียน… (distiller sub-agent, read-only)`, "info");
+		const ok = await ctx.ui.confirm("🧹 /zense distill — confirm distilling memory + deleting history?", detail);
+		if (!ok) return ctx.ui.notify("distill cancelled — no files changed", "info");
+		ctx.ui.notify(`🧪 distilling ${impact.memoryLines} lessons… (distiller sub-agent, read-only)`, "info");
 		const logPath = subagentLogPath(ctx.cwd, "distiller");
 		const mainModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-		// รันใน main cwd เสมอ (ไม่ใช่ worktree — memory ในนั้นเป็นสำเนาตอน checkout) จึงเรียก runSubagent ตรงๆ ไม่ผ่าน launchSubagent
+		// always runs in the main cwd (not the worktree — its memory is a checkout-time copy),
+		// hence a direct runSubagent call, not launchSubagent
 		const r = await runSubagent("distiller", distillTaskPrompt(memoryContent, impact.memoryLines), ctx.cwd, subagentTimeout("distiller", ctx.cwd), undefined, logPath, resolveModelPattern(ctx.cwd, "distiller", mainModel), SUBAGENT_EXCLUDE_TOOLS.distiller, await subagentStripFlagsAsync("distiller", ctx.cwd));
 		if (!r.ok) {
 			learn(ctx, `distill aborted: distiller sub-agent failed — ${r.output.split("\n")[0].slice(0, 160)}`);
-			ctx.ui.notify(`⚠ distiller ล้มเหลว — abort ไม่ลบ/เขียนทับอะไรเลย (log: ${relative(ctx.cwd, logPath)})`, "warning");
+			ctx.ui.notify(`⚠ distiller failed — aborted; nothing deleted/overwritten (log: ${relative(ctx.cwd, logPath)})`, "warning");
 			return;
 		}
 		const parsed = parseDistilledLessons(r.output);
 		if (!parsed.ok) {
 			learn(ctx, `distill aborted: distiller output invalid (${parsed.error})`);
-			ctx.ui.notify(`⚠ output ของ distiller ไม่ valid: ${parsed.error} — abort ไม่ลบ/เขียนทับอะไรเลย (log: ${relative(ctx.cwd, logPath)})`, "warning");
+			ctx.ui.notify(`⚠ distiller output is invalid: ${parsed.error} — aborted; nothing deleted/overwritten (log: ${relative(ctx.cwd, logPath)})`, "warning");
 			return;
 		}
-		// atomic: tmp+rename — process ตายกลางเขียนไฟล์เดิมไม่เสีย; เขียนไม่สำเร็จ → abort ก่อนขั้นลบ (สัญญา "ล้มจุดไหนก็ไม่ลบ")
+		// atomic: tmp+rename — a mid-write crash can't corrupt the original; a failed write
+		// aborts before the deletion phase (the "any failure deletes nothing" promise)
 		try {
 			replaceFileAtomic(memPath, buildDistilledMemory(parsed.lessons));
 		} catch (e) {
-			learn(ctx, `distill aborted: เขียนทับ memory.jsonl ไม่สำเร็จ (${String(e).slice(0, 120)})`);
-			ctx.ui.notify(`⚠ เขียนทับ memory.jsonl ไม่สำเร็จ (${String(e).slice(0, 120)}) — abort ไม่ลบ specs/logs; ไฟล์เดิมไม่เสียหาย`, "warning");
+			learn(ctx, `distill aborted: overwriting memory.jsonl failed (${String(e).slice(0, 120)})`);
+			ctx.ui.notify(`⚠ overwriting memory.jsonl failed (${String(e).slice(0, 120)}) — aborted; specs/logs not deleted, the original file is intact`, "warning");
 			return;
 		}
 		const specsN = clearDirFiles(join(zd, "specs"));
-		const logsN = clearDirFiles(join(zd, "subagents"), new Set([basename(logPath)])); // เก็บ distiller log ล่าสุดไว้ audit
+		const logsN = clearDirFiles(join(zd, "subagents"), new Set([basename(logPath)])); // keep the latest distiller log for audit
 		learn(ctx, `distilled memory: ${impact.memoryLines} → ${parsed.lessons.length} lessons; cleared specs ×${specsN}, logs ×${logsN}`);
-		ctx.ui.notify(`✅ distill เสร็จ — memory ${impact.memoryLines} บรรทัด → ${parsed.lessons.length} บทเรียน · ลบ specs ${specsN} ไฟล์ · logs ${logsN} ไฟล์ (เก็บ distiller log ไว้)`, "info");
+		ctx.ui.notify(`✅ distill done — memory ${impact.memoryLines} lines → ${parsed.lessons.length} lessons · deleted ${specsN} spec file(s) · ${logsN} log file(s) (distiller log kept)`, "info");
 	};
 
 	pi.registerCommand("zense", {
-		description: "Zense harness (เซ็น = ลายเซ็นมนุษย์/sign): status | approve | accept | discard | agents | gate on|off | memory | distill | models | ext-config-show",
+		description: "Zense harness (zense = human signature/sign): status | approve | accept | discard | agents | gate on|off | memory | distill | models | ext-config-show",
 		getArgumentCompletions: (prefix) =>
-			// เสนอเฉพาะ subcommand ของ /zense ตรงๆ — roles (requirements/grader/reviewer) ไม่ใส่เพราะมี
-			// /zense:ext-config:<role> แยกอยู่แล้ว ส่วน actions (all/none/on/off) เป็น arg ชั้นสองของ ext-config-show
-			// ซึ่ง pi แยกตำแหน่งคำไม่ได้ → ถ้ารวมไว้จะเด้งเป็น subcommand ปลอมที่ตำแหน่งแรก
+			// offer only real /zense subcommands — roles (requirements/grader/reviewer) stay out
+			// (they have dedicated /zense:ext-config:<role> commands), and actions (all/none/
+			// on/off) are second-level args of ext-config-show which pi can't positionally
+			// separate → including them would conjure phantom subcommands at position 1
 			["status", "approve", "accept", "agents", "discard", "distill", "gate", "memory", "models", "ext-config-show"]
 				.filter((s) => s.startsWith(prefix))
 				.map((value) => ({ value, label: value })),
@@ -3983,10 +4154,10 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "status") {
 				ctx.ui.notify(
 					`phase=${state.phase} spec=${state.spec ? `v${state.spec.version} approved=${state.spec.approved}` : "—"}\n` +
-						(state.worktree ? `worktree: ${state.worktree.dir}\n  branch ${state.worktree.branch} (active — apply แบบ staged เมื่อ eval PASS, ไม่ auto-commit)\n` : `worktree: (none — ทำงานใน main)\n`) +
+						(state.worktree ? `worktree: ${state.worktree.dir}\n  branch ${state.worktree.branch} (active — applied as staged changes on eval PASS, never auto-committed)\n` : `worktree: (none — working in main)\n`) +
 						`turns=${state.turnsUsed} tokens=${state.tokensUsed}\n` +
 						(state.pendingApply
-							? `⏳ pending apply: spec v${state.pendingApply.specVersion} — ${state.pendingApply.paths.length} ไฟล์ staged รอ commit (จาก ${state.pendingApply.branch})\n  commit: git commit -F .zense/pending-apply.msg · รับงานหลัง commit: /zense accept · ย้อนทิ้ง: /zense discard (reverse patch)\n`
+							? `⏳ pending apply: spec v${state.pendingApply.specVersion} — ${state.pendingApply.paths.length} file(s) staged awaiting a commit (from ${state.pendingApply.branch})\n  commit: git commit -F .zense/pending-apply.msg · accept after committing: /zense accept · roll back: /zense discard (reverse patch)\n`
 							: "") +
 						`trajectory flags:\n${state.trajectoryFlags.join("\n") || "(none)"}\nescalations:\n${state.escalations.map((e) => `${e.kind}: ${e.detail}`).join("\n") || "(none)"}`,
 					"info",
@@ -3994,24 +4165,25 @@ export default function (pi: ExtensionAPI) {
 			} else if (sub === "approve") {
 				if (!state.spec)
 				return ctx.ui.notify(
-					"No spec to approve: ยังไม่มี spec ที่ commit เข้าระบบ — approve ใช้ได้เฉพาะ spec ที่ agent เรียก zense_spec (tool) ในเซสชันนี้เท่านั้น; spec ที่ถูก present เป็น chat text registers nothing. ขั้นถัดไป: ให้ agent เรียก zense_spec (แนะนำ action=compile_spec) แล้ว sign จาก dialog ที่เด้งขึ้น", 
+					"No spec to approve: no spec has been committed into the system — approve works only on a spec the agent registered via the zense_spec tool in this session; a spec presented as chat text registers nothing. Next step: have the agent call zense_spec (recommended: action=compile_spec), then sign from the dialog that appears.",
 					"warning",
 				);
-				// ปลุก agent ทำงานต่อหลังเซ็นผ่าน /zense approve — path นี้ user เซ็นจาก slash command ตอน agent idle
-				// → ไม่มี turn ใหม่เกิดเอง (ต่างจาก flow เซ็นใน tool_dialog ที่ agent กำลัง stream อยู่) ต้อง sendUserMessage
-				const kickoff = `Zense: spec v${state.spec.version} ถูกเซ็นแล้ว — implementation gate เปิด\nเริ่ม implement ตาม spec ได้เลย (อ่าน .zense/spec.md; อย่าเขียนนอก scope)`;
+				// wake the agent to continue after a /zense approve signing — signing from a slash
+				// command happens while the agent is idle, so no new turn starts on its own (unlike
+				// signing inside a tool dialog mid-stream) → sendUserMessage is required
+				const kickoff = `Zense: spec v${state.spec.version} has been signed — the implementation gate is open\nstart implementing per the spec (read .zense/spec.md; never write outside its scope)`;
 				const nudgeAgent = () => {
-					try { pi.sendUserMessage(kickoff); return; } catch { /* agent กำลัง stream — เลือก followUp แทน */ }
-					try { pi.sendUserMessage(kickoff, { deliverAs: "followUp" }); } catch { /* non-fatal: user สั่งต่อเองได้ */ }
+					try { pi.sendUserMessage(kickoff); return; } catch { /* agent is streaming — fall back to followUp */ }
+					try { pi.sendUserMessage(kickoff, { deliverAs: "followUp" }); } catch { /* non-fatal: the user can nudge manually */ }
 				};
 				if (ctx.mode === "tui") {
-					const choice = await specSignDialog(ctx, state.spec, `เซ็น approve spec v${state.spec.version}: ${state.spec.title}?`, [
-						{ value: "sign", label: "🔏 เซ็นอนุมัติ — เปิด implementation gate", description: "ลายเซ็นมนุษย์ = agent เริ่ม implement ได้" },
-						{ value: "cancel", label: "ยกเลิก (ยังไม่เซ็น)", description: "spec ยังค้างไว้ — approve ใหม่ได้ทุกเมื่อ" },
+					const choice = await specSignDialog(ctx, state.spec, `Sign & approve spec v${state.spec.version}: ${state.spec.title}?`, [
+						{ value: "sign", label: "🔏 Sign & approve — open the implementation gate", description: "a human signature = the agent may start implementing" },
+						{ value: "cancel", label: "Cancel (not signing yet)", description: "the spec stays pending — approve again anytime" },
 					]);
 					if (choice === "sign" && approveCurrentSpec(ctx)) nudgeAgent();
 				} else {
-					const ok = await ctx.ui.confirm("🔏 เซ็น approve spec?", `${state.spec.title} v${state.spec.version}\nIntent: ${state.spec.intent.slice(0, 300)}\n(อ่านเต็มที่ .zense/spec.md)`);
+					const ok = await ctx.ui.confirm("🔏 Sign & approve the spec?", `${state.spec.title} v${state.spec.version}\nIntent: ${state.spec.intent.slice(0, 300)}\n(full text at .zense/spec.md)`);
 					if (ok && approveCurrentSpec(ctx)) nudgeAgent();
 				}
 			} else if (sub === "gate") {
@@ -4019,36 +4191,39 @@ export default function (pi: ExtensionAPI) {
 				persist();
 				ctx.ui.notify(`Gate ${state.gateEnabled ? "ON" : "OFF"}`, state.gateEnabled ? "info" : "warning");
 			} else if (sub === "discard") {
-				// ย้อน change ที่ apply ค้างไว้ (reverse patch) — undo path อย่างเป็นทางการหลังมนุษย์ review แล้วไม่พอใจ
-				if (!state.pendingApply) return ctx.ui.notify("ไม่มี pending apply ให้ discard (change ถูก commit ไปแล้ว หรือยังไม่เคย apply)", "info");
+				// roll back the pending applied change (reverse patch) — the official undo path for
+				// an unhappy human review
+				if (!state.pendingApply) return ctx.ui.notify("no pending apply to discard (the change was already committed, or never applied)", "info");
 				const dr = discardPendingApply(ctx.cwd);
 				if (!dr.ok) {
 					escalate("need-decision", `discard: ${dr.msg}`, ctx);
-					return ctx.ui.notify(`⚠ discard ไม่สำเร็จ: ${dr.msg}`, "warning");
+					return ctx.ui.notify(`⚠ discard failed: ${dr.msg}`, "warning");
 				}
 				const v = state.pendingApply.specVersion;
 				state.pendingApply = undefined;
 				learn(ctx, `spec v${v} discarded after review (reverse-applied)`);
-				state.contextBulletin = buildDiscardBulletin(v); // command path (มนุษย์พิมพ์) — agent ต้องรู้ผ่าน system prompt turn ถัดไป
+				state.contextBulletin = buildDiscardBulletin(v); // command path (human-typed) — the agent learns via the next turn's system prompt
 				resetCycleState(state);
 				persist();
 				updateWidget(ctx);
-				ctx.ui.notify(`✅ ${dr.msg} — spec v${v} ถูกย้อนออกจาก main แล้ว`, "info");
+				ctx.ui.notify(`✅ ${dr.msg} — spec v${v} has been rolled back out of main`, "info");
 			} else if (sub === "accept") {
-				// ฝั่งรับงานของ pendingApply (คู่กับ discard): "/zense accept commit" = มนุษย์ขอให้ harness commit แทน
-				if (!state.pendingApply) return ctx.ui.notify("ไม่มี pending apply ให้ accept (change ถูก commit/accept ไปแล้ว หรือยังไม่เคย apply)", "info");
+				// pendingApply's accept side (discard's counterpart): "/zense accept commit" =
+				// human wants the harness to commit for them
+				if (!state.pendingApply) return ctx.ui.notify("no pending apply to accept (already committed/accepted, or never applied)", "info");
 				let commitIfStaged = rest[0] === "commit";
 				if (!commitIfStaged && !gitOk(["diff", "--cached", "--quiet"], ctx.cwd).ok) {
-					// ยัง staged ค้าง = มนุษย์ยังไม่ commit เอง — เสนอ commit แทน (soft, ไม่ auto-commit)
+					// staged leftovers = the human hasn't committed — offer to commit on their behalf
+					// (soft, never auto-commits)
 					const ok =
 						ctx.mode === "tui" &&
 						(await ctx.ui.confirm(
-							`✅ accept spec v${state.pendingApply.specVersion} — แต่ยังมี staged change ค้างอยู่ (ยังไม่ commit)`,
-							"ให้ harness commit แทนด้วย .zense/pending-apply.msg แล้ว accept เลยไหม? (hook ทำงานปกติ)\nเลือก No → ยกเลิก: commit เองแล้ว /zense accept อีกครั้ง",
+							`✅ accepting spec v${state.pendingApply.specVersion} — but staged changes are still pending (not yet committed)`,
+							"have the harness commit them with .zense/pending-apply.msg, then accept? (hooks run normally)\nchoosing No cancels: commit yourself, then /zense accept again",
 						));
 					if (!ok)
 						return ctx.ui.notify(
-							"ยังไม่ได้ commit — commit เองด้วย `git commit -F .zense/pending-apply.msg` แล้ว /zense accept หรือให้ harness commit แทน: /zense accept commit",
+							"not committed yet — commit yourself with `git commit -F .zense/pending-apply.msg`, then /zense accept; or let the harness do it: /zense accept commit",
 							"info",
 						);
 					commitIfStaged = true;
@@ -4059,87 +4234,89 @@ export default function (pi: ExtensionAPI) {
 				await openAgentsViewer(ctx);
 			} else if (sub === "memory") {
 				if (rest[0] === "json") {
-					// raw JSONL tail (ดิบ)
+					// raw JSONL tail
 					const f = join(zenseDir(ctx.cwd), "memory.jsonl");
 					ctx.ui.notify(existsSync(f) ? readFileSync(f, "utf8").slice(-2000) : "(empty)", "info");
 				} else {
 					const lines = memorySummaryLines(ctx.cwd);
 					ctx.ui.notify(
-						lines.length ? [...lines, "(raw: /zense memory json)"].join("\n") : "📚 memory ยังว่าง — บทเรียนจะสะสมเองทุก escalation/flag/eval/sub-agent fail",
+						lines.length ? [...lines, "(raw: /zense memory json)"].join("\n") : "📚 memory is empty — lessons accumulate on every escalation/flag/eval/sub-agent failure",
 						"info",
 					);
 				}
 			} else if (sub === "distill") {
 				await runDistill(ctx);
 			} else if (sub === "models") {
-				// ดู/ตั้ง model ของ sub-agent แยกตาม role (.zense/models.json)
+				// view/set sub-agent models per role (.zense/models.json)
 				const cfgPath = join(zenseDir(ctx.cwd), "models.json");
 				const cfg = readModelsConfig(ctx.cwd);
 				const mainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no active model)";
 				const roles = ["requirements", "planner", "grader", "reviewer", "distiller"];
 				if (ctx.mode !== "tui") {
-					// non-TUI (rpc/print): แสดง summary ให้แก้เองเหมือนเดิม
+					// non-TUI (rpc/print): show a summary for manual editing, as before
 					const lines = [
-						`🧪 sub-agent models — config: ${existsSync(cfgPath) ? relative(ctx.cwd, cfgPath) : "(no .zense/models.json — ทุก role ใช้ model หลัก)"}`,
-						`agent หลัก: ${mainModel}`,
-						...roles.map((r) => `  ${r}: ${cfg[r] ? cfg[r] + " (จาก config)" : mainModel + " (fallback)"}`),
-						"แก้ไขโดยสร้าง .zense/models.json เช่น { \"grader\": \"openai/gpt-4o-mini\" } — หรือเปิด TUI แล้ว /zense models เพื่อเลือกแบบ interactive",
+						`🧪 sub-agent models — config: ${existsSync(cfgPath) ? relative(ctx.cwd, cfgPath) : "(no .zense/models.json — every role uses the main model)"}`,
+						`main agent: ${mainModel}`,
+						...roles.map((r) => `  ${r}: ${cfg[r] ? cfg[r] + " (from config)" : mainModel + " (fallback)"}`),
+						"edit by creating .zense/models.json, e.g. { \"grader\": \"openai/gpt-4o-mini\" } — or open the TUI and use /zense models for an interactive picker",
 					];
 					ctx.ui.notify(lines.join("\n"), "info");
 					return;
 				}
-				// TUI: interactive picker — เลือก role → เลือก model จาก catalogue → เขียน models.json ให้เลย
+				// TUI: interactive picker — pick a role → pick a model from the catalogue →
+				// models.json gets written
 				const role = await zensePick(
 					ctx,
-					"🧪 เลือก role ของ sub-agent ที่จะตั้ง model",
+					"🧪 pick the sub-agent role to set a model for",
 					roles.map((r) => ({
 						value: r,
 						label: r,
-						description: cfg[r] ? `${cfg[r]} (จาก config)` : `${mainModel} (fallback)`,
+						description: cfg[r] ? `${cfg[r]} (from config)` : `${mainModel} (fallback)`,
 					})),
-					`agent หลัก: ${mainModel}`,
+					`main agent: ${mainModel}`,
 				);
 				if (!role) return;
 				const choices = availableModelChoices(ctx);
 				const sel = await zensePick(
 					ctx,
-					`🧪 เลือก model สำหรับ role "${role}"`,
+					`🧪 pick a model for role "${role}"`,
 					[
-						{ value: "__default__", label: "↩️ ใช้ model หลัก (ลบ override)", description: `กลับไป fallback เป็น ${mainModel}` },
-						{ value: "__custom__", label: "✏️ พิมพ์ pattern เอง", description: "เช่น openai/gpt-4o-mini หรือ sonnet:high" },
+						{ value: "__default__", label: "↩️ use the main model (remove override)", description: `falls back to ${mainModel}` },
+						{ value: "__custom__", label: "✏️ type a pattern yourself", description: "e.g. openai/gpt-4o-mini or sonnet:high" },
 						...choices.map((c) => ({ value: c.pattern, label: c.label, description: c.description })),
 					],
-					choices.length ? `${choices.length} models จาก catalogue` : "catalogue ว่าง — เลือก 'พิมพ์ pattern เอง'",
+					choices.length ? `${choices.length} models from the catalogue` : "catalogue empty — pick 'type a pattern yourself'",
 				);
 				if (!sel) return;
 				if (sel === "__default__") {
 					writeModelsConfig(ctx.cwd, role, null);
-					ctx.ui.notify(`✅ ${role}: ลบ override แล้ว — sub-agent run ถัดไปจะ fallback เป็น model หลัก (${mainModel})`, "info");
+					ctx.ui.notify(`✅ ${role}: override removed — the next sub-agent run falls back to the main model (${mainModel})`, "info");
 					return;
 				}
 				let pattern = sel;
 				if (sel === "__custom__") {
-					const typed = (await ctx.ui.input(`model pattern สำหรับ "${role}":`, "provider/model-id"))?.trim();
-					if (!typed) return ctx.ui.notify("ยกเลิก — ไม่ได้เปลี่ยน model", "info");
+					const typed = (await ctx.ui.input(`model pattern for "${role}":`, "provider/model-id"))?.trim();
+					if (!typed) return ctx.ui.notify("cancelled — model unchanged", "info");
 					pattern = typed;
 				}
 				writeModelsConfig(ctx.cwd, role, pattern);
-				ctx.ui.notify(`✅ ${role}: ${pattern} — เขียน ${relative(ctx.cwd, cfgPath)} แล้ว (มีผล sub-agent run ถัดไปทันที)`, "info");
+				ctx.ui.notify(`✅ ${role}: ${pattern} — wrote ${relative(ctx.cwd, cfgPath)} (takes effect on the next sub-agent run)`, "info");
 			} else if (sub === "ext-config-show" || sub === "ext-config") {
-				// ext-config-show (ชื่อใหม่; ext-config เดิมรับเป็น alias): ไม่มี role → view รวมทุก role;
-				// มี role → เดลิเกต runExtConfig (ทางหลัก = per-role commands /zense:ext-config:<role>)
+				// ext-config-show (new name; ext-config kept as alias): no role → combined view of
+				// all roles; with a role → delegate to runExtConfig (the main path is the per-role
+				// commands /zense:ext-config:<role>)
 				const roles = ["requirements", "planner", "grader", "reviewer", "distiller"];
 				const [role, action, ...vals] = rest;
 				if (!role || !roles.includes(role)) {
 					ctx.ui.notify(
 						[
-							"🧩 sub-agent extension loading (ต่อ role) — default: boot เปลือย ไม่โหลด extension เลย · tick เพิ่มเฉพาะที่ต้องการ (opt-in)",
+							"🧩 sub-agent extension loading (per role) — default: bare boot, no extensions · tick to opt specific ones back in",
 							...roles.map((r) => {
 								const inc = subagentExtIncludes(r, ctx.cwd);
-								return `  ${r}: ${inc.length ? `โหลด ${inc.length} ตัว` : "boot เปลือย (ไม่โหลด extension)"}`;
+								return `  ${r}: ${inc.length ? `loads ${inc.length}` : "bare boot (no extensions)"}`;
 							}),
-							`persist: local ${join(zenseDir(ctx.cwd), "config.json")} · global ${join(zenseGlobalConfigDir(), "config.json")} (seed ครั้งแรก + fallback)`,
-							"ตั้งค่า: /zense:ext-config:grader | :requirements | :reviewer (TUI = checkbox ทันที) หรือ /zense ext-config-show <role> all|none|on|off <เลขลำดับ|path>",
+							`persist: local ${join(zenseDir(ctx.cwd), "config.json")} · global ${join(zenseGlobalConfigDir(), "config.json")} (first-time seed + fallback)`,
+							"configure: /zense:ext-config:grader | :requirements | :reviewer (TUI = instant checkboxes) or /zense ext-config-show <role> all|none|on|off <index|path>",
 						].join("\n"),
 						"info",
 					);
@@ -4152,13 +4329,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// per-role ext-config commands (v8): autocomplete จากชื่อ command ตรงๆ ไม่ต้องพิมพ์ role เป็น arg
-	// (pi getArgumentCompletions ส่งแค่ prefix คำปัจจุบัน แยกตำแหน่งไม่ได้ — pattern เดียวกับ skill commands)
+	// per-role ext-config commands (v8): autocomplete straight from the command name, no role
+	// arg to type (pi's getArgumentCompletions supplies only the current word's prefix — same
+	// pattern as skill commands)
 	for (const role of ["requirements", "planner", "grader", "reviewer", "distiller"] as const)
 		pi.registerCommand(`zense:ext-config:${role}`, {
-			description: `sub-agent "${role}" จะโหลด extensions ตัวไหนบ้าง (default boot เปลือย — tick เพิ่ม opt-in; save ลง local .zense + seed global ครั้งแรก)`,
+			description: `which extensions sub-agent "${role}" loads (default: bare boot — opt in by ticking; saved to local .zense + first-time global seed)`,
 			handler: async (_args, ctx) => runExtConfig(ctx as ExtensionContext, role),
 		});
-
-	// renderSpecMd อยู่ module scope (export เพื่อ unit-test) — closure นี้เรียกใช้งานตัวนั้นตรงๆ
 }

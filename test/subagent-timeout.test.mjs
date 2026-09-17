@@ -5,41 +5,41 @@ import { join } from "node:path";
 import test from "node:test";
 import { subagentTimeout } from "../extensions/zense-harness/index.ts";
 
-// B: timeout ต่อ role — ป้องกัน regression ของ bug "code=143 signal=null" (timeout ถูกรายงานเป็น crash)
-test("subagentTimeout: per-role map + default fallback (ไม่มี env override แล้ว)", () => {
+// B: per-role timeout — regression-guards the "code=143 signal=null" bug (a timeout reported as a crash)
+test("subagentTimeout: per-role map + default fallback (no more env override)", () => {
 	assert.equal(subagentTimeout("requirements"), 600_000);
 	assert.equal(subagentTimeout("grader"), 600_000);
 	assert.equal(subagentTimeout("reviewer"), 480_000);
-	assert.equal(subagentTimeout("unknown-role"), 300_000); // role แปลก → default
+	assert.equal(subagentTimeout("unknown-role"), 300_000); // unknown role → default
 });
 
-// s2: ช่องปรับของ agent = .zense/config.json (key subagentTimeoutMs) — อ่านสดทุก call ไม่ cache
+// s2: the agent-visible knob is .zense/config.json (key subagentTimeoutMs) — read live on every call, no cache
 test("subagentTimeout: .zense/config.json overrides built-in map, read fresh per call", () => {
 	const dir = mkdtempSync(join(tmpdir(), "zense-cfg-"));
 	try {
-		// ยังไม่มี config → built-in map
+		// no config yet → built-in map
 		assert.equal(subagentTimeout("requirements", dir), 600_000);
 		mkdirSync(join(dir, ".zense"), { recursive: true });
-		// role entry → ทับ map
+		// a role entry overrides the map
 		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 900_000 } }));
 		assert.equal(subagentTimeout("requirements", dir), 900_000);
-		assert.equal(subagentTimeout("grader", dir), 600_000); // role อื่นไม่โดน
-		// default entry ครอบ role ที่ไม่ระบุ
+		assert.equal(subagentTimeout("grader", dir), 600_000); // other roles unaffected
+		// a default entry covers unspecified roles
 		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { default: 45_000 } }));
 		assert.equal(subagentTimeout("grader", dir), 45_000);
 		assert.equal(subagentTimeout("requirements", dir), 45_000);
-		// role entry ชนะ default
+		// a role entry beats default
 		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { default: 45_000, reviewer: 120_000 } }));
 		assert.equal(subagentTimeout("reviewer", dir), 120_000);
-		// ค่า invalid (0/ติดลบ/ไม่ใช่ตัวเลข) → ข้าม ไปใช้ map
+		// invalid values (0/negative/non-number) → skipped, fall back to the map
 		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 0, default: -5 } }));
 		assert.equal(subagentTimeout("requirements", dir), 600_000);
 		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: "60k" } }));
 		assert.equal(subagentTimeout("requirements", dir), 600_000);
-		// JSON พัง → map (ไม่ throw)
+		// corrupt JSON → the map (never throws)
 		writeFileSync(join(dir, ".zense", "config.json"), "{oops");
 		assert.equal(subagentTimeout("requirements", dir), 600_000);
-		// อ่านสด: เขียนใหม่ตอน runtime → call ถัดไปเห็นทันที
+		// live read: rewritten at runtime → the very next call sees it
 		writeFileSync(join(dir, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 777_000 } }));
 		assert.equal(subagentTimeout("requirements", dir), 777_000);
 	} finally {
@@ -47,18 +47,18 @@ test("subagentTimeout: .zense/config.json overrides built-in map, read fresh per
 	}
 });
 
-// s2: worktree ไม่มี .zense (gitignored) → fallback ไป main repo
-test("subagentTimeout: cwd ไม่มี config → fallback dir ถัดไป (worktree → main repo)", () => {
+// s2: a worktree has no .zense (gitignored) → falls back to the main repo
+test("subagentTimeout: cwd without config → falls back to the next dir (worktree → main repo)", () => {
 	const wt = mkdtempSync(join(tmpdir(), "zense-wt-"));
 	const main = mkdtempSync(join(tmpdir(), "zense-main-"));
 	try {
 		mkdirSync(join(main, ".zense"), { recursive: true });
 		writeFileSync(join(main, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 800_000 } }));
-		assert.equal(subagentTimeout("requirements", wt, main), 800_000); // wt ไม่มี → main
+		assert.equal(subagentTimeout("requirements", wt, main), 800_000); // wt lacks it → main wins
 		mkdirSync(join(wt, ".zense"), { recursive: true });
 		writeFileSync(join(wt, ".zense", "config.json"), JSON.stringify({ subagentTimeoutMs: { requirements: 111_000 } }));
-		assert.equal(subagentTimeout("requirements", wt, main), 111_000); // wt มีของตัวเอง → ชนะ
-		assert.equal(subagentTimeout("reviewer", wt, main), 480_000); // ไม่มีใน config ทั้งคู่ → map
+		assert.equal(subagentTimeout("requirements", wt, main), 111_000); // wt has its own → it wins
+		assert.equal(subagentTimeout("reviewer", wt, main), 480_000); // absent in both configs → the map
 	} finally {
 		rmSync(wt, { recursive: true, force: true });
 		rmSync(main, { recursive: true, force: true });

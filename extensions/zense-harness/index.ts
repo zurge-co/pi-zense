@@ -76,6 +76,8 @@ interface SubagentRun {
 	logPath?: string;            // .zense/subagents/<stamp>-<role>.log — เขียน live ระหว่างรัน
 	model?: string;              // model ที่ sub-agent รันจริง ('provider/id' จาก JSONL events) — เทียบกับ .zense/models.json เพื่อดัก pi fallback เงียบๆ
 	status?: "running" | "done" | "failed";
+	retried?: boolean;           // provider-missing heal: รันนี้ถูก retry 1 ครั้งด้วย '-e <provider ext>' (2026-09-17)
+	autoIncluded?: boolean;      // provider-missing heal: retry สำเร็จ → merge persist path เข้า include list ของ role
 }
 /** Active per-session worktree: redirect ทุก tool call ของ main agent เข้าไปทำงานในนี้
  *  (ผ่านการ mutate event.input) จนกว่า eval PASS จะ apply เข้า main แบบ staged (ไม่ commit — ADR-003);
@@ -985,6 +987,126 @@ export const modelMatchesPattern = (usedModel: string, pattern: string): boolean
 	const used = usedModel.trim().toLowerCase();
 	const pat = pattern.trim().toLowerCase();
 	return used.length > 0 && (pat === used || pat.startsWith(`${used}:`));
+};
+
+// ---- provider-missing diagnosis (2026-09-17): sub-agent boot bare (--no-extensions) ตัด extension
+// ผู้ลง provider ของ main session ทิ้ง — provider ที่ต้องการรู้แน่ได้แค่ตอนรันจริง (models.json ต่อ role
+// อาจต่างจาก main agent) จึงวินิจฉัย post-run: silent fallback (usedModel provider ≠ pattern)
+// หรือ hard error (PROVIDER_MISSING_RX) → auto-heal retry ด้วย '-e <ext>' แล้ว persist ถ้าสำเร็จ,
+// ไม่งั้น mark failed พร้อม guidance per-role (/zense:ext-config:<role>)
+
+/** provider portion ของ model pattern (ก่อน '/' แรก, lowercase) — pattern ไม่มี '/' (เช่น "sonnet:high") = ไม่ระบุ provider */
+export const providerIdOfModelPattern = (pattern: string): string | undefined => {
+	const i = pattern.indexOf("/");
+	return i > 0 ? pattern.slice(0, i).trim().toLowerCase() : undefined;
+};
+
+/** 'provider/id' (จาก usedModel) → provider lowercase; undefined ถ้าไม่ส่งมา/ไม่มี '/' */
+export const usedProviderOf = (usedModel?: string): string | undefined => {
+	if (!usedModel) return undefined;
+	const i = usedModel.indexOf("/");
+	return i > 0 ? usedModel.slice(0, i).toLowerCase() : undefined;
+};
+
+/** provider ที่ pi มี built-in (ไม่ได้มาจาก extension) — mismatch ของ provider พวกนี้แปลว่า model id ผิด/
+ *  ไม่มี auth ไม่ใช่ provider หายจาก bare boot → ข้าม heal ไปใช้ warning path เดิม. รายการนี้ใช้แค่"ข้าม"
+ *  auto-heal การพลาด (provider extension หลุดเข้ามาใน list) ทำให้แค่ไม่ retry — behavior ไม่พัง */
+export const BUILTIN_PROVIDER_IDS = new Set([
+	"anthropic", "openai", "openai-codex", "google", "google-vertex", "google-antigravity", "google-gemini-cli",
+	"amazon-bedrock", "azure-openai-responses", "openrouter", "groq", "mistral", "xai", "cerebras", "zai",
+	"opencode", "opencode-go", "kimi-coding", "minimax", "minimax-cn", "huggingface", "deepseek",
+]);
+
+/** stderr/output ของ pi ตอน --model pattern resolve ไม่ได้ (bare boot ไม่รู้จัก provider) — สัญญาณ hard-fail
+ *  ของ provider-missing (อีกสัญญาณ = silent fallback); เข้มงวดกว้างพอดี — false positive ทำให้แค่ retry ศูนย์เปล่า 1 รอบ */
+export const PROVIDER_MISSING_RX = /no models found matching|model .{0,60}\bnot available|unknown (model|provider)|no api key found for/i;
+
+/** ผลหาผู้ลง provider: path จริงของ extension + label สั้นสำหรับ UI (extDisplayLabel) */
+export interface ProviderExtHit {
+	path: string;
+	label: string;
+}
+
+const defaultExtSourceReader = (path: string): string | undefined => {
+	try {
+		return readFileSync(path, "utf8").slice(0, 400_000);
+	} catch {
+		return undefined; // อ่านไม่ได้ = ไม่ match (ทิ้งเงียบๆ เหมือน pattern ที่เหลือของ ext-config)
+	}
+};
+
+/** หา extension (installed+enabled) ที่น่าจะลง providerId — heuristic: ไฟล์มีทั้งคำว่า registerProvider และ
+ *  providerId (case-insensitive); score: path มี segment '/provider/' (+2, เช่น pi-synthetic → extensions/provider/
+ *  index.ts ท่ามกลาง 6 entry-points) / มี id literal 'id: "<pid>"' (+1). เจอหลายตัวคะแนนสูงสุดเท่ากัน = ambiguous
+ *  → undefined (ปล่อยไป guidance ตรงๆ ดีกว่าเดาผิด). reader inject ได้เพื่อ test โดยไม่แตะ disk */
+export const findProviderExtension = (
+	providerId: string,
+	exts: InstalledExtension[],
+	read: (path: string) => string | undefined = defaultExtSourceReader,
+): ProviderExtHit | undefined => {
+	const pid = providerId.toLowerCase();
+	const scored: { ext: InstalledExtension; score: number }[] = [];
+	for (const ext of exts) {
+		if (!ext.enabled) continue;
+		const content = read(ext.path)?.toLowerCase();
+		if (!content) continue;
+		if (!content.includes("registerprovider") || !content.includes(pid)) continue;
+		let score = 0;
+		if (/\/provider\//.test(ext.path.replace(/\\/g, "/"))) score += 2;
+		if (content.includes(`id: "${pid}"`) || content.includes(`id: '${pid}'`)) score += 1;
+		scored.push({ ext, score });
+	}
+	if (!scored.length) return undefined;
+	const max = Math.max(...scored.map((s) => s.score));
+	const top = scored.filter((s) => s.score === max);
+	if (top.length !== 1) return undefined; // ambiguous — ไม่เดา
+	return { path: top[0].ext.path, label: extDisplayLabel(top[0].ext) };
+};
+
+/** merge path เข้า include list (idempotent — มีแล้วคืนตัวเดิมเป๊ะ ตัวจับ === ได้ที่ caller) */
+export const mergeExtInclude = (current: string[], path: string): string[] => (current.includes(path) ? current : [...current, path]);
+
+/** ตัดสินใจว่า run นี้เข้าเคส provider-missing จาก bare boot หรือไม่ — pure (unit-test ได้); คืน undefined =
+ *  ไม่ใช่ (ไม่มี pattern, provider built-in — mismatch แปลว่า model id ผิด/auth หาย, หรือ run ปกติ) ;
+ *  kind: provider-mismatch = silent fallback (usedModel คนละ provider กับ pattern) / hard-missing = run พังด้วย model error */
+export const diagnoseProviderMissing = (
+	modelPattern: string | undefined,
+	r: { ok: boolean; output: string; usedModel?: string },
+): { kind: "provider-mismatch" | "hard-missing"; patternProvider: string } | undefined => {
+	if (!modelPattern) return undefined;
+	const patternProvider = providerIdOfModelPattern(modelPattern);
+	if (!patternProvider || BUILTIN_PROVIDER_IDS.has(patternProvider)) return undefined;
+	if (r.usedModel) {
+		const usedProv = usedProviderOf(r.usedModel);
+		// เงื่อนไขสุดท้าย: pattern ที่ match กันโดยบังเอิญ (เช่น pattern ไม่ระบุ provider รูป 'model:level') ไม่เข้า heal
+		if (usedProv !== patternProvider && !modelMatchesPattern(r.usedModel, modelPattern)) return { kind: "provider-mismatch", patternProvider };
+		return undefined;
+	}
+	if (!r.ok && PROVIDER_MISSING_RX.test(r.output)) return { kind: "hard-missing", patternProvider };
+	return undefined;
+};
+
+/** guidance text ตอน provider-missing วินิจฉัยแล้วแก้อัตโนมัติไม่ได้/ไม่ผ่าน — ชี้คำสั่ง per-role ของ role ที่พังจริง
+ *  (ห้ามบอก generic "ext-config" เพราะ role ที่ใช้ provider นี้อาจไม่ใช่ main agent: models.json ต่อ role คนละตัว) */
+export const buildProviderMissingGuidance = (
+	role: string,
+	providerId: string,
+	opts: { hit?: ProviderExtHit; alreadyIncluded?: boolean; autoRetried?: boolean } = {},
+): string => {
+	const lines = [
+		`provider "${providerId}" ไม่พร้อมใช้ใน sub-agent (${role}) — sub-agent boot แบบ --no-extensions จึงไม่โหลด extension ผู้ลง provider ของ main session`,
+	];
+	if (opts.autoRetried && opts.hit) lines.push(`auto-include "${opts.hit.label}" แล้วแต่ provider ยังไม่พร้อม — ตั้งค่าเอง:`);
+	if (opts.hit && !opts.alreadyIncluded) {
+		lines.push(`แก้: /zense:ext-config:${role} แล้ว tick "${opts.hit.label}"`);
+		lines.push(`หรือ: /zense ext-config-show ${role} on ${opts.hit.path}`);
+		lines.push(`ถ้า include แล้วยัง fallback → nghi auth: pi login ${providerId} หรือ set env API key ของ provider`);
+	} else if (opts.hit && opts.alreadyIncluded) {
+		lines.push(`extension "${opts.hit.label}" ถูก include ให้ role นี้อยู่แล้วแต่ provider ยังไม่พร้อม — nghi auth: pi login ${providerId} หรือ set env API key ของ provider (ตรวจรายการด้วย /zense ext-config-show ${role})`);
+	} else {
+		lines.push(`หา extension ผู้ลง provider "${providerId}" ไม่เจอใน installed extensions — ติดตั้ง provider extension นั้นก่อน หรือเปลี่ยน model ของ role ด้วย /zense models`);
+	}
+	return lines.join("\n");
 };
 
 export const buildSubagentArgv = (task: string, modelPattern?: string, excludeTools?: string[], role?: string, stripFlags?: string[]): string[] => {
@@ -2343,6 +2465,45 @@ export default function (pi: ExtensionAPI) {
 	/** launch wrapper: ลงทะเบียน run (widget แสดงสด) + เขียน log live ทุก chunk
 	 *  model ของ sub-agent: resolve ตาม role จาก .zense/models.json, ถ้าไม่มี entry ใช้ model
 	 *  ปัจจุบันของ agent หลัก (ctx.model), ถ้าไม่มีอีก ปล่อย pi ใช้ default (ไม่ส่ง --model) */
+	/** provider-missing auto-heal (2026-09-17): เรียกเมื่อ diagnosis เจอ provider ใน pattern หายจาก bare boot.
+	 *  หา extension ผู้ลง provider (findProviderExtension) → retry 1 ครั้งด้วย '-e <path>';
+	 *  สำเร็จ (ok + model ตรง pattern จริง — กัน include ผิดตัวแล้วยัง fallback เงียบ) → merge persist เข้า include list
+	 *  ของ role ผ่าน writeSubagentExtIncludes (main repo เท่านั้น — worktree fallback อ่านมาอยู่แล้ว) + แจ้งช่องยกเลิก;
+	 *  retry พัง/หา ext ไม่เจอ/ambiguous/include อยู่แล้ว (nghi auth) → mark failed พร้อม guidance per-role ไม่ persist อะไร */
+	const healProviderMismatch = async (
+		ctx: ExtensionContext,
+		role: string,
+		modelPattern: string,
+		r0: { ok: boolean; output: string; logPath: string; usedModel?: string },
+		subCwd: string,
+		stripFlags: string[],
+		task: string,
+		onChunk: ((chunk: string) => void) | undefined,
+		run: SubagentRun,
+		patternProvider: string,
+	): Promise<{ ok: boolean; output: string; logPath: string; usedModel?: string }> => {
+		const include = subagentExtIncludes(role, subCwd, ctx.cwd);
+		const hit = findProviderExtension(patternProvider, await listInstalledExtensions(subCwd));
+		const alreadyIncluded = hit ? include.includes(hit.path) : false;
+		if (hit && !alreadyIncluded) {
+			ctx.ui.notify(`🔁 zense: provider "${patternProvider}" ไม่พร้อมใช้ใน sub-agent (${role}) — retry โดยโหลด extension '${hit.label}'`, "info");
+			run.retried = true;
+			const r2 = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, r0.logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], [...stripFlags, "-e", hit.path]);
+			if (r2.ok && r2.usedModel && modelMatchesPattern(r2.usedModel, modelPattern)) {
+				const merged = mergeExtInclude(include, hit.path);
+				if (merged !== include) writeSubagentExtIncludes(ctx.cwd, role, merged);
+				run.autoIncluded = true;
+				learn(ctx, `provider auto-heal: ${role} — auto-include '${hit.label}' ให้ provider "${patternProvider}" (merge persist ลง .zense/config.json แล้ว)`);
+				ctx.ui.notify(`✅ zense: auto-include '${hit.label}' ให้ role ${role} แล้ว (provider "${patternProvider}") — ยกเลิกได้ด้วย /zense ext-config-show ${role} off ${hit.path}`, "info");
+				return r2;
+			}
+			learn(ctx, `provider auto-heal failed: ${role} — include '${hit.label}' แล้วยังพัง (ok=${r2.ok} used=${r2.usedModel ?? "?"} ต้องการ ${modelPattern})`);
+			return { ...r2, ok: false, output: `${buildProviderMissingGuidance(role, patternProvider, { hit, autoRetried: true })}\n---\n${r2.output}` };
+		}
+		learn(ctx, `provider missing: ${role} ต้องการ "${patternProvider}" แต่ heal ไม่ได้ — ${hit ? (alreadyIncluded ? "extension include อยู่แล้ว แต่ยัง fallback (nghi auth)" : "extension ambiguous/ใช้ไม่ได้") : "ไม่พบ extension ผู้ลง provider"}`);
+		return { ...r0, ok: false, output: `${buildProviderMissingGuidance(role, patternProvider, { hit, alreadyIncluded })}\n---\n${r0.output}` };
+	};
+
 	const launchSubagent = async (
 		ctx: ExtensionContext,
 		role: string,
@@ -2362,14 +2523,24 @@ export default function (pi: ExtensionAPI) {
 			// C: role ถูกล็อก read-only (SUBAGENT_EXCLUDE_TOOLS) → sub-agent ร่าง spec/อ่าน repo ได้แต่แก้โค้ดไม่ได้
 			// B: timeout ต่อ role — built-in map + ช่องของ agent: .zense/config.json (subagentTimeoutMs)
 			// ส่ง subCwd ก่อนแล้ว ctx.cwd (worktree ไม่มี .zense ของตัวเอง → config อยู่ที่ main repo)
-			const r = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], await subagentStripFlagsAsync(role, subCwd, ctx.cwd));
+			const stripFlags = await subagentStripFlagsAsync(role, subCwd, ctx.cwd);
+			const r0 = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], stripFlags);
+			// provider-missing diagnosis (2026-09-17, pure fn diagnoseProviderMissing): silent fallback
+			// (usedModel คนละ provider กับ pattern) / hard error (stderr ตรง PROVIDER_MISSING_RX) → heal
+			const diagnosis = diagnoseProviderMissing(modelPattern, r0);
+			let r = r0;
+			let healHandled = false;
+			if (diagnosis) {
+				healHandled = true;
+				r = await healProviderMismatch(ctx, role, modelPattern!, r0, subCwd, stripFlags, task, onChunk, run, diagnosis.patternProvider);
+			}
 			run.ok = r.ok;
 			run.summary = r.output.slice(0, 300);
 			run.status = r.ok ? "done" : "failed";
 			if (r.usedModel) run.model = r.usedModel;
 			// verify model ที่รันจริงตรง config — pi fallback ไป default เงียบๆ ได้เมื่อ pattern resolve ไม่ได้
 			// (provider/id ไม่รู้จัก → ไม่มี error, หล่นไป saved default = มักเป็น model ของ agent หลัก)
-			if (modelPattern && r.usedModel && !modelMatchesPattern(r.usedModel, modelPattern)) {
+			if (!healHandled && modelPattern && r.usedModel && !modelMatchesPattern(r.usedModel, modelPattern)) {
 				learn(ctx, `sub-agent model mismatch: ${role} requested ${modelPattern} but ran ${r.usedModel}`);
 				ctx.ui.notify(`⚠ sub-agent model mismatch: ${role} — config ขอ "${modelPattern}" แต่รันจริง "${r.usedModel}" (pi fallback? ตรวจ .zense/models.json / /zense models)`, "warning");
 			}

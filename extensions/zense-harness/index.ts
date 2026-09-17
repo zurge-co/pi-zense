@@ -66,6 +66,7 @@ interface State {
 	worktree?: Worktree | null;     // active worktree ของ session (null = ทำงานใน main ตามปกติ)
 	worktreeLeaveNotified?: boolean; // dedupe notify “unmerged worktree” 1 ครั้ง/การสร้าง
 	pendingApply?: PendingApply;    // change ที่ apply เข้า main แบบ staged หลัง eval PASS รอมนุษย์ commit (ADR-003)
+	contextBulletin?: string;      // one-shot ข้อความ cycle-closure ที่จะติด system prompt ของ turn ถัดไป (consume แล้วเคลียร์ทันที) — ปิดช่อง agent ไม่รู้ว่ามนุษย์ accept/discard/commit แล้ว
 }
 interface SubagentRun {
 	role: string;
@@ -593,6 +594,45 @@ export const acceptPendingApply = (
 	rmSync(join(zenseDir(cwd), PENDING_MSG), { force: true });
 	return { ok: true, msg: "ปิด pending apply แล้ว — change durable ใน main (undo จากนี้ใช้ git revert ปกติ)", amendedFiles, warnings, committedOnBehalf };
 };
+
+// ----------------------------------------------------------------------------- cycle closure: bulletin + reset (module scope — export เพื่อ unit-test)
+/** งานปิด 2 อาการของ 'closure ไม่สนิท': (1) agent ไม่รู้ว่ามนุษย์ accept/discard/commit แล้ว
+ *  (เห็นแค่ tool results — command/reconcile ปิดเงียบๆ) → contextBulletin one-shot ติด system prompt
+ *  turn ถัดไปครั้งเดียว (ห้าม sendUserMessage — trigger turn ใหม่เสมอ); (2) state.spec ค้างทำ
+ *  commitSpec นับ version ต่อทั้งที่เป็นงานใหม่ → resetCycleState เคลียร์ cycle-scope ให้เริ่ม v1 ใหม่ */
+
+/** cycle reset: เคลียร์เฉพาะ state ที่ผูกกับรอบงาน — คง session-scope observability (turnsUsed/tokensUsed/
+ *  subagentRuns/trajectoryFlags/escalations) และห้ามแตะ .zense/spec.json + specs archive บน disk (ประวัติ);
+ *  เรียกเฉพาะตอน closure สำเร็จ (accept/discard/reconcile ที่ index ว่าง) — idempotent (state ว่างอยู่แล้วก็ไม่พัง) */
+export const resetCycleState = (s: State): void => {
+	s.spec = undefined;
+	s.phase = "requirements";
+	s.lastEval = undefined;
+	s.baselineHead = undefined;
+	s.evalOverrideFails = undefined;
+	s.specSource = undefined;
+	s.specMdPath = undefined;
+	s.specJsonPath = undefined;
+	s.lastCompileLessons = undefined;
+	s.worktreeLeaveNotified = undefined;
+};
+
+/** one-shot getter: คืนค่า bulletin แล้วเคลียร์ field ทันที (caller persist — กันติด system prompt ทุก turn); ไม่มี → undefined ไม่แตะ state */
+export const takeContextBulletin = (s: { contextBulletin?: string }): string | undefined => {
+	const b = s.contextBulletin;
+	if (b !== undefined) s.contextBulletin = undefined;
+	return b;
+};
+
+/** ข้อความ ≤2 บรรทัด ขึ้นต้น '[zense]' — ติด system prompt ของ turn ถัดไป ห้าม markdown หนัก */
+export const buildAcceptBulletin = (specVersion: number, title: string, amendedCount: number): string =>
+	`[zense] งาน spec v${specVersion} "${title}" ถูก accept + commit บน main แล้ว${amendedCount ? ` (มนุษย์แก้เพิ่ม ${amendedCount} ไฟล์หลัง grader ผ่าน)` : ""} — cycle reset แล้ว งานใหม่เริ่ม spec v1`;
+
+export const buildReconcileBulletin = (specVersion: number): string =>
+	`[zense] pendingApply ของ spec v${specVersion} ถูกมนุษย์ปิดนอก flow (commit แล้ว หรือถิ้ง change) — cycle reset แล้ว งานใหม่เริ่ม spec v1`;
+
+export const buildDiscardBulletin = (specVersion: number): string =>
+	`[zense] change ของ spec v${specVersion} ถูก discard — reverse patch ออกจาก main แล้ว — cycle reset แล้ว งานใหม่เริ่ม spec v1`;
 
 const freshState = (): State => ({
 	phase: "requirements",
@@ -2401,6 +2441,9 @@ export default function (pi: ExtensionAPI) {
 				state.pendingApply = undefined;
 				rmSync(join(zenseDir(ctx.cwd), PENDING_PATCH), { force: true });
 				rmSync(join(zenseDir(ctx.cwd), PENDING_MSG), { force: true });
+				// เดิม 'ล้าง pointer เงียบๆ' = agent หลงว่างานค้าง + version รันต่อ — ตอนนี้บอกผ่าน bulletin + reset cycle
+				state.contextBulletin = buildReconcileBulletin(pa.specVersion);
+				resetCycleState(state);
 				persist();
 			} else {
 				ctx.ui.notify(
@@ -2629,9 +2672,19 @@ export default function (pi: ExtensionAPI) {
 
 	// ----- M (spec v2 ข้อ 3): comment-discipline guideline append เข้า system prompt เฉพาะตอน implementation
 	// (system prompt ถูกส่งทุก turn — จ่ายเฉพาะช่วงที่มีการเขียนโค้ดจริงเท่านั้น; ออกจาก implementation แล้วหายไปเอง)
-	pi.on("before_agent_start", async (event) => {
-		if (state.phase !== "implementation") return;
-		return { systemPrompt: event.systemPrompt + "\n\n" + COMMENT_DISCIPLINE_GUIDELINE };
+	pi.on("before_agent_start", async (event, ctx) => {
+		let sp = event.systemPrompt;
+		if (state.phase === "implementation") sp += "\n\n" + COMMENT_DISCIPLINE_GUIDELINE;
+		// cycle-closure bulletin (2026-09-17): one-shot — consume แล้ว persist ทันที ไม่ติดทุก turn;
+		// ไม่ใช้ sendUserMessage จงใจ (trigger turn ใหม่เสมอ = เปลือง LLM call + surprise ตอนเปิด session)
+		const bulletin = takeContextBulletin(state);
+		if (bulletin) {
+			sp += "\n\n" + bulletin;
+			persist();
+		}
+		// fast path เดิม: ไม่มีอะไรเปลี่ยน → undefined ไม่สร้าง systemPrompt copy ใหม่
+		if (sp === event.systemPrompt) return;
+		return { systemPrompt: sp };
 	});
 
 	// ----- Phase 3: turn/token usage meter
@@ -3708,8 +3761,8 @@ export default function (pi: ExtensionAPI) {
 			state.pendingApply = undefined;
 			// บันทึกเป็น escalation ด้วย — reject คือ signal สำคัญของวงจร (reviewer packet/telemetry ครั้งหน้าควรเห็น)
 			state.escalations.push({ kind: "discarded", detail: `spec v${v} apply discarded after human review`, at: Date.now() });
-			state.phase = "maintenance";
 			learn(ctx, `spec v${v} discarded after review (reverse-applied patch)`);
+			resetCycleState(state); // closure พัง = จบรอบเช่นกัน (tool path: agent ได้ tool result อยู่แล้ว ไม่ set bulletin)
 			persist();
 			updateWidget(ctx);
 			return {
@@ -3722,14 +3775,14 @@ export default function (pi: ExtensionAPI) {
 		/** accept ของ pendingApply (ใช้ร่วมกันทั้ง /zense accept และ zense_accept tool):
 	 *  ปิดบัญชี → learn outcome ลง memory (accepted cleanly / with amendments / warnings) → maintenance
 	 *  commitIfStaged=true คือ "มนุษย์ขอให้ commit แทน" — helper จะ commit จาก message ที่เตรียมไว้ (hook ทำงานปกติ) */
-	const acceptPending = (ctx: ExtensionContext, commitIfStaged: boolean): { ok: boolean; text: string; specVersion?: number } => {
+	const acceptPending = (ctx: ExtensionContext, commitIfStaged: boolean, notifyViaBulletin = false): { ok: boolean; text: string; specVersion?: number } => {
 		if (!state.pendingApply)
 			return { ok: false, text: "ไม่มี pending apply ให้ accept (change accept/commit ไปแล้ว หรือยังไม่เคย apply)" };
 		const v = state.pendingApply.specVersion;
+		const specTitle = state.spec?.title ?? ""; // เก็บก่อน reset — bulletin ต้องใช้
 		const r = acceptPendingApply(ctx.cwd, { evalTree: state.lastEval?.head, preApplyHead: state.pendingApply.preApplyHead, commitIfStaged });
 		if (!r.ok) return { ok: false, text: `⚠️ accept ไม่สำเร็จ: ${r.msg}` };
 		state.pendingApply = undefined;
-		state.phase = "maintenance";
 		// outcome เชิงบวกก็เป็น signal ของวงจรเช่นกัน — push escalation kind "accepted" (pattern เดียวกับ "discarded")
 		// ให้ reviewer packet/telemetry รอบถัดไปเห็นทั้งฝั่งรับและฝั่งทิ้ง ไม่ใช่เห็นแต่ของพัง
 		state.escalations.push({ kind: "accepted", detail: `spec v${v} accepted by human${r.amendedFiles.length ? ` — amended: ${r.amendedFiles.join(", ")}` : ""}`, at: Date.now() });
@@ -3745,6 +3798,10 @@ export default function (pi: ExtensionAPI) {
 		);
 		if (r.committedOnBehalf) learn(ctx, `spec v${v} accepted: harness committed staged change on human request`);
 		for (const w of r.warnings) learn(ctx, `accept warning spec v${v}: ${w}`);
+		// cycle closure (2026-09-17): accept สำเร็จ = จบรอบงาน — reset cycle state ให้งานถัดไปเริ่ม spec v1;
+		// bulletin เฉพาะ command path (/zense accept): tool path agent ได้ tool result อยู่แล้ว กันข้อมูลซ้ำ
+		if (notifyViaBulletin) state.contextBulletin = buildAcceptBulletin(v, specTitle, r.amendedFiles.length);
+		resetCycleState(state);
 		persist();
 		updateWidget(ctx);
 		const warnText = r.warnings.length ? `\n⚠️ ${r.warnings.join("\n⚠️ ")}` : "";
@@ -3972,6 +4029,8 @@ export default function (pi: ExtensionAPI) {
 				const v = state.pendingApply.specVersion;
 				state.pendingApply = undefined;
 				learn(ctx, `spec v${v} discarded after review (reverse-applied)`);
+				state.contextBulletin = buildDiscardBulletin(v); // command path (มนุษย์พิมพ์) — agent ต้องรู้ผ่าน system prompt turn ถัดไป
+				resetCycleState(state);
 				persist();
 				updateWidget(ctx);
 				ctx.ui.notify(`✅ ${dr.msg} — spec v${v} ถูกย้อนออกจาก main แล้ว`, "info");
@@ -3994,7 +4053,7 @@ export default function (pi: ExtensionAPI) {
 						);
 					commitIfStaged = true;
 				}
-				const r = acceptPending(ctx, commitIfStaged);
+				const r = acceptPending(ctx, commitIfStaged, true);
 				ctx.ui.notify(r.text, r.ok ? "info" : "warning");
 			} else if (sub === "agents") {
 				await openAgentsViewer(ctx);

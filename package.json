@@ -1,6 +1,6 @@
 {
   "name": "pi-zense",
-  "version": "0.33.3",
+  "version": "0.33.4",
   "description": "Spec-gated, human-signed SDLC harness for pi (zense = a pun on the Thai word for sign) — sub-agents, dual eval, escalation gates — plus the Zense dark theme.",
   "keywords": [
     "pi-package",

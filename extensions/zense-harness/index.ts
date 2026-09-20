@@ -2018,8 +2018,11 @@ const subagentLogPath = (cwd: string, role: string): string => {
  * before close — the log looks frozen until the very end), while json mode streams
  * JSONL events from the start → parsed into text and appended live to the log so the
  * user can tail it during the run (/zense agents or ctrl+_).
+ * abortSignal = pi's agent-turn signal (Esc): wired like the timeout — SIGTERM +
+ * 5s SIGKILL backstop → resolves ok:false "cancelled by user" instead of waiting
+ * out the (up to 10-minute) timeout (old bug: Esc did nothing mid-run).
  */
-function runSubagent(
+export function runSubagent(
 	role: string,
 	task: string,
 	cwd: string,
@@ -2029,9 +2032,16 @@ function runSubagent(
 	modelPattern?: string,           // pi --model pattern (e.g. "anthropic/claude-sonnet") — undefined = pi default
 	excludeTools?: string[],         // C: read-only roles (requirements) → ["write","edit"] (see SUBAGENT_EXCLUDE_TOOLS)
 	stripFlags?: string[],           // ext-config: resolved from subagentStripFlags(role, subCwd, ctx.cwd) — undefined = built-in map
+	abortSignal?: AbortSignal,       // pi agent-turn signal (Esc) — kill the child mid-run; pre-aborted → never spawn
 ): Promise<{ ok: boolean; output: string; logPath: string; usedModel?: string }> {
 	const relLog = relative(cwd, logPath);
 	return new Promise((res) => {
+		// Esc already arrived before we got here (e.g. during a clarify dialog between
+		// launches) → resolve immediately without spawning a doomed child
+		if (abortSignal?.aborted) {
+			res({ ok: false, output: "cancelled by user (Esc) — the sub-agent never started", logPath });
+			return;
+		}
 		// M: pass role into the argv builder for that role's strip flags — the log header echoes them for later audit
 		const argv = buildSubagentArgv(task, modelPattern, excludeTools, role, stripFlags);
 		const strip = stripFlags ?? SUBAGENT_STRIP_FLAGS[role];
@@ -2126,25 +2136,44 @@ function runSubagent(
 		// mysterious "exited code=143".
 		// SIGKILL backstop after 5s: covers pi hanging in a long tool call after SIGTERM
 		let timedOut = false;
+		let cancelled = false; // set by the abort listener — distinguishes a user cancel from a crash in the close handler
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const timer = setTimeout(() => {
 			timedOut = true;
 			child.kill("SIGTERM");
 			killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
 		}, timeoutMs);
+		// Esc mid-run → same kill pattern as the timeout; abort supersedes the timeout timer
+		const onAbort = () => {
+			cancelled = true;
+			clearTimeout(timer);
+			appendFileSync(logPath, `\n--- cancelled by user (Esc) — SIGTERM ---\n`);
+			child.kill("SIGTERM");
+			killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+		};
+		abortSignal?.addEventListener("abort", onAbort, { once: true });
 		child.on("error", (err) => {
 			clearTimeout(timer);
+			abortSignal?.removeEventListener("abort", onAbort);
 			appendFileSync(logPath, `\n[spawn error] ${err.message}\n`);
 			res({ ok: false, output: `sub-agent spawn error: ${err.message} (log: ${relLog})`, logPath });
 		});
 		child.on("close", (code, signal) => {
 			clearTimeout(timer);
 			clearTimeout(killTimer);
+			abortSignal?.removeEventListener("abort", onAbort);
 			if (lineBuf.trim()) handleLine(lineBuf); // flush a trailing unterminated line
-			appendFileSync(logPath, `\n--- exited code=${code} signal=${signal}${timedOut ? " (timeout SIGTERM)" : ""} ---\n`);
+			appendFileSync(logPath, `\n--- exited code=${code} signal=${signal}${timedOut ? " (timeout SIGTERM)" : cancelled ? " (cancelled SIGTERM)" : ""} ---\n`);
 			appendFileSync(logPath, `--- used model: ${usedModel ?? "(not captured from events)"} ---\n`);
 			const modelInfo = usedModel !== undefined ? { usedModel } : {};
-			if (code === 0 && !signal) res({ ok: true, output: (finalText || out).slice(-16_000), logPath, ...modelInfo });
+			if (cancelled)
+				res({
+					ok: false,
+					output: `cancelled by user (Esc) — the ${role} sub-agent was killed mid-run\nlast output:\n${out.slice(-2_000)}\n(full log: ${relLog})`,
+					logPath,
+					...modelInfo,
+				});
+			else if (code === 0 && !signal) res({ ok: true, output: (finalText || out).slice(-16_000), logPath, ...modelInfo });
 			else
 				res({
 					ok: false,
@@ -2557,7 +2586,7 @@ export default function (pi: ExtensionAPI) {
 		const line =
 			`ZENSE ▸ ${state.phase.toUpperCase()} · spec: ${s ? (s.approved ? "✅v" + s.version : "⏳unapproved") : "—"}` +
 			` · turns ${state.turnsUsed} · tok ${fmtTok(state.tokensUsed)}` +
-			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+_ live)` : "") +
+			(run ? ` · 🧪 ${run.role} ▶ ${Math.round((Date.now() - (run.startedAt ?? run.at)) / 1000)}s (ctrl+_ live · Esc cancels)` : "") +
 			(state.worktree ? ` · 🌳 ${basename(state.worktree.root)}` : "") +
 			(state.pendingApply ? ` · ⏳staged v${state.pendingApply.specVersion}` : "") +
 			(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
@@ -2638,6 +2667,7 @@ export default function (pi: ExtensionAPI) {
 		role: string,
 		task: string,
 		onChunk?: (chunk: string) => void,
+		signal?: AbortSignal, // pi agent-turn signal (Esc) — threaded into runSubagent so the user can cancel mid-run
 	): Promise<{ ok: boolean; output: string; logPath: string }> => {
 		const logPath = subagentLogPath(ctx.cwd, role);
 		const mainModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
@@ -2653,14 +2683,15 @@ export default function (pi: ExtensionAPI) {
 			// B: per-role timeout — built-in map + agent-visible knob .zense/config.json (subagentTimeoutMs);
 			// subCwd first, then ctx.cwd (a worktree has no .zense of its own → config lives in the main repo)
 			const stripFlags = await subagentStripFlagsAsync(role, subCwd, ctx.cwd);
-			const r0 = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], stripFlags);
+			const r0 = await runSubagent(role, task, subCwd, subagentTimeout(role, subCwd, ctx.cwd), onChunk, logPath, modelPattern, SUBAGENT_EXCLUDE_TOOLS[role], stripFlags, signal);
 			// provider-missing diagnosis (2026-09-17, pure fn diagnoseProviderMissing): silent
 			// fallback (usedModel has a different provider than the pattern) / hard error (stderr
 			// matches PROVIDER_MISSING_RX) → heal
 			const diagnosis = diagnoseProviderMissing(modelPattern, r0);
 			let r = r0;
 			let healHandled = false;
-			if (diagnosis) {
+			// a user cancel (Esc) is not a provider problem — never auto-heal/relaunch after it
+			if (diagnosis && !signal?.aborted) {
 				healHandled = true;
 				r = await healProviderMismatch(ctx, role, modelPattern!, r0, subCwd, stripFlags, task, onChunk, run, diagnosis.patternProvider);
 			}
@@ -3420,7 +3451,7 @@ export default function (pi: ExtensionAPI) {
 			specDebt: Type.Optional(Type.Array(Type.String(), { description: "Unverifiable → forced human review" })),
 			title: Type.Optional(Type.String()),
 		}),
-		async execute(_id, params, _sig, _on, ctx) {
+		async execute(_id, params, sig, _on, ctx) {
 			if (params.action === "compile_spec") {
 				if (!params.intent?.trim())
 					return { content: [{ type: "text", text: "compile_spec requires intent — pass the user's request summary as intent and call again" }], details: {}, isError: true };
@@ -3481,7 +3512,12 @@ export default function (pi: ExtensionAPI) {
 				// (4 clarify + retry + final draft fit exactly)
 				while (launches < 7) {
 					launches++;
-					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons, facts, exemplar, subagentTimeout("requirements", state.worktree?.root ?? ctx.cwd, ctx.cwd)));
+					// Esc before this (re)launch → stop the loop instead of spawning another sub-agent
+					if (sig?.aborted)
+						return { content: [{ type: "text", text: "⏸ compile_spec cancelled by the user (Esc) — the user interrupted on purpose — do NOT retry on your own; ask what they'd like instead" }], details: { cancelled: true }, isError: true };
+					const draft = await launchSubagent(ctx, "requirements", buildRequirementsPrompt(intent, lessons, facts, exemplar, subagentTimeout("requirements", state.worktree?.root ?? ctx.cwd, ctx.cwd)), undefined, sig);
+					if (!draft.ok && sig?.aborted)
+						return { content: [{ type: "text", text: `⏸ compile_spec cancelled by the user (Esc) — the requirements sub-agent was killed mid-run (log: ${relative(ctx.cwd, draft.logPath)}). The user interrupted on purpose — do NOT retry on your own; ask what they'd like instead` }], details: { cancelled: true, logPath: draft.logPath }, isError: true };
 					if (!draft.ok) return { content: [{ type: "text", text: `sub-agent failed: ${draft.output}` }], details: draft };
 					const parsed = parseSpecDraft(draft.output);
 					if (parsed.kind === "clarify" && !clarifyClosed && clarifyRounds < 4 && ctx.hasUI) {
@@ -3590,7 +3626,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Phase 4: dual evaluation — output eval grades the artifact against approved spec criteria (delegated to the grader sub-agent); trajectory flags are attached. Spec-debt items become forced human review.",
 		parameters: Type.Object({ note: Type.Optional(Type.String()) }),
-		async execute(_id, _p, _s, onUpdate, ctx) {
+		async execute(_id, _p, sig, onUpdate, ctx) {
 			if (!state.spec) return { content: [{ type: "text", text: "No spec yet." }], details: {}, isError: true };
 			onUpdate?.({ content: [{ type: "text", text: "running probes + grader sub-agent…" }], details: {} });
 			// W3: probes — the harness runs criteria[].check itself first (deterministic) as
@@ -3624,7 +3660,7 @@ export default function (pi: ExtensionAPI) {
 			let grade: { ok: boolean; output: string; logPath: string } = { ok: false, output: "(not launched)", logPath: "" };
 			let feedback = "";
 			for (let launch = 0; launch < 3; launch++) {
-				grade = await launchSubagent(ctx, "grader", buildGraderPrompt(state.spec, probes, diffSummary, feedback), streamTail);
+				grade = await launchSubagent(ctx, "grader", buildGraderPrompt(state.spec, probes, diffSummary, feedback), streamTail, sig);
 				if (!grade.ok) break;
 				parsed = parseGraderOutput(grade.output, state.spec.criteria);
 				const problems: string[] = [];
@@ -3643,6 +3679,9 @@ export default function (pi: ExtensionAPI) {
 			// it, so an inconclusive eval crashed TDZ "Cannot access 'probeSection' before
 			// initialization" instead of escalating to the human
 			const probeSection = buildCompactProbeSection(probes);
+			// Esc killed the grader → don't escalate "inconclusive" to the human after their own interrupt
+			if (!grade.ok && sig?.aborted)
+				return { content: [{ type: "text", text: "⏸ eval cancelled by the user (Esc) — the grader sub-agent was killed mid-run. The user interrupted on purpose — do NOT re-run eval on your own; ask what they'd like instead" }], details: { cancelled: true, logPath: grade.logPath }, isError: true };
 			// W2 (G): inconclusive — used to be "unknown silently flows to PASS" (= free merge
 			// into main) → now escalates for the human to decide, with probe results (hard
 			// evidence that's guaranteed to exist) and a non-looping way out (re-eval allowed)
@@ -3808,7 +3847,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Zense Review Packet",
 		description: "Phase 5: build the exception-based review packet (TL;DR first, evidence linked, anomalies highlighted).",
 		parameters: Type.Object({}),
-		async execute(_id, _p, _s, _o, ctx) {
+		async execute(_id, _p, sig, _o, ctx) {
 			// phase-order guard: review comes only after eval PASS (phase is set to "review" in
 			// zense_eval)
 			if (state.phase !== "review")
@@ -3849,14 +3888,17 @@ export default function (pi: ExtensionAPI) {
 			const packetInput = (): string =>
 				buildReviewerPrompt(state.spec?.intent ?? "(no spec)", state.lastEval, state.trajectoryFlags, state.spec?.specDebt ?? [], state.escalations,
 					(gitEvidencePrefix ? gitEvidencePrefix + "\n" : "") + gitChangeSummary(reviewRoot, state.baselineHead), packetFeedback, freshness, state.spec?.criteria);
-			let reviewer = await launchSubagent(ctx, "reviewer", packetInput());
+			let reviewer = await launchSubagent(ctx, "reviewer", packetInput(), undefined, sig);
+			// Esc killed the reviewer → stop before the retry/grounding chain spawns more sub-agents
+			if (!reviewer.ok && sig?.aborted)
+				return { content: [{ type: "text", text: "⏸ review cancelled by the user (Esc) — the reviewer sub-agent was killed mid-run. The user interrupted on purpose — do NOT re-run review on your own; ask what they'd like instead" }], details: { cancelled: true, logPath: reviewer.logPath }, isError: true };
 			let packetParse = parseReviewerPacket(reviewer.output);
 			// A (schema): missing sections → one retry with feedback (replaces the raw 900-char
 			// slice that waved anything through)
 			if (reviewer.ok && !packetParse.ok) {
 				learn(ctx, `reviewer: packet missing sections [${packetParse.missing.join(",")}] — retry`);
 				packetFeedback = packetParse.missing.join(", ");
-				reviewer = await launchSubagent(ctx, "reviewer", packetInput());
+				reviewer = await launchSubagent(ctx, "reviewer", packetInput(), undefined, sig);
 				packetParse = parseReviewerPacket(reviewer.output);
 			}
 			// r5 (grounding): packet tokens absent from the evidence = inventions → one retry with
@@ -3868,7 +3910,7 @@ export default function (pi: ExtensionAPI) {
 			if (ungrounded.length) {
 				learn(ctx, `reviewer: ungrounded tokens [${ungrounded.slice(0, 5).join(",")}] — retry`);
 				packetFeedback = `ungrounded tokens not present in the evidence (remove them or quote verbatim): ${ungrounded.slice(0, 8).join(", ")}`;
-				reviewer = await launchSubagent(ctx, "reviewer", packetInput());
+				reviewer = await launchSubagent(ctx, "reviewer", packetInput(), undefined, sig);
 				ungrounded = reviewer.ok ? checkGrounding(reviewer.output) : [];
 				if (ungrounded.length) {
 					state.trajectoryFlags.push(`reviewer hallucination: ${ungrounded.slice(0, 5).join(",")}`);

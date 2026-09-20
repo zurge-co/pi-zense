@@ -350,6 +350,146 @@ const excludeFromGitStatus = (cwd: string, absPath: string): void => {
 	}
 };
 
+// ----- new-session resume helpers (/zense resume: explicit adoption only — a session
+//       that does not resume abandons the old cycle; nothing here runs automatically)
+
+/** Adopt the latest on-disk spec into a fresh session: parse + validate .zense/spec.json.
+ *  synced by syncApprovedSpecFiles, so approved:true on disk = genuinely signed. Minimal
+ *  shape check only (numeric version, string title, array scope/criteria); optional fields
+ *  default to [] — older persisted specs lack approach. Corrupt/absent → null. */
+export const loadSpecFromDisk = (cwd: string): Spec | null => {
+	try {
+		const p = join(zenseDir(cwd), "spec.json");
+		if (!existsSync(p)) return null;
+		const s = JSON.parse(readFileSync(p, "utf8")) as Partial<Spec>;
+		if (!s || typeof s.version !== "number" || typeof s.title !== "string") return null;
+		if (!Array.isArray(s.scope) || !Array.isArray(s.criteria)) return null;
+		return {
+			version: s.version,
+			title: s.title,
+			intent: typeof s.intent === "string" ? s.intent : "",
+			...(Array.isArray(s.approach) ? { approach: s.approach } : {}),
+			scope: s.scope,
+			constraints: Array.isArray(s.constraints) ? s.constraints : [],
+			criteria: s.criteria,
+			specDebt: Array.isArray(s.specDebt) ? s.specDebt : [],
+			approved: s.approved === true,
+			...(typeof s.approvedAt === "number" ? { approvedAt: s.approvedAt } : {}),
+			...(Array.isArray(s.changesFrom) ? { changesFrom: s.changesFrom } : {}),
+		};
+	} catch {
+		return null;
+	}
+};
+
+/** Locate the archive pair (.zense/specs/<stamp>-v<N>-<slug>.{json,md}) for a spec version
+ *  so a resumed state gets working specJsonPath/specMdPath (zense_eval appends outcomes to
+ *  the archive .md). Files are timestamp-prefixed → the newest copy sorts last. */
+export const findSpecArchivePaths = (cwd: string, version: number): { json?: string; md?: string } => {
+	try {
+		const dir = join(zenseDir(cwd), "specs");
+		if (!existsSync(dir)) return {};
+		const files = readdirSync(dir)
+			.filter((f) => f.includes(`-v${version}-`))
+			.sort();
+		const jsons = files.filter((f) => f.endsWith(".json"));
+		const mds = files.filter((f) => f.endsWith(".md"));
+		return {
+			...(jsons.length ? { json: join(dir, jsons[jsons.length - 1]) } : {}),
+			...(mds.length ? { md: join(dir, mds[mds.length - 1]) } : {}),
+		};
+	} catch {
+		return {};
+	}
+};
+
+/** Rewire a previous session's worktree: scan .zense/worktree/* for a REAL git worktree on a
+ *  zense/impl/ branch. Prefer an exact version match (zense/impl/v<N>-…); a version bump
+ *  mid-implementation keeps the old branch name (cosmetic — see approveCurrentSpec), so a
+ *  single unmatched candidate is still adopted (caller warns); several unmatched candidates
+ *  = ambiguous → null rather than guessing (would mix two rounds of work). */
+export const findSessionWorktree = (cwd: string, specVersion: number): { wt: Worktree; exactVersion: boolean } | null => {
+	try {
+		const parent = join(zenseDir(cwd), "worktree");
+		if (!existsSync(parent)) return null;
+		const candidates: { wt: Worktree; exactVersion: boolean }[] = [];
+		for (const entry of readdirSync(parent)) {
+			const dir = join(parent, entry);
+			try {
+				if (!statSync(dir).isDirectory()) continue;
+			} catch {
+				continue;
+			}
+			if (!gitOk(["rev-parse", "--is-inside-work-tree"], dir).ok) continue; // real worktrees only (never adopt a stray dir)
+			const br = gitOk(["rev-parse", "--abbrev-ref", "HEAD"], dir);
+			if (!br.ok || !br.out.trim().startsWith("zense/impl/")) continue;
+			const branch = br.out.trim();
+			candidates.push({ wt: { root: dir, branch, dir }, exactVersion: branch.startsWith(`zense/impl/v${specVersion}-`) });
+		}
+		const exact = candidates.find((c) => c.exactVersion);
+		if (exact) return exact;
+		return candidates.length === 1 ? candidates[0] : null; // one leftover = unambiguous (stale branch name ok); many = refuse to guess
+	} catch {
+		return null;
+	}
+};
+
+/** Restore pendingApply across session boundaries: eval PASS applied the change into main as
+ *  staged changes, the human then opened a NEW session to review+commit — without this the
+ *  new session's /zense accept|discard finds "no pending apply". Requires BOTH the helper
+ *  patch file (proves an apply happened) AND a non-empty staged index (proves it's still
+ *  pending) — an empty index means the human closed it outside the flow → null. */
+export const restorePendingApply = (cwd: string, specVersion: number): PendingApply | null => {
+	try {
+		const patchPath = join(zenseDir(cwd), PENDING_PATCH);
+		if (!existsSync(patchPath)) return null;
+		if (gitOk(["diff", "--cached", "--quiet"], cwd).ok) return null; // empty index = committed/discarded already
+		const names = gitOk(["diff", "--cached", "--name-only", "--", ".", NOT_ZENSE], cwd);
+		return {
+			specVersion,
+			branch: "(resumed)", // the apply already deleted the source branch — the pointer is for traceability only
+			paths: names.ok ? names.out.trim().split("\n").filter(Boolean) : [],
+			appliedAt: statSync(patchPath).mtimeMs,
+		};
+	} catch {
+		return null;
+	}
+};
+
+/** Everything /zense resume needs, discovered from disk in one call (spec → archive pair →
+ *  worktree → pendingApply). null = nothing resumable (no valid spec.json). worktree/
+ *  pendingApply are optional by design: a gone worktree or closed apply never blocks resume.
+ *  pendingApply is only probed for signed specs (an apply can't exist before approval). */
+export interface ResumeDiscovery {
+	spec: Spec;
+	specJsonPath?: string;
+	specMdPath?: string;
+	worktree?: Worktree;
+	worktreeExactVersion?: boolean; // false = adopted a single leftover whose branch predates the spec version (caller warns)
+	pendingApply?: PendingApply;
+}
+
+export const discoverResumeState = (cwd: string): ResumeDiscovery | null => {
+	const spec = loadSpecFromDisk(cwd);
+	if (!spec) return null;
+	const arch = findSpecArchivePaths(cwd, spec.version);
+	const out: ResumeDiscovery = {
+		spec,
+		...(arch.json ? { specJsonPath: arch.json } : {}),
+		...(arch.md ? { specMdPath: arch.md } : {}),
+	};
+	const found = findSessionWorktree(cwd, spec.version);
+	if (found) {
+		out.worktree = found.wt;
+		out.worktreeExactVersion = found.exactVersion;
+	}
+	if (spec.approved) {
+		const pa = restorePendingApply(cwd, spec.version);
+		if (pa) out.pendingApply = pa;
+	}
+	return out;
+};
+
 /** single-line commit subject (≤72 chars) — built from the human-signed spec title */
 export const sanitizeSubject = (title: string): string => {
 	const oneLine = (title || "").replace(/\s+/g, " ").trim();
@@ -2543,6 +2683,16 @@ export default function (pi: ExtensionAPI) {
 			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
 		lastWidget = undefined; // pi clears widgets on session switch/reload → resend even identical text
+		// discovery only — NEVER auto-adopt: a fresh session that finds an on-disk spec gets a
+		// hint to /zense resume; ignoring it = the old cycle is abandoned (left untouched on disk)
+		if (!state.spec && ctx.hasUI) {
+			const disk = loadSpecFromDisk(ctx.cwd);
+			if (disk)
+				ctx.ui.notify(
+					`📄 found spec v${disk.version}${disk.approved ? " (signed)" : ""} on disk: ${disk.title} — run /zense resume to continue it, or ignore to abandon`,
+					"info",
+				);
+		}
 		// reconcile pendingApply across sessions/restarts: is the applied change still staged in main?
 		if (state.pendingApply) {
 			const pa = state.pendingApply;
@@ -4181,21 +4331,74 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`✅ distill done — memory ${impact.memoryLines} lines → ${parsed.lessons.length} lessons · deleted ${specsN} spec file(s) · ${logsN} log file(s) (distiller log kept)`, "info");
 	};
 
+	/** 🔁 /zense resume — explicit adoption of an on-disk cycle into a FRESH session
+	 *  (appendEntry restore covers same-session resumes; a genuinely new session starts empty
+	 *  and spec/worktree/pendingApply pointers would otherwise be lost). Human decision
+	 *  (2026-09-20): no auto-adopt — a session that doesn't resume abandons the old cycle
+	 *  (files stay untouched on disk; clean up an abandoned worktree with git worktree remove). */
+	const resumeZense = (ctx: ExtensionContext): void => {
+		if (state.spec)
+			return ctx.ui.notify(
+				`nothing to resume — this session already owns spec v${state.spec.version} (${state.spec.approved ? "signed" : "unsigned"})`,
+				"warning",
+			);
+		const disc = discoverResumeState(ctx.cwd);
+		if (!disc)
+			return ctx.ui.notify(
+				"nothing to resume — no valid .zense/spec.json on disk (no spec was ever committed here, or the file is corrupt)",
+				"info",
+			);
+		const disk = disc.spec;
+		state.spec = disk;
+		state.phase = disk.approved ? "implementation" : "requirements"; // unsigned spec resumes with the gate closed — sign via /zense approve
+		state.specJsonPath = disc.specJsonPath;
+		state.specMdPath = disc.specMdPath;
+		// worktree rewire — found → redirect resumes; gone → work continues in main (never a failure)
+		let wtLine: string;
+		if (disc.worktree) {
+			state.worktree = disc.worktree;
+			state.worktreeLeaveNotified = true; // this notify already carries the "applied on eval PASS" info
+			wtLine =
+				`🌳 worktree rewired: ${disc.worktree.root}\n  branch ${disc.worktree.branch} — tool calls are redirected here; applied as staged changes on eval PASS` +
+				(disc.worktreeExactVersion === false ? `\n  ⚠ branch predates spec v${disk.version} (reused worktree across a version bump) — verify it holds the right in-progress work` : "");
+			learn(ctx, `resume: worktree rewired ${disc.worktree.branch} @ ${disc.worktree.root}`);
+		} else {
+			wtLine = "no matching worktree found — working directly in main";
+		}
+		// pendingApply restore — eval PASS staged the change in main, then the human reopened a
+		// session to review/commit: without the pointer /zense accept|discard would be blind
+		let paLine = "";
+		if (disc.pendingApply) {
+			state.pendingApply = disc.pendingApply;
+			learn(ctx, `resume: pendingApply restored (${disc.pendingApply.paths.length} staged path(s))`);
+			paLine = `\n⏳ pending apply restored: ${disc.pendingApply.paths.length} file(s) staged awaiting a commit — git commit -F .zense/pending-apply.msg · /zense accept · or /zense discard`;
+		}
+		learn(ctx, `resumed spec v${disk.version} from disk (approved=${disk.approved})`);
+		persist();
+		updateWidget(ctx);
+		ctx.ui.notify(
+			`🔁 resumed spec v${disk.version}${disk.approved ? " (signed — implementation gate open)" : " (unsigned — gate closed; sign via /zense approve)"}: ${disk.title}\n${wtLine}${paLine}`,
+			"info",
+		);
+	};
+
 	pi.registerCommand("zense", {
-		description: "Zense harness (zense = human signature/sign): status | approve | accept | discard | agents | gate on|off | memory | distill | models | ext-config-show",
+		description: "Zense harness (zense = human signature/sign): status | resume | approve | accept | discard | agents | gate on|off | memory | distill | models | ext-config-show",
 		getArgumentCompletions: (prefix) =>
 			// offer only real /zense subcommands — roles (requirements/grader/reviewer) stay out
 			// (they have dedicated /zense:ext-config:<role> commands), and actions (all/none/
 			// on/off) are second-level args of ext-config-show which pi can't positionally
 			// separate → including them would conjure phantom subcommands at position 1
-			["status", "approve", "accept", "agents", "discard", "distill", "gate", "memory", "models", "ext-config-show"]
+			["status", "resume", "approve", "accept", "agents", "discard", "distill", "gate", "memory", "models", "ext-config-show"]
 				.filter((s) => s.startsWith(prefix))
 				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			if (sub === "status") {
+				const disk = state.spec ? null : loadSpecFromDisk(ctx.cwd);
 				ctx.ui.notify(
 					`phase=${state.phase} spec=${state.spec ? `v${state.spec.version} approved=${state.spec.approved}` : "—"}\n` +
+						(disk ? `📄 on-disk spec found: v${disk.version} ${disk.approved ? "(signed)" : "(unsigned)"} — /zense resume to continue it, or ignore to abandon\n` : "") +
 						(state.worktree ? `worktree: ${state.worktree.dir}\n  branch ${state.worktree.branch} (active — applied as staged changes on eval PASS, never auto-committed)\n` : `worktree: (none — working in main)\n`) +
 						`turns=${state.turnsUsed} tokens=${state.tokensUsed}\n` +
 						(state.pendingApply
@@ -4204,6 +4407,8 @@ export default function (pi: ExtensionAPI) {
 						`trajectory flags:\n${state.trajectoryFlags.join("\n") || "(none)"}\nescalations:\n${state.escalations.map((e) => `${e.kind}: ${e.detail}`).join("\n") || "(none)"}`,
 					"info",
 				);
+			} else if (sub === "resume") {
+				resumeZense(ctx);
 			} else if (sub === "approve") {
 				if (!state.spec)
 				return ctx.ui.notify(
@@ -4366,7 +4571,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				await runExtConfig(ctx, role, action, vals);
 			} else {
-				ctx.ui.notify("usage: /zense status|approve|accept [commit]|discard|agents|gate on|off|memory|distill|models|ext-config-show", "info");
+				ctx.ui.notify("usage: /zense status|resume|approve|accept [commit]|discard|agents|gate on|off|memory|distill|models|ext-config-show", "info");
 			}
 		},
 	});

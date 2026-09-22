@@ -52,6 +52,7 @@ export * from "./src/adr-deny.ts";
 export * from "./src/subagent-runner.ts";
 export * from "./src/memory.ts";
 export * from "./src/models.ts";
+export * from "./src/ask.ts";
 
 // The original package import block (top of file) already covers every external the factory
 // body needs — the lines below are only the local src/ bindings the factory uses by name.
@@ -70,6 +71,7 @@ import { firstAdrDenyViolation } from "./src/adr-deny.ts";
 import { fmtTok, subagentLogPath, runSubagent } from "./src/subagent-runner.ts";
 import { aggregateMemory, memorySummaryLines, distillImpact, fmtBytes, parseDistilledLessons, buildDistilledMemory, clearDirFiles, MAX_DISTILL_MEMORY_BYTES, replaceFileAtomic, distillTaskPrompt } from "./src/memory.ts";
 import { readModelsConfig, resolveModelPattern, writeModelsConfig, availableModelChoices, panelize } from "./src/models.ts";
+import { asAskQuestions, formatAskAnswers, ASK_NO_UI_TEXT, type AskAnswer } from "./src/ask.ts";
 
 // ----------------------------------------------------------------------------- extension
 
@@ -1631,6 +1633,44 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, p, _s, _o, ctx) {
 			const r = acceptPending(ctx as ExtensionContext, !!p.commitIfStaged);
 			return { content: [{ type: "text", text: r.text }], details: { accepted: r.ok, ...(r.specVersion !== undefined ? { specVersion: r.specVersion } : {}) }, isError: !r.ok };
+		},
+	});
+
+	// ----- zense_ask: the harness picker as a general agent tool — any phase, not just the
+	// requirements clarify loop (a design decision the human should pick gets a real picker
+	// instead of a "1. a 2. b 3. c" plain-text list)
+
+	pi.registerTool({
+		name: "zense_ask",
+		label: "Zense Ask Human",
+		description:
+			"Ask the human decision-critical questions through the harness multiple-choice picker (search-filtered TUI with an 'Other (type your own)' free-text option). Callable in ANY phase — prefer this over dumping a '1. a 2. b 3. c' numbered list as chat text whenever the human should pick a design decision. In non-UI (RPC/print) sessions it returns guidance to ask in plain text instead — it never hangs.",
+		promptSnippet: "Ask the human questions with a multiple-choice picker any time a design decision needs a human pick",
+		promptGuidelines: [
+			"Use zense_ask whenever the human should choose between options (design decisions, direction changes, ambiguous next steps) — it renders a pickable/searchable TUI instead of a long numbered chat list.",
+			"Attach 2–6 plausible choices per question; the human can also pick 'Other (type your own)' to answer freely. Esc = that question is skipped (reported as such — never infer an answer from a skip).",
+			"Keep it to the few decision-critical questions (max 5 per call); this is an interactive check-in, not batch form-filling.",
+		],
+		parameters: Type.Object({
+			questions: Type.Array(
+				Type.Object({
+					question: Type.String(),
+					choices: Type.Optional(Type.Array(Type.String(), { description: "pickable options (2–6 work best); omit for a plain free-text answer" })),
+				}),
+				{ description: "questions asked in order, each with its own picker (max 5)" },
+			),
+		}),
+		async execute(_id, p, _s, _o, ctx) {
+			const qs = asAskQuestions(p.questions);
+			if (!qs?.length)
+				return { content: [{ type: "text", text: "zense_ask: no usable question — pass at least one non-empty question text" }], details: {}, isError: true };
+			// no UI → never await a picker: graceful non-error guidance (RPC/print must not hang)
+			if (!ctx.hasUI) return { content: [{ type: "text", text: ASK_NO_UI_TEXT }], details: { noUi: true } };
+			const answers: AskAnswer[] = [];
+			for (const q of qs)
+				answers.push({ question: q.question, answer: await askClarifyQuestion(ctx as ExtensionContext, q) }); // Esc/skip resolves undefined per question — never aborts the rest
+			learn(ctx as ExtensionContext, `zense_ask: ${qs.length} question(s), ${answers.filter((a) => a.answer === undefined).length} skipped`);
+			return { content: [{ type: "text", text: formatAskAnswers(answers) }], details: { answers } };
 		},
 	});
 

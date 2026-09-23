@@ -15,6 +15,7 @@ import { type State } from "./types.ts";
  *  reconcile with an empty index); idempotent. */
 export const resetCycleState = (s: State): void => {
 	s.spec = undefined;
+	s.longRun = undefined; // cycle closure after a COMPLETED tracker (acceptPending applies back + marks done) — mid-longrun phase closure never calls resetCycleState, it keeps the ref
 	s.phase = "requirements";
 	s.lastEval = undefined;
 	s.baselineHead = undefined;

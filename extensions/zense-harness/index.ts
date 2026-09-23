@@ -53,14 +53,21 @@ export * from "./src/subagent-runner.ts";
 export * from "./src/memory.ts";
 export * from "./src/models.ts";
 export * from "./src/ask.ts";
+export * from "./src/longrun.ts";
 
 // The original package import block (top of file) already covers every external the factory
 // body needs — the lines below are only the local src/ bindings the factory uses by name.
-import { zenseDir, type Criterion, type Spec, type State, type SubagentRun } from "./src/types.ts";
+import { zenseDir, type Criterion, type LongRunRef, type Spec, type State, type SubagentRun, type Tracker, type TrackerPhase, type Worktree as WorktreeT } from "./src/types.ts";
 import { buildSpecChanges, renderSpecChangesTui, renderSpecMd, syncApprovedSpecFiles, applyFullscreenDefault } from "./src/spec-changes.ts";
-import { rewritePathForWorktree, buildWorktreeCommand, gitOk, canReuseWorktree, createWorktree } from "./src/worktree.ts";
-import { loadSpecFromDisk, discoverResumeState } from "./src/resume.ts";
-import { composeCommitMessage, PENDING_PATCH, PENDING_MSG, isGitRepo, uncommittedChanges, composeSnapshotMessage, snapshotUncommitted, applyWorktreeBack, discardPendingApply, acceptPendingApply } from "./src/pending-apply.ts";
+import { rewritePathForWorktree, buildWorktreeCommand, gitOk, canReuseWorktree, createWorktree, ensureLongrunWorktree } from "./src/worktree.ts";
+import { loadSpecFromDisk, discoverResumeState, findSpecArchivePaths, discoverLongrunTrackers } from "./src/resume.ts";
+import {
+	allPhasesDone, appendSpecsLog, buildContextCapsule, checkpointCommit, droppedSeedIds, findPhase, healToBranch,
+	abandonLongrunWorktree, buildLongrunPlannerPrompt, compilePhaseSpec, loadTracker, longrunBranch, longrunDir,
+	nextPendingPhase, parseLongrunPlan, reconcileLongrunWorktree,
+	renderTrackerMd, resetToCheckpoint, saveTracker, slugifyTitle, validateTracker, writePhaseSummary,
+} from "./src/longrun.ts";
+import { composeCommitMessage, PENDING_PATCH, PENDING_MSG, NOT_ZENSE, isGitRepo, uncommittedChanges, composeSnapshotMessage, snapshotUncommitted, applyWorktreeBack, discardPendingApply, acceptPendingApply } from "./src/pending-apply.ts";
 import { resetCycleState, takeContextBulletin, buildAcceptBulletin, buildReconcileBulletin, buildDiscardBulletin, freshState } from "./src/cycle.ts";
 import { parseSpecDraft, applyQualityGate, type ClarifyQuestion } from "./src/spec-draft.ts";
 import { SUBAGENT_EXCLUDE_TOOLS, subagentTimeout, zenseGlobalConfigDir, extDisplayLabel, listInstalledExtensions, subagentExtIncludes, writeSubagentExtIncludes, subagentStripFlagsAsync, modelMatchesPattern, PROVIDER_MISSING_RX, findProviderExtension, mergeExtInclude, diagnoseProviderMissing, buildProviderMissingGuidance, buildRequirementsPrompt } from "./src/subagent-config.ts";
@@ -333,7 +340,9 @@ export default function (pi: ExtensionAPI) {
 				// no-spec → /zense approve can never work → tell the agent to commit a spec first
 				return { block: true, reason: state.spec
 					? "Zense gate: the spec is not yet signed — the user must sign via the next dialog or /zense approve first"
-					: "Zense gate: there is no spec in the system at all — call zense_spec (recommended: action=compile_spec) to commit one first; the user can then sign from the dialog immediately. A spec pasted in chat does not count" };
+					: state.longRun
+						? `Zense gate: longrun "${state.longRun.slug}" is between phases — call zense_longrun next to acquire the signed phase spec (writes outside a phase are blocked by design)`
+						: "Zense gate: there is no spec in the system at all — call zense_spec (recommended: action=compile_spec) to commit one first; the user can then sign from the dialog immediately. A spec pasted in chat does not count" };
 			}
 			// the signature lives on this dialog — signing continues the work immediately, no
 			// follow-up /zense approve needed (TUI: full spec shown before signing; RPC: plain select)
@@ -914,6 +923,10 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		fields: { title?: string; intent?: string; approach?: string[]; scope?: string[]; constraints?: string[]; criteria?: Criterion[]; specDebt?: string[] },
 		source: "set" | "compile",
+		// longrun: the signed tracker IS the signature — no dialog; provenance recorded on the
+		// spec; baselineOverride pins git evidence to the phase start (longrun branch HEAD),
+		// not to main's HEAD (which never moves during a longrun — ADR-004)
+		opts?: { sign?: "ask" | "auto"; provenance?: string; baselineOverride?: string },
 	): Promise<{ version: number; signed: boolean; mdPath: string; changes?: string[]; lint?: string[] }> => {
 		const version = (state.spec?.version ?? 0) + 1;
 		// deterministic commit-time check lint (one choke point for both action=set and
@@ -991,7 +1004,13 @@ export default function (pi: ExtensionAPI) {
 		// The spec was archived to disk first — the dialog shows the full text to read before
 		// signing (TUI)
 		let signed = false;
-		if (ctx.hasUI && ctx.mode === "tui") {
+		if (opts?.sign === "auto") {
+			state.spec.approvedBy = opts.provenance;
+			signed = true;
+			approveCurrentSpec(ctx);
+			if (opts.baselineOverride) state.baselineHead = opts.baselineOverride;
+			if (opts.provenance) learn(ctx, `spec v${state.spec.version} auto-approved by ${opts.provenance} (tracker signature)`);
+		} else if (ctx.hasUI && ctx.mode === "tui") {
 			const choice = await specSignDialog(ctx, state.spec, `Sign spec v${version}: ${state.spec.title}?`, [
 				{ value: "sign", label: "🔏 Sign & approve — open the implementation gate", description: "a human signature = the agent may start implementing" },
 				{ value: "later", label: "✏️ Not yet (I want to amend the spec first)", description: "sign later with /zense approve" },
@@ -1401,7 +1420,17 @@ export default function (pi: ExtensionAPI) {
 			// auto apply-back (ADR-003): on eval PASS → apply the worktree change into main
 			// **staged-only, never auto-committed** — the human reviews the diff in main, then
 			// makes the final commit (or asks the agent to)
-			if (state.worktree) {
+			if (state.worktree && state.longRun) {
+				// longrun (ADR-004): eval PASS does NOT apply back — the whole phase set merges at
+				// tracker completion. The phase work stays in the longrun worktree; the reviewer
+				// reads the phase diff there (baseline = phase start); the human accepts via
+				// zense_longrun close (checkpoint commit) or rejects via zense_longrun fail (reset --hard)
+				ctx.ui.notify(
+					`🌳 longrun ${state.longRun.slug}: eval PASS — phase held in worktree ${state.worktree.branch} for human review (main untouched)\n` +
+						`review: open ${state.worktree.root} or run zense_review → accept: zense_longrun close · reject: zense_longrun fail`,
+					"info",
+				);
+			} else if (state.worktree) {
 				const wtBranch = state.worktree.branch;
 				const preHead = gitOk(["rev-parse", "HEAD"], ctx.cwd); // doesn't move during apply (squash never commits) — kept for reconcile
 				const ar = applyWorktreeBack(ctx.cwd, state.spec, state.worktree);
@@ -1547,7 +1576,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, _p, _s, _o, ctx) {
 			if (!state.pendingApply)
 				return {
-					content: [{ type: "text", text: "no pending apply to discard (the change was already committed, or never applied)" }],
+					content: [{ type: "text", text: state.longRun
+						? `no pending apply to discard — longrun "${state.longRun.slug}" phases never stage into main (ADR-004). To reject the current phase's work: zense_longrun fail (git reset --hard to the phase baseline); to drop the whole requirement: zense_longrun abandon`
+						: "no pending apply to discard (the change was already committed, or never applied)" }],
 					details: { discarded: false },
 					isError: true,
 				};
@@ -1584,6 +1615,18 @@ export default function (pi: ExtensionAPI) {
 	const acceptPending = (ctx: ExtensionContext, commitIfStaged: boolean, notifyViaBulletin = false): { ok: boolean; text: string; specVersion?: number } => {
 		if (!state.pendingApply)
 			return { ok: false, text: "no pending apply to accept (already accepted/committed, or never applied)" };
+		// longrun: this pendingApply is the WHOLE tracker's final apply — accepting it closes
+		// the tracker (a mid-phase longrun has no pendingApply by construction, so hitting this
+		// branch with state.longRun set can only mean the final apply)
+		if (state.longRun) {
+			const t = loadTracker(ctx.cwd, state.longRun.slug);
+			if (t && t.status === "active") {
+				t.status = "done";
+				saveTracker(ctx.cwd, t);
+				appendSpecsLog(ctx.cwd, t.slug, `tracker COMPLETE — final apply accepted on main`);
+				learn(ctx, `longrun ${t.slug}: tracker v${t.version} done (${t.phases.length} phases) — merged into main`);
+			}
+		}
 		const v = state.pendingApply.specVersion;
 		const specTitle = state.spec?.title ?? ""; // captured before the reset — the bulletin needs it
 		const r = acceptPendingApply(ctx.cwd, { evalTree: state.lastEval?.head, preApplyHead: state.pendingApply.preApplyHead, commitIfStaged });
@@ -1633,6 +1676,502 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, p, _s, _o, ctx) {
 			const r = acceptPending(ctx as ExtensionContext, !!p.commitIfStaged);
 			return { content: [{ type: "text", text: r.text }], details: { accepted: r.ok, ...(r.specVersion !== undefined ? { specVersion: r.specVersion } : {}) }, isError: !r.ok };
+		},
+	});
+
+	// ----- long-running mode (ADR-004): tracker-signed multi-phase requirements · one worktree
+	//       for the whole set · per-phase human review gate · merge into main only at the end
+
+	/** Reconcile precondition shared by next/close/resume (ambient-state distrust): assert the
+	 *  worktree is on the tracker branch. Clean mismatches auto-heal; dirty/diverged states are
+	 *  the human's call (picker) — never auto. lastCheckpoint = newest done phase's checkpoint. */
+	const longrunReconcile = async (
+		ctx: ExtensionContext,
+		tracker: Tracker,
+		lastCheckpoint?: string,
+	): Promise<{ ok: boolean; text?: string; wt?: WorktreeT }> => {
+		const wt = state.worktree && state.worktree.branch === tracker.worktreeBranch ? state.worktree : undefined;
+		const rec = reconcileLongrunWorktree(wt?.root, tracker.worktreeBranch, lastCheckpoint);
+		if (rec.status === "missing-worktree") {
+			const ens = ensureLongrunWorktree(ctx.cwd, tracker.slug, tracker.worktreeBranch);
+			if (!ens)
+				return { ok: false, text: `❌ .zense/worktree/longrun-${tracker.slug} is occupied by a non-worktree directory — refusing to touch it (may hold human work); inspect/remove it manually` };
+			state.worktree = ens.wt;
+			state.worktreeLeaveNotified = false;
+			learn(ctx, `longrun ${tracker.slug}: worktree ${ens.created ? "(re)created" : "reattached"}: ${tracker.worktreeBranch}`);
+			persist();
+			return { ok: true, wt: ens.wt };
+		}
+		if (rec.status === "checkpoint-diverged") {
+			escalate("need-decision", `longrun ${tracker.slug}: checkpoint ${lastCheckpoint?.slice(0, 12)} is not an ancestor of ${tracker.worktreeBranch} HEAD (branch rewound outside the flow?)`, ctx);
+			return { ok: false, text: `⛔ checkpoint-diverged: the recorded checkpoint ${lastCheckpoint?.slice(0, 12)} is not an ancestor of HEAD on ${tracker.worktreeBranch} — the branch moved outside the flow. Human resolution required (escalation recorded) — never auto-healed\ncheck: git -C ${state.worktree?.root ?? `.zense/worktree/longrun-${tracker.slug}`} log --oneline -10` };
+		}
+		if (rec.status === "wrong-branch" || rec.status === "detached") {
+			if (rec.healable) {
+				const h = healToBranch(wt!.root, tracker.worktreeBranch);
+				if (!h.ok) return { ok: false, text: `❌ auto-heal failed switching back to ${tracker.worktreeBranch}: ${h.msg}` };
+				learn(ctx, `longrun ${tracker.slug}: healed HEAD (${rec.status}${rec.actualBranch ? `: ${rec.actualBranch}` : ""}) → ${tracker.worktreeBranch}`);
+				return { ok: true, wt: wt! };
+			}
+			// dirty tree on the wrong branch/detached = possibly the human's uncommitted review edits — only they may decide
+			if (!ctx.hasUI)
+				return { ok: false, text: `⛔ longrun worktree is on "${rec.actualBranch ?? "DETACHED"}" with ${rec.dirty.length} uncommitted change(s) (expected ${tracker.worktreeBranch}, no UI to ask) — human: cd ${wt!.root} && git status, then retry` };
+			const preview = rec.dirty.slice(0, 10).join("\n") + (rec.dirty.length > 10 ? `\n… (+${rec.dirty.length - 10} more)` : "");
+			const choice = await ctx.ui.select(
+				`longrun worktree is on branch "${rec.actualBranch ?? "DETACHED"}" with ${rec.dirty.length} uncommitted change(s):\n${preview}\n\nexpected branch: ${tracker.worktreeBranch}`,
+				[
+					"📦 stash → switch back → pop onto the longrun branch (the changes belong to the phase work)",
+					"🗑 discard the uncommitted changes, then switch back (destroys them)",
+					"✋ cancel — I'll fix the worktree myself",
+				],
+			);
+			if (!choice || choice.startsWith("✋"))
+				return { ok: false, text: "reconcile cancelled by the human — resolve the longrun worktree branch state, then retry" };
+			if (choice.startsWith("📦")) {
+				gitOk(["stash", "push", "-u", "-m", "longrun-reconcile"], wt!.root);
+				const h = healToBranch(wt!.root, tracker.worktreeBranch);
+				if (!h.ok) return { ok: false, text: `❌ switch-back failed after stashing (changes are safe in git stash): ${h.msg}` };
+				const pop = gitOk(["stash", "pop"], wt!.root);
+				learn(ctx, `longrun ${tracker.slug}: stash-healed onto ${tracker.worktreeBranch}${pop.ok ? "" : " (pop reported conflicts)"}`);
+				if (!pop.ok) return { ok: false, text: `⚠ switched back to ${tracker.worktreeBranch} but git stash pop reported conflicts — resolve them in ${wt!.root} first` };
+			} else {
+				gitOk(["reset", "-q", "--hard", "HEAD"], wt!.root);
+				gitOk(["clean", "-fd", "--", ".", NOT_ZENSE], wt!.root);
+				healToBranch(wt!.root, tracker.worktreeBranch);
+				learn(ctx, `longrun ${tracker.slug}: discarded ${rec.dirty.length} uncommitted change(s) on human order, back on ${tracker.worktreeBranch}`);
+			}
+		}
+		return { ok: true, wt: wt ?? undefined };
+	};
+
+	/** The final merge (tracker complete → ADR-003 staged apply-back, exactly once). Shared by
+	 *  close's last-phase path and its dirty-main retry (awaitingFinalApply). */
+	const longrunApplyFinal = (ctx: ExtensionContext, tracker: Tracker): { ok: boolean; text: string } => {
+		if (!state.spec || !state.worktree) return { ok: false, text: "internal: final apply needs the last phase's spec + worktree in state" };
+		const wtBranch = state.worktree.branch;
+		const preHead = gitOk(["rev-parse", "HEAD"], ctx.cwd);
+		const ar = applyWorktreeBack(ctx.cwd, state.spec, state.worktree);
+		if (!ar.ok) {
+			state.longRun = { ...state.longRun!, awaitingFinalApply: true } satisfies LongRunRef;
+			persist();
+			escalate("need-decision", `longrun ${tracker.slug} final apply: ${ar.msg}`, ctx);
+			return { ok: false, text: `⚠ final apply refused: ${ar.msg}\nfix main, then call zense_longrun close again — the retry skips checkpointing and only retries the apply` };
+		}
+		learn(ctx, `longrun ${tracker.slug}: worktree applied: ${ar.msg}`);
+		state.worktree = null;
+		const idxTree = gitOk(["write-tree"], ctx.cwd); // same repin as eval-PASS: reviewer evidence must read the index tree
+		if (idxTree.ok && state.lastEval) state.lastEval.head = idxTree.out.trim();
+		if (ar.paths.length) {
+			state.pendingApply = { specVersion: state.spec.version, branch: wtBranch, paths: ar.paths, appliedAt: Date.now(), ...(preHead.ok ? { preApplyHead: preHead.out.trim() } : {}) };
+			try { writeFileSync(join(zenseDir(ctx.cwd), PENDING_MSG), ar.commitMsg ?? composeCommitMessage(state.spec, [])); } catch { /* best-effort */ }
+		}
+		persist();
+		return {
+			ok: true,
+			text: `🌳 longrun "${tracker.slug}" COMPLETE — the whole phase set (${tracker.phases.length} phases) is staged in main (${ar.paths.length} file(s), not yet committed)\n` +
+				`review: git status · git diff --cached — then commit: git commit -F .zense/pending-apply.msg → /zense accept (marks the tracker done)\n` +
+				`↩️ unhappy with the whole set → zense_discard (reverse patch restores main; checkpoints stay on the deleted branch's reflog)`,
+		};
+	};
+
+	/** Close out a phase's cycle scope but KEEP the longrun ref + worktree (unlike
+	 *  resetCycleState, which runs only at whole-tracker closure). */
+	const resetLongrunPhaseCycle = (slug: string, trackerVersion: number, extra?: Partial<LongRunRef>): void => {
+		state.spec = undefined;
+		state.phase = "requirements";
+		state.lastEval = undefined;
+		state.baselineHead = undefined;
+		state.evalOverrideFails = undefined;
+		state.specSource = undefined;
+		state.specMdPath = undefined;
+		state.specJsonPath = undefined;
+		state.lastCompileLessons = undefined;
+		state.worktreeLeaveNotified = undefined;
+		state.pendingApply = undefined;
+		state.longRun = { slug, trackerVersion, ...extra };
+	};
+
+	const trackerSummaryLines = (t: Tracker): string => {
+		const done = t.phases.filter((p) => p.status === "done").length;
+		return `${t.slug} — "${t.title}" [v${t.version} ${t.status}] ${done}/${t.phases.length} phases done · branch ${t.worktreeBranch}`;
+	};
+
+	pi.registerTool({
+		name: "zense_longrun",
+		label: "Zense Long-Running",
+		description:
+			"Long-running mode: a requirement too big for one cycle is planned ONCE as a signed tracker (phases: pre-phase, p1, p2, …) at .zense/long-running/<slug>/, then run phase-by-phase — each phase auto-compiles its spec from the tracker's seed criteria (no per-phase signature; the tracker IS the signature), runs in the ONE shared longrun worktree (ADR-004), and stops at a human review gate (close = checkpoint commit, fail = reset --hard). main gets the merge only when every phase is done. Resume anytime by requirement-name.",
+		promptSnippet: "Run multi-phase requirements: signed tracker → per-phase loops in one worktree → merge at completion",
+		promptGuidelines: [
+			"Flow: init (specs.md) → plan (phases w/ seed criteria → human signs the tracker ONCE) → next (activate phase: capsule + auto-approved spec) → implement → zense_eval → zense_review → close (human accepted) or fail (human rejected) → next … → the last close merges into main.",
+			"Never hand-ed .zense/long-running/*/tracker.json — the tool transitions are the only writers; resume (zense_longrun resume or /zense longrun resume) always works from disk.",
+			"Between phases the write gate is shut: writes require an active phase spec from zense_longrun next — this is by design.",
+			"When a reconcile/step returns a human-resolution text, surface it verbatim and wait — never retry destructive operations on your own.",
+		],
+		parameters: Type.Object({
+			action: Type.Union(
+				["init", "plan", "next", "close", "fail", "status", "resume", "abandon"].map((v) => Type.Literal(v)) as [
+					ReturnType<typeof Type.Literal>, ...ReturnType<typeof Type.Literal>[],
+				],
+			),
+			slug: Type.Optional(Type.String({ description: "requirement-name (directory + branch key). Optional for resume (pick from a list); required elsewhere except init." })),
+			title: Type.Optional(Type.String({ description: "init: requirement title" })),
+			intent: Type.Optional(Type.String({ description: "init: what the whole requirement wants and why" })),
+			specsMd: Type.Optional(Type.String({ description: "init: full specs.md content (the master requirement doc)" })),
+			phases: Type.Optional(
+				Type.Array(
+					Type.Object({
+						id: Type.Optional(Type.String({ description: "stable id (p1, pre, …) — auto-assigned when omitted" })),
+						title: Type.String(),
+						intent: Type.String({ description: "what this phase delivers and why" }),
+						scope: Type.Array(Type.String()),
+						constraints: Type.Optional(Type.Array(Type.String())),
+						criteria: Type.Array(Type.Object({ id: Type.String(), text: Type.String(), check: Type.String({ description: CHECK_FORMAT_CONTRACT }) })),
+					}),
+					{ description: "plan: the phase list — seed criteria are signed with the tracker and carried verbatim into each phase spec; omit to let the planner sub-agent draft from specs.md (the human still signs the result)" },
+				),
+			),
+			extraCriteria: Type.Optional(
+				Type.Array(Type.Object({ id: Type.String(), text: Type.String(), check: Type.String() }), {
+					description: "next: extra criteria the agent adds for this phase (marked origin 'compiled'; may never replace a seed id)",
+				}),
+			),
+			summary: Type.Optional(Type.String({ description: "close: what the phase delivered (+ decisions worth carrying into the capsule)" })),
+			confirm: Type.Optional(Type.Boolean({ description: "fail/abandon: the human explicitly ordered this destructive step" })),
+		}),
+		async execute(_id, p, sig, _on, ctx) {
+			const say = (text: string, details: Record<string, unknown> = {}, isError = false) => ({ content: [{ type: "text" as const, text }], details, isError });
+			const lr = state.longRun;
+
+			if (p.action === "init") {
+				if (state.longRun) return say(`a longrun is already active in this session: "${state.longRun.slug}" — finish/abandon it first`, {}, true);
+				if (!p.title?.trim()) return say("init requires title", {}, true);
+				const slug = slugifyTitle(p.title);
+				if (loadTracker(ctx.cwd, slug)) return say(`tracker "${slug}" already exists — use resume/plan/status for it`, {}, true);
+				if (!isGitRepo(ctx.cwd)) return say("longrun requires a git repo (checkpoints/reset/apply-back are git-native) — this project is not one", {}, true);
+				const dir = longrunDir(ctx.cwd, slug);
+				mkdirSync(join(dir, "phases"), { recursive: true });
+				writeFileSync(join(dir, "specs.md"), p.specsMd?.trim() ? p.specsMd : `# ${p.title}\n\n${p.intent ?? ""}\n`);
+				const t: Tracker = { version: 1, slug, title: p.title, intent: p.intent ?? "", worktreeBranch: longrunBranch(slug), status: "planning", phases: [], updatedAt: Date.now() };
+				saveTracker(ctx.cwd, t);
+				learn(ctx, `longrun ${slug}: init (specs.md written)`);
+				return say(`🏗 longrun "${slug}" initialized at .zense/long-running/${slug}/ (specs.md written, tracker planning)\nnext: zense_longrun plan with the phase list (specs.md is amendable until the tracker is signed)`);
+			}
+
+			// every other action resolves a tracker from slug (param → active session longrun)
+			const slug = p.slug ?? (p.action === "resume" ? undefined : state.longRun?.slug);
+
+			if (p.action === "plan") {
+				if (!slug) return say("plan requires slug", {}, true);
+				const t0 = loadTracker(ctx.cwd, slug);
+				if (!t0) return say(`no tracker "${slug}" — run zense_longrun init first`, {}, true);
+				if (t0.status !== "planning") return say(`tracker "${slug}" is ${t0.status} — plan edits need a re-signed new version (amend = zense_longrun plan again after resetting status manually via the human)`, {}, true);
+				// no explicit phases → the planner sub-agent drafts them from specs.md (the human
+				// signs the RESULT — the model never bypasses the tracker signature)
+				let planInput = p.phases;
+				if (!planInput?.length) {
+					let specsMd = "";
+					try { specsMd = readFileSync(join(longrunDir(ctx.cwd, t0.slug), "specs.md"), "utf8"); } catch { /* best-effort */ }
+					const t0time = Date.now();
+					const run = await launchSubagent(ctx, "planner", buildLongrunPlannerPrompt(t0.title, t0.intent, specsMd), undefined, sig);
+					if (sig?.aborted) return say("⏸ plan cancelled (Esc) — do not retry on your own", {}, true);
+					if (!run.ok) return say(`planner sub-agent failed: ${run.output}\nalternative: call plan with an explicit phases list`, {}, true);
+					const parsed = parseLongrunPlan(run.output);
+					if (!parsed.ok)
+						return say(`planner output invalid: ${parsed.error}\nalternative: call plan with an explicit phases list (the raw draft is logged via /zense agents)`, {}, true);
+					planInput = parsed.phases;
+					learn(ctx, `longrun ${t0.slug}: planner drafted ${planInput.length} phases (${Date.now() - t0time}ms)`);
+				}
+				const phases: TrackerPhase[] = planInput.map((ph, i) => ({
+					id: ph.id?.trim() || `p${i + 1}`,
+					title: ph.title,
+					intent: ph.intent,
+					scope: ph.scope,
+					constraints: ph.constraints ?? [],
+					criteria: ph.criteria,
+					status: "pending",
+				}));
+				const t: Tracker = { ...t0, phases, updatedAt: Date.now() };
+				const errors = validateTracker(t);
+				if (errors.length) return say(`⛔ tracker invalid:\n${errors.map((e) => `- ${e}`).join("\n")}`, { errors }, true);
+				saveTracker(ctx.cwd, t); // write tracker.md first — the signer reads the full plan
+				let signed = false;
+				if (ctx.hasUI) {
+					const choice = await ctx.ui.select(
+						`🔏 Sign longrun tracker "${t.slug}" v${t.version}? ${phases.length} phase(s): ${phases.map((x) => x.id).join(", ")} — one signature covers all phases (full plan: .zense/long-running/${t.slug}/tracker.md)`,
+						[
+							"🔏 Sign — start the longrun (phases run under this signature; review gate at every phase end)",
+							"✏️ Not yet (amend the plan first)",
+						],
+					);
+					signed = !!choice && choice.startsWith("🔏");
+				}
+				if (!signed)
+					return say(`tracker "${t.slug}" saved unsigned (planning) — sign later: rerun plan, or /zense longrun sign ${t.slug}`, { signed });
+				t.approvedAt = Date.now();
+				t.status = "active";
+				saveTracker(ctx.cwd, t);
+				appendSpecsLog(ctx.cwd, t.slug, `tracker v${t.version} signed (${phases.length} phases: ${phases.map((x) => x.id).join(", ")})`);
+				state.longRun = { slug: t.slug, trackerVersion: t.version };
+				// the ONE worktree for the whole set exists from this moment (ADR-004)
+				const ens = ensureLongrunWorktree(ctx.cwd, t.slug, t.worktreeBranch);
+				if (ens) {
+					state.worktree = ens.wt;
+					state.worktreeLeaveNotified = false;
+				}
+				learn(ctx, `longrun ${t.slug}: tracker v${t.version} signed${ens ? `, worktree ${t.worktreeBranch}` : " (⚠ worktree unavailable)"}`);
+				persist();
+				return say(`🔏 tracker "${t.slug}" v${t.version} SIGNED — ${phases.length} phase(s) · worktree ${t.worktreeBranch}${ens ? "" : " (⚠ could not attach — next will try again)"}\nphases auto-run under this signature; start: zense_longrun next`, { signed: true, phases: phases.map((x) => x.id) });
+			}
+
+			if (p.action === "next") {
+				if (!state.longRun) return say("no active longrun in this session — resume one first (zense_longrun resume)", {}, true);
+				const t = loadTracker(ctx.cwd, state.longRun.slug);
+				if (!t) return say(`tracker "${state.longRun.slug}" vanished from disk — human check: .zense/long-running/`, {}, true);
+				if (t.status !== "active") return say(`tracker "${t.slug}" is ${t.status}`, {}, true);
+				if (state.spec?.approved) return say(`phase "${state.longRun.activePhase ?? "?"}" already has an active signed spec (v${state.spec.version}) — finish it (eval→review→close) or reject it with zense_longrun fail`, {}, true);
+				// final-apply retry: everything checkpointed, last attempt hit the dirty-main guard
+				if (state.longRun.awaitingFinalApply) {
+					if (!allPhasesDone(t)) return say("internal: awaitingFinalApply with pending phases — reconcile manually", {}, true);
+					const rec = await longrunReconcile(ctx, t, undefined);
+					if (!rec.ok) return say(rec.text!, {}, true);
+					// the phase cycle was already closed — rebuild the minimal spec view for a retry
+					if (!state.spec) {
+						const disk = loadSpecFromDisk(ctx.cwd);
+						if (disk) state.spec = disk;
+						else return say("retry needs the last phase's spec on disk (.zense/spec.json) — missing; human: apply manually via git merge --squash", {}, true);
+					}
+					const r = longrunApplyFinal(ctx, t);
+					if (r.ok) resetLongrunPhaseCycle(t.slug, t.version);
+					return say(r.text, {}, !r.ok);
+				}
+				const phase = nextPendingPhase(t);
+				if (!phase) return say(`all phases of "${t.slug}" are done — finish the final review in main (git diff --cached), commit, then /zense accept`, {});
+				const lastCheckpoint = [...t.phases].reverse().find((x) => x.checkpoint)?.checkpoint;
+				const rec = await longrunReconcile(ctx, t, lastCheckpoint);
+				if (!rec.ok) return say(rec.text!, {}, true);
+				if (!rec.wt) return say("internal: reconcile ok but no worktree", {}, true);
+				if (rec.ok && rec.wt && reconcileLongrunWorktree(rec.wt.root, t.worktreeBranch).dirty.length)
+					state.trajectoryFlags.push(`longrun ${t.slug}: phase ${phase.id} started with uncommitted leftovers in the worktree`);
+				const headSha = gitOk(["rev-parse", "HEAD"], rec.wt.root);
+				if (!headSha.ok) return say("could not read the longrun branch HEAD (git broken?)", {}, true);
+				const draft = compilePhaseSpec(t, phase, p.extraCriteria ?? []);
+				const dropped = droppedSeedIds(phase.criteria, draft.criteria);
+				if (dropped.length) return say(`⛔ seed criteria would be dropped: ${dropped.join(", ")} — the tracker signature forbids that`, {}, true);
+				const r = await commitSpec(ctx, draft, "set", { sign: "auto", provenance: draft.provenance, baselineOverride: headSha.out.trim() });
+				phase.status = "active";
+				phase.baseline = headSha.out.trim();
+				saveTracker(ctx.cwd, t);
+				appendSpecsLog(ctx.cwd, t.slug, `phase ${phase.id} "${phase.title}" activated (baseline ${headSha.out.trim().slice(0, 12)})`);
+				state.longRun = { slug: t.slug, trackerVersion: t.version, activePhase: phase.id };
+				persist();
+				const capsule = buildContextCapsule(ctx.cwd, t, phase);
+				return say(
+					`${capsule}\n\n✅ phase spec v${r.version} auto-approved (provenance tracker:${t.slug}@v${t.version}) — implement within scope: ${phase.scope.join(", ")}\n` +
+						`when done: zense_eval → zense_review → the human closes (zense_longrun close) or rejects (zense_longrun fail)`,
+					{ phase: phase.id, specVersion: r.version, capsule: true },
+				);
+			}
+
+			if (p.action === "close") {
+				if (!lr) return say("no active longrun in this session", {}, true);
+				const t = loadTracker(ctx.cwd, lr.slug);
+				if (!t) return say(`tracker "${lr.slug}" not found on disk`, {}, true);
+				if (lr.awaitingFinalApply) {
+					if (!state.spec) {
+						const disk = loadSpecFromDisk(ctx.cwd);
+						if (disk) state.spec = disk;
+					}
+					const r = longrunApplyFinal(ctx, t);
+					if (r.ok) resetLongrunPhaseCycle(t.slug, t.version);
+					return say(r.text, {}, !r.ok);
+				}
+				if (state.phase !== "review" || !state.spec)
+					return say(`⛔ close needs an eval-PASSED phase (phase=${state.phase}) — run zense_eval (+zense_review) first; the human closes only after review`, {}, true);
+				const phase = lr.activePhase ? findPhase(t, lr.activePhase) : undefined;
+				if (!phase) return say(`no active phase recorded for longrun "${t.slug}" (state/disk mismatch — human check tracker.json)`, {}, true);
+				if (!state.worktree) return say("no worktree attached (session restarted?) — run zense_longrun resume first", {}, true);
+				const rec = await longrunReconcile(ctx, t, undefined); // dirty is EXPECTED here (uncommitted phase work) — only branch/divergence matter
+				if (!rec.ok) return say(rec.text!, {}, true);
+				const ck = checkpointCommit(rec.wt!.root, `longrun(${t.slug}): ${phase.id} ${phase.title}`);
+				if (!ck.ok) return say(`❌ checkpoint commit failed: ${ck.msg}`, {}, true);
+				const files = gitOk(["diff", "--name-only", `${phase.baseline ?? "HEAD"}..HEAD`, "--", ".", NOT_ZENSE], rec.wt!.root);
+				const filesChanged = files.ok ? files.out.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+				phase.status = "done";
+				phase.checkpoint = ck.sha;
+				phase.specVersion = state.spec.version;
+				phase.summaryPath = writePhaseSummary(ctx.cwd, t, phase, p.summary ?? "", filesChanged);
+				saveTracker(ctx.cwd, t);
+				appendSpecsLog(ctx.cwd, t.slug, `phase ${phase.id} accepted → checkpoint ${ck.sha?.slice(0, 12)} (${filesChanged.length} files)`);
+				state.escalations.push({ kind: "accepted", detail: `longrun ${t.slug} phase ${phase.id} accepted (checkpoint ${ck.sha?.slice(0, 12)})`, at: Date.now() });
+				learn(ctx, `longrun ${t.slug}: phase ${phase.id} closed → checkpoint ${ck.sha?.slice(0, 12)}`);
+				const done = allPhasesDone(t);
+				if (done) {
+					const r = longrunApplyFinal(ctx, t);
+					if (!r.ok) return say(`✅ phase ${phase.id} closed (checkpoint ${ck.sha?.slice(0, 12)}) — but the final apply needs attention:\n${r.text}`, {}, true);
+					// keep state.phase = "review" + pendingApply → the standard /zense accept flow marks the tracker done
+					const slugKeep = t.slug, ver = t.version;
+					resetLongrunPhaseCycle(slugKeep, ver);
+					state.phase = "review"; // pendingApply exists → review/accept flow continues from here
+					persist();
+					return say(`✅ final phase ${phase.id} closed (checkpoint ${ck.sha?.slice(0, 12)})\n${r.text}`, { trackerComplete: true });
+				}
+				const nextP = nextPendingPhase(t)!;
+				resetLongrunPhaseCycle(t.slug, t.version);
+				state.contextBulletin = `[zense] longrun ${t.slug}: phase ${phase.id} closed (checkpoint ${ck.sha?.slice(0, 12)}) — ${nextP.id} "${nextP.title}" is next (zense_longrun next). Consider /compact to drop this phase's context — the capsule carries forward only what's needed`;
+				persist();
+				updateWidget(ctx);
+				return say(
+					`✅ phase ${phase.id} accepted — checkpoint ${ck.sha?.slice(0, 12)} on ${t.worktreeBranch} (${filesChanged.length} file(s))\nsummary: ${phase.summaryPath}\nnext: ${nextP.id} "${nextP.title}" → zense_longrun next · recommended: /compact first (clean context; the capsule re-orients)`,
+				{ closed: phase.id, checkpoint: ck.sha, next: nextP.id },
+				);
+			}
+
+			if (p.action === "fail") {
+				if (!lr?.activePhase) return say("no active phase to fail", {}, true);
+				const t = loadTracker(ctx.cwd, lr.slug);
+				if (!t) return say(`tracker "${lr.slug}" not found on disk`, {}, true);
+				const phase = findPhase(t, lr.activePhase);
+				if (!phase) return say(`phase "${lr.activePhase}" not found in tracker`, {}, true);
+				if (p.confirm !== true) {
+					if (!ctx.hasUI) return say("fail destroys the phase's uncommitted+committed-since-baseline work (reset --hard) — pass confirm:true only when the human explicitly ordered it", {}, true);
+					const ok = await ctx.ui.select(
+						`⚠️ fail phase ${phase.id} "${phase.title}"? git reset --hard back to baseline ${phase.baseline?.slice(0, 12) ?? "?"} — this phase's work in the longrun worktree is destroyed (earlier checkpoints are safe)`,
+						["🗑 Yes — reject this phase's work (reset --hard)", "✋ Cancel"],
+					);
+					if (!ok?.startsWith("🗑")) return say("fail cancelled", {});
+				}
+				if (!state.worktree || !phase.baseline) return say("missing worktree or phase baseline — cannot reset safely", {}, true);
+				const rr = resetToCheckpoint(state.worktree.root, phase.baseline);
+				if (!rr.ok) return say(`❌ reset failed: ${rr.msg}`, {}, true);
+				phase.status = "pending";
+				phase.baseline = undefined;
+				saveTracker(ctx.cwd, t);
+				appendSpecsLog(ctx.cwd, t.slug, `phase ${phase.id} REJECTED — reset --hard to baseline`);
+				state.escalations.push({ kind: "discarded", detail: `longrun ${t.slug} phase ${phase.id} rejected (reset --hard)`, at: Date.now() });
+				learn(ctx, `longrun ${t.slug}: phase ${phase.id} failed/rejected → ${rr.msg}`);
+				resetLongrunPhaseCycle(t.slug, t.version);
+				persist();
+				updateWidget(ctx);
+				return say(`🗑 phase ${phase.id} rejected — ${rr.msg}; the phase is pending again. Restart with a fresh approach: zense_longrun next`, { failed: phase.id });
+			}
+
+			if (p.action === "status") {
+				const trackers = discoverLongrunTrackers(ctx.cwd).filter((t) => t.status !== "done");
+				if (!trackers.length && !state.longRun) return say("no long-running requirements found (.zense/long-running/)", {});
+				const active = state.longRun ? loadTracker(ctx.cwd, state.longRun.slug) : null;
+				const lines = trackers.map(trackerSummaryLines);
+				return say(
+					`🏗 long-running requirements:\n${lines.map((l) => `  ${l}`).join("\n") || "  (none)"}` +
+						(active ? `\n\nsession-active: ${state.longRun!.slug} — activePhase: ${state.longRun!.activePhase ?? "(between phases)"} · spec: ${state.spec ? `v${state.spec.version}` : "—"} · cycle phase: ${state.phase}${state.longRun!.awaitingFinalApply ? " · ⏳ awaiting final apply retry" : ""}` : "") +
+						(active ? `\n(full tracker: .zense/long-running/${active.slug}/tracker.md)` : ""),
+					{ trackers: trackers.map((t) => t.slug) },
+				);
+			}
+
+			if (p.action === "resume") {
+				let trackers = discoverLongrunTrackers(ctx.cwd).filter((t) => t.status === "active");
+				let t = p.slug ? trackers.find((x) => x.slug === p.slug) : trackers.length === 1 ? trackers[0] : undefined;
+				if (p.slug && !t) {
+					const raw = loadTracker(ctx.cwd, p.slug);
+					if (raw?.status === "done" || raw?.status === "abandoned") return say(`tracker "${p.slug}" is ${raw.status} — nothing to resume`, {}, true);
+					if (!raw) return say(`no tracker "${p.slug}" on disk`, {}, true);
+					t = raw;
+				}
+				if (!t && trackers.length) {
+					if (!ctx.hasUI)
+						return say(`multiple resumable longruns — pick one:\n${trackers.map(trackerSummaryLines).join("\n")}\nzense_longrun resume slug=<name>`, {}, true);
+					const pick = await ctx.ui.select(`resume which long-running requirement?`, trackers.map((x) => `${x.slug} — "${x.title}" (${x.phases.filter((ph) => ph.status === "done").length}/${x.phases.length} done)`));
+					if (!pick) return say("resume cancelled", {});
+					t = trackers.find((x) => pick.startsWith(x.slug));
+				}
+				if (!t) return say("no resumable longrun (nothing active in .zense/long-running/) — start one with zense_longrun init", {}, true);
+				state.longRun = { slug: t.slug, trackerVersion: t.version };
+				const activePh = t.phases.find((x) => x.status === "active");
+				state.longRun.activePhase = activePh?.id;
+				const lastCheckpoint = [...t.phases].reverse().find((x) => x.checkpoint)?.checkpoint;
+				const rec = await longrunReconcile(ctx, t, lastCheckpoint);
+				if (!rec.ok) return say(rec.text!, {}, true);
+				persist();
+				if (!activePh) {
+					return say(`🔁 longrun "${t.slug}" resumed at a phase boundary (${t.phases.filter((x) => x.status === "done").length}/${t.phases.length} done) — worktree ${t.worktreeBranch} reattached\ncontinue: zense_longrun next`, { resumed: t.slug });
+				}
+				// mid-phase resume: the phase's signed spec should be the latest .zense/spec.json —
+				// adopt it ONLY when it provably belongs to this phase (title prefix match); otherwise
+				// the human picks (adopt anyway vs restart the phase cleanly)
+				const disk = loadSpecFromDisk(ctx.cwd);
+				const belongs = !!disk && disk.approved && disk.title.startsWith(`longrun(${t.slug}) ${activePh.id}`);
+				let adopt = belongs;
+				if (!belongs && ctx.hasUI) {
+					const pick = await ctx.ui.select(
+						`longrun "${t.slug}" was mid-phase ${activePh.id} "${activePh.title}" — but the on-disk spec ${disk ? `("${disk.title}")` : "is missing"} doesn't match this phase`,
+						[
+							...(disk?.approved ? [`adopt the disk spec anyway and continue phase ${activePh.id}`] : []),
+							`restart phase ${activePh.id} cleanly (reset --hard to baseline ${activePh.baseline?.slice(0, 12) ?? "?"} — destroys this phase's work)`,
+							"cancel resume",
+						],
+					);
+					if (!pick || pick.startsWith("cancel")) return say("resume cancelled", {});
+					if (pick.startsWith("restart")) {
+						if (state.worktree && activePh.baseline) resetToCheckpoint(state.worktree.root, activePh.baseline);
+						activePh.status = "pending";
+						activePh.baseline = undefined;
+						saveTracker(ctx.cwd, t);
+						resetLongrunPhaseCycle(t.slug, t.version);
+						persist();
+						return say(`🔁 resumed — phase ${activePh.id} reset to pending. continue: zense_longrun next`, { resumed: t.slug });
+					}
+					adopt = true;
+				}
+				if (!adopt || !disk)
+					return say(`🔁 longrun "${t.slug}" reattached (branch ${t.worktreeBranch}, mid-phase ${activePh.id}) — but its phase spec could not be restored from disk (${disk ? "unsigned/mismatch" : "missing"}) and there's no UI to choose; run zense_longrun fail to restart the phase, or sign issues aside call zense_longrun next only after resolving`, {}, true);
+				state.spec = disk;
+				const arch = findSpecArchivePaths(ctx.cwd, disk.version);
+				if (arch.json) state.specJsonPath = arch.json;
+				if (arch.md) state.specMdPath = arch.md;
+				state.phase = "implementation";
+				state.baselineHead = activePh.baseline;
+				persist();
+				updateWidget(ctx);
+				return say(
+					`🔁 longrun "${t.slug}" resumed mid-phase ${activePh.id} "${activePh.title}" — spec v${disk.version} adopted, branch ${t.worktreeBranch}\n\n${buildContextCapsule(ctx.cwd, t, activePh)}`,
+					{ resumed: t.slug, midPhase: true },
+				);
+			}
+
+			if (p.action === "abandon") {
+				const target = p.slug ?? state.longRun?.slug;
+				if (!target) return say("abandon requires a slug (or an active longrun)", {}, true);
+				const t = loadTracker(ctx.cwd, target);
+				if (!t) return say(`no tracker "${target}"`, {}, true);
+				if (t.status === "done") return say(`tracker "${target}" is done — nothing to abandon (its merge is already in main history)`, {}, true);
+				if (p.confirm !== true) {
+					if (!ctx.hasUI) return say("abandon destroys the longrun worktree + branch (all phase work not yet merged) — pass confirm:true only on an explicit human order", {}, true);
+					const ok = await ctx.ui.select(
+						`⚠️ abandon longrun "${t.slug}"? the worktree ${t.worktreeBranch} (including checkpoints) is REMOVED — the whole set's work is destroyed. main is untouched by construction (nothing ever staged)`,
+						["🗑 Yes — destroy the worktree and abandon the requirement", "✋ Cancel"],
+					);
+					if (!ok?.startsWith("🗑")) return say("abandon cancelled", {});
+				}
+				if (state.pendingApply && state.longRun?.slug === t.slug)
+					return say(`the final apply of "${t.slug}" is already staged in main — discard it first (zense_discard), then abandon`, {}, true);
+				const ab = abandonLongrunWorktree(ctx.cwd, t);
+				if (!ab.ok) return say(`❌ ${ab.msg}`, {}, true);
+				t.status = "abandoned";
+				saveTracker(ctx.cwd, t);
+				appendSpecsLog(ctx.cwd, t.slug, `ABANDONED — worktree+branch removed, main untouched`);
+				learn(ctx, `longrun ${t.slug}: abandoned (worktree ${t.worktreeBranch} removed)`);
+				if (state.longRun?.slug === t.slug) {
+					resetLongrunPhaseCycle(t.slug, t.version);
+					state.longRun = undefined;
+					state.worktree = null;
+				}
+				persist();
+				updateWidget(ctx);
+				return say(`🗑 longrun "${t.slug}" abandoned — worktree + branch removed; main was never touched. tracker kept as status=abandoned for the record`, { abandoned: t.slug });
+			}
+
+			return say(`unknown action: ${p.action}`, {}, true);
 		},
 	});
 
@@ -1879,7 +2418,7 @@ export default function (pi: ExtensionAPI) {
 			// (they have dedicated /zense:ext-config:<role> commands), and actions (all/none/
 			// on/off) are second-level args of ext-config-show which pi can't positionally
 			// separate → including them would conjure phantom subcommands at position 1
-			["status", "resume", "approve", "accept", "agents", "discard", "distill", "gate", "memory", "models", "ext-config-show"]
+			["status", "resume", "approve", "accept", "agents", "discard", "distill", "gate", "memory", "models", "ext-config-show", "longrun"]
 				.filter((s) => s.startsWith(prefix))
 				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
@@ -1967,7 +2506,65 @@ export default function (pi: ExtensionAPI) {
 				}
 				const r = acceptPending(ctx, commitIfStaged, true);
 				ctx.ui.notify(r.text, r.ok ? "info" : "warning");
-			} else if (sub === "agents") {
+			} else if (sub === "longrun") {
+			// long-running mode (ADR-004) from the keyboard — mirrors zense_longrun's actions for
+			// the human: status=list, resume=pick by name, sign=a saved-but-unsigned tracker,
+			// abandon=destroy the set's worktree. Agent-side lives in the zense_longrun tool.
+			const [action, target] = rest;
+			if (action === "status" || action === "list" || !action) {
+				const trackers = discoverLongrunTrackers(ctx.cwd).filter((t) => t.status !== "done");
+				ctx.ui.notify(
+					trackers.length
+						? `🏗 long-running requirements:\n${trackers
+								.map(
+									(t) =>
+										`  ${t.status === "active" ? "▶" : "○"} ${t.slug} — "${t.title}" [v${t.version} ${t.status}] ${t.phases.filter((ph) => ph.status === "done").length}/${t.phases.length} phases done` +
+										(state.longRun?.slug === t.slug ? "  ← session-active" : ""),
+								)
+								.join("\n")}\n\nresume: /zense longrun resume — agent: zense_longrun status`
+						: "no long-running requirements (.zense/long-running/) — the agent starts one with zense_longrun init",
+					"info",
+				);
+			} else if (action === "resume") {
+				const trackers = discoverLongrunTrackers(ctx.cwd).filter((t) => t.status === "active");
+				let t = target ? trackers.find((x) => x.slug === target) : trackers.length === 1 ? trackers[0] : undefined;
+				if (!t && trackers.length && ctx.mode === "tui") {
+					const pick = await ctx.ui.select("resume which long-running requirement?", trackers.map((x) => `${x.slug} — "${x.title}" (${x.phases.filter((ph) => ph.status === "done").length}/${x.phases.length} done)`));
+					if (pick) t = trackers.find((x) => pick.startsWith(x.slug));
+				}
+				if (!t)
+					return ctx.ui.notify(trackers.length ? `pick one: /zense longrun resume <slug>\n${trackers.map((x) => `  ${x.slug}`).join("\n")}` : "no active longrun to resume", "warning");
+				state.longRun = { slug: t.slug, trackerVersion: t.version, ...(t.phases.find((x) => x.status === "active") ? { activePhase: t.phases.find((x) => x.status === "active")!.id } : {}) };
+				persist();
+				updateWidget(ctx);
+				// same idle-agent nudge as /zense approve: a slash command starts no turn
+				const kick = `Zense: the human resumed longrun "${t.slug}" — continue it now: reconcile + activate the next/current phase with the zense_longrun tool (action=resume slug=${t.slug}, which verifies the worktree), then proceed`;
+				try { pi.sendUserMessage(kick); } catch { try { pi.sendUserMessage(kick, { deliverAs: "followUp" }); } catch { /* non-fatal */ } }
+				ctx.ui.notify(`🔁 resuming longrun "${t.slug}"…`, "info");
+			} else if (action === "sign") {
+				const t = target ? loadTracker(ctx.cwd, target) : undefined;
+				if (!t) return ctx.ui.notify("usage: /zense longrun sign <slug>", "warning");
+				if (t.status !== "planning") return ctx.ui.notify(`tracker "${t.slug}" is ${t.status} — sign applies only to a saved-but-unsigned plan`, "warning");
+				const ok = await ctx.ui.confirm(`🔏 Sign longrun tracker "${t.slug}" v${t.version}?`, `${t.phases.length} phase(s): ${t.phases.map((x) => x.id).join(", ")} — one signature covers all phases\n(full plan: .zense/long-running/${t.slug}/tracker.md)`);
+				if (!ok) return ctx.ui.notify("not signed", "info");
+				t.approvedAt = Date.now();
+				t.status = "active";
+				saveTracker(ctx.cwd, t);
+				state.longRun = { slug: t.slug, trackerVersion: t.version };
+				const ens = ensureLongrunWorktree(ctx.cwd, t.slug, t.worktreeBranch);
+				if (ens) {
+					state.worktree = ens.wt;
+					state.worktreeLeaveNotified = false;
+				}
+				persist();
+				updateWidget(ctx);
+				ctx.ui.notify(`🔏 tracker "${t.slug}" v${t.version} signed — tell the agent to continue (zense_longrun next)`, "info");
+			} else if (action === "abandon") {
+				ctx.ui.notify(`use the agent: ask it to run zense_longrun abandon slug=${target ?? "<slug>"} — it enforces the pendingApply guard and confirm flow`, "info");
+			} else {
+				ctx.ui.notify("usage: /zense longrun status|resume [slug]|sign <slug>|abandon <slug>", "info");
+			}
+		} else if (sub === "agents") {
 				await openAgentsViewer(ctx);
 			} else if (sub === "memory") {
 				if (rest[0] === "json") {
@@ -2061,7 +2658,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				await runExtConfig(ctx, role, action, vals);
 			} else {
-				ctx.ui.notify("usage: /zense status|resume|approve|accept [commit]|discard|agents|gate on|off|memory|distill|models|ext-config-show", "info");
+				ctx.ui.notify("usage: /zense status|resume|approve|accept [commit]|discard|agents|gate on|off|memory|distill|models|ext-config-show|longrun status|longrun resume|longrun sign", "info");
 			}
 		},
 	});

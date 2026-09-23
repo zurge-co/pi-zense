@@ -1,7 +1,7 @@
 // zense-harness module: git worktree isolation: path rewrite, command prefixing, worktree create/reuse (moved verbatim from index.ts — see AGENTS.md map)
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { zenseDir, type Spec, type Worktree } from "./types.ts";
 
@@ -56,14 +56,40 @@ export const createWorktree = (cwd: string, spec: Spec): Worktree | null => {
 	const head = gitOk(["rev-parse", "HEAD"], cwd); // round baseline = main HEAD before branching (always before worktree add)
 	if (gitOk(["worktree", "add", wtRoot, "-b", branch], cwd).ok !== true) return null;
 	excludeFromGitStatus(cwd, wtParent);
-	// copy current spec + memory into the worktree so bash-based reads see current state (not checkout-time state)
+	// copy current spec + memory into the worktree so bash-based reads see current state (not checkout-time state);
+	// adr/ too: check probes run with cwd=worktree, and a spec may legitimately scope .zense/adr
+	// (e.g. "ADR recorded") — without the mirror such checks false-fail inside the sandbox
 	const wtZense = join(wtRoot, ".zense");
 	mkdirSync(wtZense, { recursive: true });
 	for (const f of ["spec.json", "spec.md", "memory.jsonl"]) {
 		const src = join(zenseDir(cwd), f);
 		if (existsSync(src)) copyFileSync(src, join(wtZense, f));
 	}
+	const adrSrc = join(zenseDir(cwd), "adr");
+	if (existsSync(adrSrc)) cpSync(adrSrc, join(wtZense, "adr"), { recursive: true });
 	return { root: wtRoot, branch, dir: wtRoot, ...(head.ok ? { baseline: head.out.trim() } : {}) };
+};
+
+/** Longrun worktree (ADR-004): ONE worktree per requirement for the whole tracker —
+ *  created at plan-sign, REUSED across sessions/phases (reattach by slug is the whole point:
+ *  resume must land in the same branch so checkpoints chain). Returns null when the slot is
+ *  occupied by a non-worktree dir (could hold human work — never auto-delete; the caller
+ *  escalates instead). */
+export const ensureLongrunWorktree = (cwd: string, slug: string, branch: string): { wt: Worktree; created: boolean } | null => {
+	const wtParent = join(zenseDir(cwd), "worktree");
+	const wtRoot = join(wtParent, `longrun-${slug}`);
+	const head = gitOk(["rev-parse", "HEAD"], cwd); // whole-set baseline = main HEAD at creation (per-phase baselines live in the tracker)
+	if (existsSync(wtRoot)) {
+		if (!gitOk(["rev-parse", "--is-inside-work-tree"], wtRoot).ok) return null;
+		return { wt: { root: wtRoot, branch, dir: wtRoot, ...(head.ok ? { baseline: head.out.trim() } : {}) }, created: false };
+	}
+	mkdirSync(wtParent, { recursive: true });
+	// orphaned branch (worktree dir pruned but branch survived) → re-checkout; else fresh branch
+	const haveBranch = gitOk(["rev-parse", "--verify", "-q", branch], cwd).ok;
+	const add = haveBranch ? gitOk(["worktree", "add", wtRoot, branch], cwd) : gitOk(["worktree", "add", wtRoot, "-b", branch], cwd);
+	if (!add.ok) return null;
+	excludeFromGitStatus(cwd, wtParent);
+	return { wt: { root: wtRoot, branch, dir: wtRoot, ...(head.ok ? { baseline: head.out.trim() } : {}) }, created: true };
 };
 
 /** Keep zense-created dirs (e.g. .zense/worktree/) out of main's git status — best-effort

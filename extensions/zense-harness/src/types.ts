@@ -41,6 +41,7 @@ export interface State {
 	specJsonPath?: string;          // archive spec .json of the current version
 	worktree?: Worktree | null;     // active session worktree (null = work directly in main)
 	longRun?: LongRunRef;           // active long-running requirement (cleared on cycle closure / tracker done)
+	pendingLongrunCompact?: { slug: string; summary: string }; // auto-loop: capsule snapshot for the session_before_compact override — one-shot, consumed by the handler (cleared on fail/cancel too)
 	worktreeLeaveNotified?: boolean; // dedupe: notify "unmerged worktree" once per creation
 	pendingApply?: PendingApply;    // change staged into main after eval PASS, awaiting human commit (ADR-003)
 	contextBulletin?: string;      // one-shot cycle-closure message pinned to the next turn's system prompt (consumed then cleared) — so the agent knows the human accepted/discarded/committed
@@ -93,6 +94,9 @@ export interface TrackerPhase {
 	specVersion?: number;
 	adrs?: number[];
 	summaryPath?: string;        // phases/<id>.md closure summary
+	verdict?: string;            // eval verdict captured at phase close ("PASS") — digest source
+	criteriaVerdicts?: Record<string, string>; // per-criterion verdicts from the passing zense_eval — digest source
+	filesChanged?: string[];     // git diff name-only baseline..HEAD at close — digest source
 }
 /** The human-signed plan of a long-running requirement — tracker.json is the ONLY source
  *  of truth the harness trusts (ambient-state distrust, ADR-004); tracker.md is its render. */
@@ -103,6 +107,7 @@ export interface Tracker {
 	intent: string;
 	worktreeBranch: string;      // zense/longrun/<slug> — ONE worktree for the whole set (ADR-004)
 	status: "planning" | "active" | "done" | "abandoned";
+	auto?: boolean;              // v2: signed as autonomous — phases advance without a human gate; eval FAIL auto-fixes bounded by AUTO_FIX_MAX_ROUNDS (false/undefined = v1 manual gates)
 	phases: TrackerPhase[];
 	approvedAt?: number;
 	updatedAt: number;
@@ -112,6 +117,8 @@ export interface LongRunRef {
 	trackerVersion: number;
 	activePhase?: string;
 	awaitingFinalApply?: boolean; // all phases checkpointed, final applyWorktreeBack refused (dirty main) — close retries the apply instead of re-checkpointing
+	auto?: boolean;              // mirror of Tracker.auto (kept in session state so resume survives reloads)
+	autoFixRounds?: number;      // consecutive eval FAILs in the current auto phase — bounded by AUTO_FIX_MAX_ROUNDS
 }
 
 export const zenseDir = (cwd: string) => join(cwd, ".zense");

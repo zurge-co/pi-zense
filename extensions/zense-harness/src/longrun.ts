@@ -187,7 +187,8 @@ export const compilePhaseSpec = (
 // ----- context capsule: the ONLY thing carried into a fresh phase after a compact/new
 //       session — done phases collapse to one line each, the active phase is spelled out
 
-export const buildContextCapsule = (cwd: string, t: Tracker, active: TrackerPhase): string => {
+export const buildContextCapsule = (cwd: string, t: Tracker, active: TrackerPhase, opts?: { label?: string }): string => {
+	const label = opts?.label ?? "Active phase";
 	const summaryOf = (p: TrackerPhase): string => {
 		if (!p.summaryPath) return p.checkpoint ? `checkpoint ${p.checkpoint.slice(0, 12)}` : "(no summary)";
 		try {
@@ -209,7 +210,7 @@ export const buildContextCapsule = (cwd: string, t: Tracker, active: TrackerPhas
 	}
 	const adrs = t.phases.flatMap((p) => p.adrs ?? []);
 	lines.push(
-		`Active phase ${active.id} "${active.title}": ${active.intent}`,
+		`${label} ${active.id} "${active.title}": ${active.intent}`,
 		`  scope: ${active.scope.join(", ")}${active.constraints.length ? ` · constraints: ${active.constraints.join("; ")}` : ""}`,
 		`  seed criteria (signed — carry ALL into the phase spec): ${active.criteria.map((c) => c.id).join(", ") || "(none)"}`,
 		...(adrs.length ? [`  ADRs so far: ${adrs.join(", ")} (re-read .zense/adr/ before irreversible choices)`] : []),

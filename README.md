@@ -13,7 +13,7 @@
 - **Human-in-command merge** — on eval PASS, work is **squashed and applied to `main` staged-but-uncommitted**. You review the staged diff, then `accept` or `discard` — the harness never auto-commits on `main`.
 - **Memory that feeds back** — every flag, escalation, and verdict becomes a lesson that shapes the next spec.
 - **zense theme** — a dark theme on the Zense design system (green → lime → gold over near-black).
-- **Long-running mode** — a requirement too big for one cycle becomes a **signed tracker**: you sign the whole phase plan once (pre-phase, p1, p2, …), then each phase auto-compiles its spec from the tracker's seed criteria, runs in **one shared worktree** (`zense/longrun/<slug>`, ADR-004), and stops at a human review gate per phase. `main` stays untouched until every phase is done — then one final staged apply-back. Resume by requirement-name anytime (`/zense longrun resume`), across sessions; between phases a context capsule carries only what the next phase needs.
+- **Long-running mode** — a requirement too big for one cycle becomes a **signed tracker**: you sign the whole phase plan once (choosing AUTO or MANUAL). AUTO runs every phase end-to-end **with no per-phase interruption**: eval PASS checkpoints and advances on its own, eval FAIL gets a bounded auto-fix, and between phases the context is **hard-reset deterministically** (capsule-only compaction — no LLM tail dragging 20k tokens along). `main` stays untouched until every phase is done; then you review **exactly once**: the staged whole-set diff plus a generated `digest.md` (per phase: intent/goal, signed criteria + verdicts, files changed + why). MANUAL keeps per-phase review gates. Resume by requirement-name anytime (`/zense longrun resume`), across sessions.
 
 ## Install
 
@@ -65,7 +65,7 @@ pi-zense/
 
 Per-project runtime artifacts (spec archive, ADRs, memory) live under each repo's `.zense/` — spec-as-code, diffable and auditable. Long-running requirements add `.zense/long-running/<slug>/` (`specs.md`, signed `tracker.md`/`tracker.json`, per-phase closure summaries).
 
-Long-running cheat sheet (agent drives via `zense_longrun`, human via `/zense longrun`): `init` → `plan` (planner sub-agent may draft phases; you sign once) → `next` ⟶ implement ⟵ eval/review → `close` (checkpoint commit) or `fail` (reset --hard) … → the last `close` stages the whole set into `main` for your final review/commit.
+Long-running cheat sheet (agent drives via `zense_longrun`, human via `/zense longrun`): `init` → `plan` (planner sub-agent may draft phases; you sign once, AUTO or MANUAL) → AUTO: `next` ⟶ implement ⟵ eval (PASS auto-advances with a hard context reset, FAIL auto-fixes bounded) … until the set completes → one `digest.md` + staged whole-set diff for your single review/commit. MANUAL: `next` ⟶ eval/review → `close`/`fail` per phase. `abandon` removes the whole set's worktree; `main` was never touched.
 
 ## License
 

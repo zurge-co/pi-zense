@@ -54,6 +54,7 @@ export * from "./src/memory.ts";
 export * from "./src/models.ts";
 export * from "./src/ask.ts";
 export * from "./src/longrun.ts";
+export * from "./src/longrun-auto.ts";
 
 // The original package import block (top of file) already covers every external the factory
 // body needs — the lines below are only the local src/ bindings the factory uses by name.
@@ -67,6 +68,10 @@ import {
 	nextPendingPhase, parseLongrunPlan, reconcileLongrunWorktree,
 	renderTrackerMd, resetToCheckpoint, saveTracker, slugifyTitle, validateTracker, writePhaseSummary,
 } from "./src/longrun.ts";
+import {
+	AUTO_FIX_MAX_ROUNDS, autoLoopEnabled, buildAutoFixPrompt, buildCompactionCapsule, buildLongrunDigest,
+	buildNextPhaseKickoff, retainNoneCut,
+} from "./src/longrun-auto.ts";
 import { composeCommitMessage, PENDING_PATCH, PENDING_MSG, NOT_ZENSE, isGitRepo, uncommittedChanges, composeSnapshotMessage, snapshotUncommitted, applyWorktreeBack, discardPendingApply, acceptPendingApply } from "./src/pending-apply.ts";
 import { resetCycleState, takeContextBulletin, buildAcceptBulletin, buildReconcileBulletin, buildDiscardBulletin, freshState } from "./src/cycle.ts";
 import { parseSpecDraft, applyQualityGate, type ClarifyQuestion } from "./src/spec-draft.ts";
@@ -459,6 +464,40 @@ export default function (pi: ExtensionAPI) {
 			persist();
 		}
 		persist();
+	});
+
+	// ----- longrun v2 context reset: the auto loop's retain-none compaction. The handler
+	//       fires for EVERY compaction pi runs — it must be a strict no-op unless the auto
+	//       loop armed a one-shot marker (pendingLongrunCompact) right before ctx.compact()
+	pi.on("session_before_compact", async (event, ctx) => {
+		const marker = state.pendingLongrunCompact;
+		if (!marker) return; // untouched: threshold/manual/overflow compactions outside the loop
+		state.pendingLongrunCompact = undefined; // one-shot: consume ALWAYS, even on weird entry sets
+		persist();
+		// override the compaction deterministically: summary = the pre-built capsule snapshot,
+		// cut = retain-none (keep only the freshest tiny entry; degrade to pi's default cut
+		// only when the branch is somehow empty — flagged, never silent)
+		const last = event.branchEntries[event.branchEntries.length - 1];
+		const cut = retainNoneCut(event.preparation, undefined, last?.id);
+		if (!last?.id) state.trajectoryFlags.push(`longrun ${marker.slug}: retain-none cut degraded to pi's default (empty branchEntries)`);
+		learn(ctx, `longrun ${marker.slug}: hard context reset (capsule-only compaction, retain-none)`);
+		return {
+			compaction: {
+				summary: marker.summary,
+				firstKeptEntryId: cut,
+				tokensBefore: event.preparation.tokensBefore,
+			},
+		};
+	});
+
+	pi.on("session_compact_failed", async (_ev, ctx) => {
+		if (!state.pendingLongrunCompact) return;
+		// the armed marker must never leak into a LATER unrelated compaction → clear + fallback:
+		// context stays un-reset (the v1 behavior), the loop itself is unaffected
+		state.pendingLongrunCompact = undefined;
+		state.trajectoryFlags.push("longrun phase-transition compaction failed/cancelled — context kept un-reset (fallback)");
+		persist();
+		ctx.ui.notify("⚠ longrun context reset failed/cancelled — the next phase runs on the old (larger) context; /compact manually if you want", "warning");
 	});
 
 	const flag = (msg: string, ctx: ExtensionContext) => {
@@ -1402,7 +1441,30 @@ export default function (pi: ExtensionAPI) {
 				persist(); updateWidget(ctx);
 				// M: text from the pure builder — raw grade.output no longer embeds in the
 				// transcript (points at the log instead); only failing criteria's evidence shows
-				return { content: [{ type: "text", text: buildEvalResultText(evalView) }], details: { ok: grade.ok, verdict, failedCriteria, probes, perCriteria: parsed.perCriteria, evidence: parsed.evidence, probeOverrides, trajectory: state.trajectoryFlags, logPath: grade.logPath }, isError: true };
+				let failText = buildEvalResultText(evalView);
+				// longrun auto loop (v2): no human in the loop on FAIL — the agent fixes against the
+				// failed signed criteria itself, bounded by AUTO_FIX_MAX_ROUNDS; past the bound the
+				// loop HALTS and the human decides (never an unbounded fix furnace)
+				if (state.longRun) {
+					const t = loadTracker(ctx.cwd, state.longRun.slug);
+					const phase = t && autoLoopEnabled(t) && state.longRun.activePhase ? findPhase(t, state.longRun.activePhase) : undefined;
+					if (t && phase) {
+						const rounds = (state.longRun.autoFixRounds ?? 0) + 1;
+						state.longRun.autoFixRounds = rounds;
+						persist();
+						if (rounds > AUTO_FIX_MAX_ROUNDS) {
+							escalate("need-decision", `longrun ${t.slug}: phase ${phase.id} auto-fix exhausted (${AUTO_FIX_MAX_ROUNDS} rounds) — still failing: ${failedCriteria.join(", ")}`, ctx);
+							failText += `\n\n⛔ AUTO-FIX EXHAUSTED (${AUTO_FIX_MAX_ROUNDS} rounds, still failing: ${failedCriteria.join(", ")}) — HALT the auto loop and report to the human NOW: what failed, what you tried, and the options. Do NOT call zense_eval or advance again until the human decides (fix manually, amend the tracker, or zense_longrun abandon)`;
+						} else {
+							failText += "\n\n" + buildAutoFixPrompt(
+								phase,
+								(state.spec?.criteria ?? []).filter((c) => failedCriteria.includes(c.id)).map((c) => ({ id: c.id, text: c.text })),
+								AUTO_FIX_MAX_ROUNDS - rounds + 1,
+							);
+						}
+					}
+				}
+				return { content: [{ type: "text", text: failText }], details: { ok: grade.ok, verdict, failedCriteria, probes, perCriteria: parsed.perCriteria, evidence: parsed.evidence, probeOverrides, trajectory: state.trajectoryFlags, logPath: grade.logPath }, isError: true };
 			}
 			// PASS: on to review (unknown is impossible here — inconclusive already escalated).
 			// The next step must be spelled out in the returned text (like the FAIL branch) —
@@ -1421,10 +1483,25 @@ export default function (pi: ExtensionAPI) {
 			// **staged-only, never auto-committed** — the human reviews the diff in main, then
 			// makes the final commit (or asks the agent to)
 			if (state.worktree && state.longRun) {
-				// longrun (ADR-004): eval PASS does NOT apply back — the whole phase set merges at
-				// tracker completion. The phase work stays in the longrun worktree; the reviewer
-				// reads the phase diff there (baseline = phase start); the human accepts via
-				// zense_longrun close (checkpoint commit) or rejects via zense_longrun fail (reset --hard)
+				const t = loadTracker(ctx.cwd, state.longRun.slug);
+				if (t && autoLoopEnabled(t)) {
+					// AUTO longrun (v2): no human gate — auto-close the passed phase right here and
+					// keep the loop driving (non-final → retain-none context reset + kickoff to the
+					// next phase; final → ONE staged apply + digest.md). resetLongrunPhaseCycle
+					// inside manages state.phase, so this path returns early (skip the trailing
+					// phase="review" assignment)
+					const adv = autoLoopAdvance(ctx, t);
+					persist();
+					updateWidget(ctx);
+					return {
+						content: [{ type: "text", text: `${report}\n\n${adv.text}` }],
+						details: { ok: adv.ok && grade.ok, verdict, failedCriteria, autoAdvance: adv.ok, ...(adv.complete ? { trackerComplete: true } : {}), probes, trajectory: state.trajectoryFlags },
+						isError: !adv.ok,
+					};
+				}
+				// manual longrun (v1 semantics, tracker.auto falsy): eval PASS does NOT apply back
+				// — the phase set merges at tracker completion; the human accepts via zense_longrun
+				// close (checkpoint commit) or rejects via zense_longrun fail (reset --hard)
 				ctx.ui.notify(
 					`🌳 longrun ${state.longRun.slug}: eval PASS — phase held in worktree ${state.worktree.branch} for human review (main untouched)\n` +
 						`review: open ${state.worktree.root} or run zense_review → accept: zense_longrun close · reject: zense_longrun fail`,
@@ -1796,21 +1873,83 @@ export default function (pi: ExtensionAPI) {
 		return `${t.slug} — "${t.title}" [v${t.version} ${t.status}] ${done}/${t.phases.length} phases done · branch ${t.worktreeBranch}`;
 	};
 
+	/** The auto loop's phase advance (v2 — replaces the human close gate for auto trackers):
+	 *  called on eval PASS (and from the `auto` action). Checkpoints deterministically,
+	 *  snapshots the eval verdict into the tracker (digest source), then — more phases →
+	 *  snapshot the capsule into pendingLongrunCompact and trigger the hard context reset
+	 *  (ctx.compact → session_before_compact override, retain-none); last phase → the ONE
+	 *  final staged apply + digest.md. Never asks the human anything (ADR-004 gates remain:
+	 *  tracker signature + final review + ADR approvals). */
+	const autoLoopAdvance = (ctx: ExtensionContext, t: Tracker): { ok: boolean; text: string; complete?: boolean } => {
+		const phaseId = state.longRun?.activePhase;
+		const phase = phaseId ? findPhase(t, phaseId) : undefined;
+		if (!phase) return { ok: false, text: `auto-advance: no active phase in tracker "${t.slug}" (state/disk mismatch — human check tracker.json)` };
+		if (!state.worktree || !state.spec) return { ok: false, text: "auto-advance: missing worktree/spec (session restarted?) — run zense_longrun resume first" };
+		const ck = checkpointCommit(state.worktree.root, `longrun(${t.slug}): ${phase.id} ${phase.title}`);
+		if (!ck.ok) return { ok: false, text: `auto-advance: checkpoint commit failed: ${ck.msg}` };
+		const filesChanged = gitOk(["diff", "--name-only", `${phase.baseline ?? "HEAD"}..HEAD`, "--", ".", NOT_ZENSE], state.worktree.root).out.split("\n").map((s) => s.trim()).filter(Boolean);
+		phase.status = "done";
+		phase.checkpoint = ck.sha;
+		phase.specVersion = state.spec.version;
+		phase.verdict = state.lastEval?.verdict ?? "PASS";
+		phase.criteriaVerdicts = state.lastEval ? { ...state.lastEval.perCriteria } : undefined;
+		phase.filesChanged = filesChanged;
+		phase.summaryPath = writePhaseSummary(
+			ctx.cwd,
+			t,
+			phase,
+			`eval PASS — verdicts: ${Object.entries(phase.criteriaVerdicts ?? {}).map(([id, v]) => `${id}:${v}`).join(", ") || phase.verdict}`,
+			filesChanged,
+		);
+		saveTracker(ctx.cwd, t);
+		appendSpecsLog(ctx.cwd, t.slug, `phase ${phase.id} auto-advanced → checkpoint ${ck.sha?.slice(0, 12)} (${filesChanged.length} files)`);
+		state.escalations.push({ kind: "accepted", detail: `longrun ${t.slug} phase ${phase.id} auto-advanced (checkpoint ${ck.sha?.slice(0, 12)})`, at: Date.now() });
+		learn(ctx, `longrun ${t.slug}: auto-advance phase ${phase.id} → checkpoint ${ck.sha?.slice(0, 12)}`);
+		if (!allPhasesDone(t)) {
+			const nextP = nextPendingPhase(t)!;
+			resetLongrunPhaseCycle(t.slug, t.version, { auto: true, autoFixRounds: 0 });
+			// hard context reset (v2): the capsule snapshot rides pendingLongrunCompact → the
+			// session_before_compact handler turns it into the compaction summary with a
+			// retain-none cut — no LLM summary, no keepRecentTokens tail (v1's growing-context bug)
+			state.pendingLongrunCompact = { slug: t.slug, summary: buildCompactionCapsule(ctx.cwd, t) };
+			persist();
+			ctx.compact({
+				onError: (e) => {
+					state.pendingLongrunCompact = undefined;
+					persist();
+					state.trajectoryFlags.push(`longrun ${t.slug}: phase-transition compaction failed (${e.message}) — context kept growing (fallback: old bulletin path)`);
+				},
+			});
+			return { ok: true, text: `✅ phase ${phase.id} auto-advanced — checkpoint ${ck.sha?.slice(0, 12)} (${filesChanged.length} file(s))\ncontext is being hard-reset to the capsule (retain-none)\n\n${buildNextPhaseKickoff(ctx.cwd, t, nextP)}` ,complete: false};
+		}
+		// last phase → the single human review gate: staged final apply + digest.md
+		const digest = buildLongrunDigest(ctx.cwd, t);
+		const r = longrunApplyFinal(ctx, t);
+		if (!r.ok) return { ok: false, text: `✅ final phase ${phase.id} auto-advanced (checkpoint ${ck.sha?.slice(0, 12)}) — but the final apply needs attention:\n${r.text}`, complete: true };
+		const slugKeep = t.slug, ver = t.version;
+		resetLongrunPhaseCycle(slugKeep, ver, { auto: true, autoFixRounds: 0 });
+		state.phase = "review";
+		persist();
+		return { ok: true, text: `✅ final phase ${phase.id} auto-advanced — the whole set is complete\n📋 YOUR SINGLE REVIEW: ${digest}\n${r.text}`, complete: true };
+	};
+
 	pi.registerTool({
 		name: "zense_longrun",
 		label: "Zense Long-Running",
 		description:
-			"Long-running mode: a requirement too big for one cycle is planned ONCE as a signed tracker (phases: pre-phase, p1, p2, …) at .zense/long-running/<slug>/, then run phase-by-phase — each phase auto-compiles its spec from the tracker's seed criteria (no per-phase signature; the tracker IS the signature), runs in the ONE shared longrun worktree (ADR-004), and stops at a human review gate (close = checkpoint commit, fail = reset --hard). main gets the merge only when every phase is done. Resume anytime by requirement-name.",
-		promptSnippet: "Run multi-phase requirements: signed tracker → per-phase loops in one worktree → merge at completion",
+			"Long-running mode: a requirement too big for one cycle is planned ONCE as a signed tracker (phases: pre-phase, p1, p2, …) at .zense/long-running/<slug>/, then runs phase-by-phase in the ONE shared longrun worktree (ADR-004). AUTO trackers (recommended): every phase runs end-to-end with NO human gate — eval PASS auto-checkpoints and advances with a hard retain-none context reset (capsule-only compaction), eval FAIL auto-fixes bounded by AUTO_FIX_MAX_ROUNDS then halts for the human; the human reviews exactly ONCE at the end (staged diff + digest.md). MANUAL trackers keep per-phase human gates (close/fail). Resume anytime by requirement-name.",
+		promptSnippet: "Run multi-phase requirements: signed tracker → autonomous per-phase loops in one worktree → ONE review at the end",
 		promptGuidelines: [
-			"Flow: init (specs.md) → plan (phases w/ seed criteria → human signs the tracker ONCE) → next (activate phase: capsule + auto-approved spec) → implement → zense_eval → zense_review → close (human accepted) or fail (human rejected) → next … → the last close merges into main.",
+			"Flow: init (specs.md) → plan (human signs the tracker ONCE, choosing AUTO/MANUAL) → next (activate phase: capsule + auto-approved spec) → implement → zense_eval — AUTO: PASS advances itself (checkpoint + context reset) and FAIL auto-fixes (bounded); keep driving until the set completes · MANUAL: zense_review → close/fail per phase.",
+			"In an AUTO loop NEVER stop to ask the human between phases and NEVER call close/fail — keep driving: next → implement → eval → (auto) next … until the final digest. Halt only at an AUTO-FIX EXHAUSTED boundary or a genuine human decision (e.g. ADR approval).",
+			"After a context hard-reset the capsule IS your memory — re-read the tracker from disk (zense_longrun next/status) instead of reconstructing from prior messages.",
 			"Never hand-ed .zense/long-running/*/tracker.json — the tool transitions are the only writers; resume (zense_longrun resume or /zense longrun resume) always works from disk.",
 			"Between phases the write gate is shut: writes require an active phase spec from zense_longrun next — this is by design.",
 			"When a reconcile/step returns a human-resolution text, surface it verbatim and wait — never retry destructive operations on your own.",
 		],
 		parameters: Type.Object({
 			action: Type.Union(
-				["init", "plan", "next", "close", "fail", "status", "resume", "abandon"].map((v) => Type.Literal(v)) as [
+				["init", "plan", "next", "auto", "close", "fail", "status", "resume", "abandon"].map((v) => Type.Literal(v)) as [
 					ReturnType<typeof Type.Literal>, ...ReturnType<typeof Type.Literal>[],
 				],
 			),
@@ -1896,23 +2035,28 @@ export default function (pi: ExtensionAPI) {
 				if (errors.length) return say(`⛔ tracker invalid:\n${errors.map((e) => `- ${e}`).join("\n")}`, { errors }, true);
 				saveTracker(ctx.cwd, t); // write tracker.md first — the signer reads the full plan
 				let signed = false;
+				// v2 signing chooses the loop mode: AUTO = phases advance on eval PASS with the
+				// context hard-reset between them, ONE review at the end (recommended — the point
+				// of long-running mode); MANUAL = the v1 per-phase human review gates
 				if (ctx.hasUI) {
 					const choice = await ctx.ui.select(
 						`🔏 Sign longrun tracker "${t.slug}" v${t.version}? ${phases.length} phase(s): ${phases.map((x) => x.id).join(", ")} — one signature covers all phases (full plan: .zense/long-running/${t.slug}/tracker.md)`,
 						[
-							"🔏 Sign — start the longrun (phases run under this signature; review gate at every phase end)",
+							"🔏 Sign — AUTO loop: phases run end-to-end under this signature (auto-fix bounded, hard context reset between phases), ONE review at the end",
+							"🔏 Sign — MANUAL: stop at a human review gate after every phase",
 							"✏️ Not yet (amend the plan first)",
 						],
 					);
 					signed = !!choice && choice.startsWith("🔏");
+					if (signed) t.auto = !choice?.startsWith("🔏 Sign — MANUAL");
 				}
 				if (!signed)
 					return say(`tracker "${t.slug}" saved unsigned (planning) — sign later: rerun plan, or /zense longrun sign ${t.slug}`, { signed });
 				t.approvedAt = Date.now();
 				t.status = "active";
 				saveTracker(ctx.cwd, t);
-				appendSpecsLog(ctx.cwd, t.slug, `tracker v${t.version} signed (${phases.length} phases: ${phases.map((x) => x.id).join(", ")})`);
-				state.longRun = { slug: t.slug, trackerVersion: t.version };
+				appendSpecsLog(ctx.cwd, t.slug, `tracker v${t.version} signed ${autoLoopEnabled(t) ? "AUTO" : "MANUAL"} (${phases.length} phases: ${phases.map((x) => x.id).join(", ")})`);
+				state.longRun = { slug: t.slug, trackerVersion: t.version, ...(autoLoopEnabled(t) ? { auto: true, autoFixRounds: 0 } : {}) };
 				// the ONE worktree for the whole set exists from this moment (ADR-004)
 				const ens = ensureLongrunWorktree(ctx.cwd, t.slug, t.worktreeBranch);
 				if (ens) {
@@ -1924,7 +2068,24 @@ export default function (pi: ExtensionAPI) {
 				return say(`🔏 tracker "${t.slug}" v${t.version} SIGNED — ${phases.length} phase(s) · worktree ${t.worktreeBranch}${ens ? "" : " (⚠ could not attach — next will try again)"}\nphases auto-run under this signature; start: zense_longrun next`, { signed: true, phases: phases.map((x) => x.id) });
 			}
 
-			if (p.action === "next") {
+			if (p.action === "auto") {
+				// drive the AUTO loop one step (after a resume / a lost advance): eval-PASSED phase
+				// → advance now; idle between phases → fall into the normal next-activation path
+				if (!state.longRun) return say("no active longrun in this session — resume one first (zense_longrun resume)", {}, true);
+				const t0 = loadTracker(ctx.cwd, state.longRun.slug);
+				if (!t0) return say(`tracker "${state.longRun.slug}" not found on disk`, {}, true);
+				if (!autoLoopEnabled(t0)) return say(`tracker "${t0.slug}" was signed MANUAL — phases advance only via close/fail (human gates)`, {}, true);
+				if (state.spec?.approved && state.phase === "review" && state.lastEval?.verdict === "PASS") {
+					const adv = autoLoopAdvance(ctx, t0);
+					persist();
+					return say(adv.text, {}, !adv.ok);
+				}
+				if (state.spec?.approved)
+					return say("phase in flight — implement, then zense_eval; the auto loop advances itself on PASS", {}, true);
+				// no active phase → behave exactly like next (below)
+			}
+
+			if (p.action === "next" || p.action === "auto") {
 				if (!state.longRun) return say("no active longrun in this session — resume one first (zense_longrun resume)", {}, true);
 				const t = loadTracker(ctx.cwd, state.longRun.slug);
 				if (!t) return say(`tracker "${state.longRun.slug}" vanished from disk — human check: .zense/long-running/`, {}, true);
@@ -1963,12 +2124,14 @@ export default function (pi: ExtensionAPI) {
 				phase.baseline = headSha.out.trim();
 				saveTracker(ctx.cwd, t);
 				appendSpecsLog(ctx.cwd, t.slug, `phase ${phase.id} "${phase.title}" activated (baseline ${headSha.out.trim().slice(0, 12)})`);
-				state.longRun = { slug: t.slug, trackerVersion: t.version, activePhase: phase.id };
+				state.longRun = { slug: t.slug, trackerVersion: t.version, activePhase: phase.id, ...(autoLoopEnabled(t) ? { auto: true, autoFixRounds: 0 } : {}) };
 				persist();
 				const capsule = buildContextCapsule(ctx.cwd, t, phase);
 				return say(
 					`${capsule}\n\n✅ phase spec v${r.version} auto-approved (provenance tracker:${t.slug}@v${t.version}) — implement within scope: ${phase.scope.join(", ")}\n` +
-						`when done: zense_eval → zense_review → the human closes (zense_longrun close) or rejects (zense_longrun fail)`,
+						(autoLoopEnabled(t)
+							? `AUTO loop: when done call zense_eval — PASS advances this phase itself (checkpoint + context hard-reset), FAIL gives a bounded auto-fix prompt. Do NOT stop to ask the human between phases`
+							: `when done: zense_eval → zense_review → the human closes (zense_longrun close) or rejects (zense_longrun fail)`),
 					{ phase: phase.id, specVersion: r.version, capsule: true },
 				);
 			}
@@ -1990,6 +2153,8 @@ export default function (pi: ExtensionAPI) {
 					return say(`⛔ close needs an eval-PASSED phase (phase=${state.phase}) — run zense_eval (+zense_review) first; the human closes only after review`, {}, true);
 				const phase = lr.activePhase ? findPhase(t, lr.activePhase) : undefined;
 				if (!phase) return say(`no active phase recorded for longrun "${t.slug}" (state/disk mismatch — human check tracker.json)`, {}, true);
+				if (autoLoopEnabled(t))
+					return say(`tracker "${t.slug}" is AUTO — phases advance automatically on eval PASS; there is no manual close. To stop the loop: eval → AUTO-FIX boundary, or zense_longrun abandon (human order)`, {}, true);
 				if (!state.worktree) return say("no worktree attached (session restarted?) — run zense_longrun resume first", {}, true);
 				const rec = await longrunReconcile(ctx, t, undefined); // dirty is EXPECTED here (uncommitted phase work) — only branch/divergence matter
 				if (!rec.ok) return say(rec.text!, {}, true);
@@ -2033,6 +2198,8 @@ export default function (pi: ExtensionAPI) {
 				if (!t) return say(`tracker "${lr.slug}" not found on disk`, {}, true);
 				const phase = findPhase(t, lr.activePhase);
 				if (!phase) return say(`phase "${lr.activePhase}" not found in tracker`, {}, true);
+				if (autoLoopEnabled(t))
+					return say(`tracker "${t.slug}" is AUTO — no manual fail in the loop; the auto-fix bound (${AUTO_FIX_MAX_ROUNDS} rounds) halts it for a human decision. Rejecting work needs an explicit human order → zense_longrun abandon (whole set)`, {}, true);
 				if (p.confirm !== true) {
 					if (!ctx.hasUI) return say("fail destroys the phase's uncommitted+committed-since-baseline work (reset --hard) — pass confirm:true only when the human explicitly ordered it", {}, true);
 					const ok = await ctx.ui.select(
@@ -2086,7 +2253,7 @@ export default function (pi: ExtensionAPI) {
 					t = trackers.find((x) => pick.startsWith(x.slug));
 				}
 				if (!t) return say("no resumable longrun (nothing active in .zense/long-running/) — start one with zense_longrun init", {}, true);
-				state.longRun = { slug: t.slug, trackerVersion: t.version };
+				state.longRun = { slug: t.slug, trackerVersion: t.version, ...(autoLoopEnabled(t) ? { auto: true, autoFixRounds: 0 } : {}) };
 				const activePh = t.phases.find((x) => x.status === "active");
 				state.longRun.activePhase = activePh?.id;
 				const lastCheckpoint = [...t.phases].reverse().find((x) => x.checkpoint)?.checkpoint;

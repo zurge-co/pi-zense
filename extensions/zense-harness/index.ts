@@ -55,6 +55,7 @@ export * from "./src/models.ts";
 export * from "./src/ask.ts";
 export * from "./src/longrun.ts";
 export * from "./src/longrun-auto.ts";
+export * from "./src/longrun-status.ts";
 
 // The original package import block (top of file) already covers every external the factory
 // body needs — the lines below are only the local src/ bindings the factory uses by name.
@@ -68,6 +69,7 @@ import {
 	nextPendingPhase, parseLongrunPlan, reconcileLongrunWorktree,
 	renderTrackerMd, resetToCheckpoint, saveTracker, slugifyTitle, validateTracker, writePhaseSummary,
 } from "./src/longrun.ts";
+import { longrunStatusText } from "./src/longrun-status.ts";
 import {
 	AUTO_FIX_MAX_ROUNDS, autoLoopEnabled, buildAutoFixPrompt, buildCompactionCapsule, buildLongrunDigest,
 	buildNextPhaseKickoff, retainNoneCut,
@@ -147,6 +149,7 @@ export default function (pi: ExtensionAPI) {
 			if (e.type === "custom" && e.customType === "zense-state")
 				state = { ...freshState(), ...(e.data as State) };
 		lastWidget = undefined; // pi clears widgets on session switch/reload → resend even identical text
+		lastLongrunStatus = undefined; // same reset for the footer status entry (resetExtensionUI drops it too)
 		// discovery only — NEVER auto-adopt: a fresh session that finds an on-disk spec gets a
 		// hint to /zense resume; ignoring it = the old cycle is abandoned (left untouched on disk)
 		if (!state.spec && ctx.hasUI) {
@@ -179,7 +182,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 		}
-		updateWidget(ctx);
+		updateWidget(ctx); // also refreshes the longrun status bar (restored state)
 	});
 
 	const activeRun = (): SubagentRun | undefined => {
@@ -192,6 +195,8 @@ export default function (pi: ExtensionAPI) {
 	 *  during sub-agent runs (2s tick + hooks call updateWidget often) → the view jitters.
 	 *  Dedupe at string level: setWidget only when the text really changed. */
 	let lastWidget: string | undefined;
+	/** Dedupe sibling of lastWidget for the "zense-longrun" footer status entry (2026-09-24). */
+	let lastLongrunStatus: string | undefined;
 
 	const updateWidget = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
@@ -205,6 +210,17 @@ export default function (pi: ExtensionAPI) {
 			(state.pendingApply ? ` · ⏳staged v${state.pendingApply.specVersion}` : "") +
 			(state.trajectoryFlags.length ? ` · ⚠ ${state.trajectoryFlags.length} traj-flags` : "") +
 			(state.escalations.length ? ` · 🚨 ${state.escalations.length}` : "");
+		// longrun status bar (2026-09-24): the compact tracker/phase/cycle line lives in the
+		// footer via ctx.ui.setStatus — wired HERE (not a separate closure) so every existing
+		// updateWidget call site (session_start, sub-agent tick, zense_longrun's say, the AUTO
+		// eval-PASS self-advance) refreshes it for free. Same string-level dedupe as the
+		// widget: the 2s sub-agent tick must not rewrite the footer entry; a longrunStatusText
+		// of undefined CLEARS the entry so a stale line never lingers
+		const status = longrunStatusText(ctx.cwd, state.longRun, state.phase);
+		if (status !== lastLongrunStatus) {
+			lastLongrunStatus = status;
+			ctx.ui.setStatus("zense-longrun", status);
+		}
 		if (line === lastWidget) return; // same content → don't rebuild the component (prevents dock relayout)
 		lastWidget = line;
 		ctx.ui.setWidget("zense", [line]);
@@ -1492,7 +1508,7 @@ export default function (pi: ExtensionAPI) {
 					// phase="review" assignment)
 					const adv = autoLoopAdvance(ctx, t);
 					persist();
-					updateWidget(ctx);
+					updateWidget(ctx); // refreshes the status bar too — AUTO self-advance has no human-driven follow-up
 					return {
 						content: [{ type: "text", text: `${report}\n\n${adv.text}` }],
 						details: { ok: adv.ok && grade.ok, verdict, failedCriteria, autoAdvance: adv.ok, ...(adv.complete ? { trackerComplete: true } : {}), probes, trajectory: state.trajectoryFlags },
@@ -1979,7 +1995,12 @@ export default function (pi: ExtensionAPI) {
 			confirm: Type.Optional(Type.Boolean({ description: "fail/abandon: the human explicitly ordered this destructive step" })),
 		}),
 		async execute(_id, p, sig, _on, ctx) {
-			const say = (text: string, details: Record<string, unknown> = {}, isError = false) => ({ content: [{ type: "text" as const, text }], details, isError });
+			// every return below funnels through say — refresh the widget/status bar there so ALL
+			// actions (init/plan/next/auto/close/fail/status/resume/abandon, incl. errors) stay in sync (2026-09-24)
+			const say = (text: string, details: Record<string, unknown> = {}, isError = false) => {
+				updateWidget(ctx);
+				return { content: [{ type: "text" as const, text }], details, isError };
+			};
 			const lr = state.longRun;
 
 			if (p.action === "init") {

@@ -97,6 +97,7 @@ export const findPhase = (t: Tracker, id: string): TrackerPhase | undefined => t
 export const nextPendingPhase = (t: Tracker): TrackerPhase | undefined => t.phases.find((p) => p.status === "pending");
 export const allPhasesDone = (t: Tracker): boolean => t.phases.length > 0 && t.phases.every((p) => p.status === "done");
 
+
 /** Phase-spec criteria = tracker seeds (origin "tracker", IDs immutable — they carry the
  *  human signature) + agent extras (origin "compiled"). Guard returns the IDs of seed
  *  criteria a compiled spec would have dropped — must be empty before approval. */

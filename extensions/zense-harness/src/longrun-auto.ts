@@ -1,11 +1,14 @@
 // zense-harness module: longrun v2 — the autonomous loop (signed ONCE via the tracker, no
 // per-phase human gate): eval PASS auto-checkpoints and advances, eval FAIL auto-fixes
 // bounded by AUTO_FIX_MAX_ROUNDS, and the context between phases is hard-reset by a
-// DETERMINISTIC compaction override (a one-line reset directive as the summary, retain-none
-// cut) — never an LLM auto-summary lugging pi's default ~20k-token tail (that was v1's
-// growing-context bug), and never a prior-phase capsule snapshot (that dragged stale state
-// past the reset — the fresh context re-reads the tracker from disk instead). Pure helpers
-// only; session-compact/session wiring lives in index.ts.
+// DETERMINISTIC compaction boundary draft appended at turn_end (a one-line reset directive
+// as the summary, firstKeptEntryId: null → pi's self-retaining retain-none reset) — never
+// an LLM auto-summary lugging pi's default ~20k-token tail (that was v1's growing-context
+// bug), never a prior-phase capsule snapshot (that dragged stale state past the reset — the
+// fresh context re-reads the tracker from disk instead), and never ctx.compact() (pi's
+// manual compact() aborts the current agent operation mid-run and never retries the
+// interrupted turn — that stalled the loop after every phase transition, 2026-09-26).
+// Pure helpers only; session/boundary wiring lives in index.ts.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -41,7 +44,7 @@ export const buildNextPhaseKickoff = (_cwd: string, t: Tracker, nextPhase: Track
 	].join("\n");
 
 /** The compaction summary for a phase transition: ONE self-sufficient line, supplied to
- *  pi's session_before_compact instead of any LLM summary. The context capsule is
+ *  the turn_end boundary as a compaction draft instead of any LLM summary. The context capsule is
  *  deliberately NOT embedded (2026-09-26) — that dragged a stale snapshot of completed
  *  phases past the reset; disk is the single source of truth: `zense_longrun next`
  *  re-reads tracker.json and re-derives the capsule + phase spec from CURRENT worktree state. */
@@ -50,19 +53,6 @@ export const buildCompactionCapsule = (t: Tracker): string => {
 		return `[zense longrun] ${t.slug} — every phase is done; the whole set awaits the single final human review (staged in main) · see digest.md`;
 	return `[zense longrun] ${t.slug} — a phase was checkpointed and this context was hard-reset (retain-none): call zense_longrun next now to activate the next phase — it re-reads the tracker from disk and emits the signed phase spec; never reconstruct state from memory`;
 };
-
-/** Minimal slice of pi's CompactionPreparation (structural — the handler passes the real one) */
-export interface CompactionPreparationLike {
-	firstKeptEntryId: string;
-	tokensBefore: number;
-}
-
-/** The retain-none cut for a phase transition: NOTHING of the prior phase survives —
- *  markerId (a fresh entry appended right before ctx.compact) when available, else the very
- *  last entry in the branch (the advance tool result — tiny); only when neither exists do we
- *  degrade to pi's default cut (never silently, the caller flags it). */
-export const retainNoneCut = (preparation: CompactionPreparationLike, markerId: string | undefined, lastEntryId?: string): string =>
-	markerId ?? lastEntryId ?? preparation.firstKeptEntryId;
 
 // ----- digest.md — the ONE human review artifact at the end of the set: per phase the
 //       intent/goal, the signed criteria + their verdicts, and the files changed + why

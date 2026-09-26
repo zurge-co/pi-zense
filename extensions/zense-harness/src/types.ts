@@ -41,7 +41,7 @@ export interface State {
 	specJsonPath?: string;          // archive spec .json of the current version
 	worktree?: Worktree | null;     // active session worktree (null = work directly in main)
 	longRun?: LongRunRef;           // active long-running requirement (cleared on cycle closure / tracker done)
-	pendingLongrunCompact?: { slug: string; summary: string }; // auto-loop: one-line reset directive for the session_before_compact override — one-shot, consumed by the handler (cleared on fail/cancel too)
+	pendingLongrunCompact?: { slug: string; summary: string }; // auto-loop: one-line reset directive armed by autoLoopAdvance, consumed one-shot by the turn_end boundary → retain-none compaction draft (firstKeptEntryId: null; never ctx.compact — that aborts the run)
 	worktreeLeaveNotified?: boolean; // dedupe: notify "unmerged worktree" once per creation
 	pendingApply?: PendingApply;    // change staged into main after eval PASS, awaiting human commit (ADR-003)
 	contextBulletin?: string;      // one-shot cycle-closure message pinned to the next turn's system prompt (consumed then cleared) — so the agent knows the human accepted/discarded/committed

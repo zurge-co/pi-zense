@@ -72,7 +72,7 @@ import {
 import { longrunStatusText } from "./src/longrun-status.ts";
 import {
 	AUTO_FIX_MAX_ROUNDS, autoLoopEnabled, buildAutoFixPrompt, buildCompactionCapsule, buildLongrunDigest,
-	buildNextPhaseKickoff, retainNoneCut,
+	buildNextPhaseKickoff,
 } from "./src/longrun-auto.ts";
 import { composeCommitMessage, PENDING_PATCH, PENDING_MSG, NOT_ZENSE, isGitRepo, uncommittedChanges, composeSnapshotMessage, snapshotUncommitted, applyWorktreeBack, discardPendingApply, acceptPendingApply } from "./src/pending-apply.ts";
 import { resetCycleState, takeContextBulletin, buildAcceptBulletin, buildReconcileBulletin, buildDiscardBulletin, freshState } from "./src/cycle.ts";
@@ -452,6 +452,20 @@ export default function (pi: ExtensionAPI) {
 		state.tokensUsed += m?.role === "assistant" ? (m.usage?.totalTokens ?? 0) : 0;
 		updateWidget(ctx);
 		persist();
+		// longrun v2 context reset (2026-09-26): the AUTO loop's retain-none reset rides THIS
+		// boundary as a compaction entry draft — never pi's manual compact() API: it aborts
+		// the current agent operation mid-run and never retries the interrupted turn (that
+		// stalled the loop after every phase transition — the human had to resume).
+		// firstKeptEntryId pointing at nothing (null) = pi's self-retaining reset: the next
+		// turn's rebuilt context is [system prompt, one-line capsule directive] and the loop
+		// keeps driving. No continuation flag either — this turn ends with tool results, so
+		// pi schedules the next request itself (an unconditional continuation can loop)
+		const marker = state.pendingLongrunCompact;
+		if (!marker) return;
+		state.pendingLongrunCompact = undefined; // one-shot: consume ALWAYS (any outcome) — never leak into a later unrelated turn
+		persist();
+		learn(ctx, `longrun ${marker.slug}: hard context reset (turn_end compaction draft, retain-none)`);
+		return { entries: [{ type: "compaction", summary: marker.summary, firstKeptEntryId: null }] };
 	});
 
 	// ----- Phase 4: trajectory eval heuristics at run end
@@ -480,40 +494,6 @@ export default function (pi: ExtensionAPI) {
 			persist();
 		}
 		persist();
-	});
-
-	// ----- longrun v2 context reset: the auto loop's retain-none compaction. The handler
-	//       fires for EVERY compaction pi runs — it must be a strict no-op unless the auto
-	//       loop armed a one-shot marker (pendingLongrunCompact) right before ctx.compact()
-	pi.on("session_before_compact", async (event, ctx) => {
-		const marker = state.pendingLongrunCompact;
-		if (!marker) return; // untouched: threshold/manual/overflow compactions outside the loop
-		state.pendingLongrunCompact = undefined; // one-shot: consume ALWAYS, even on weird entry sets
-		persist();
-		// override the compaction deterministically: summary = the pre-built one-line directive,
-		// cut = retain-none (keep only the freshest tiny entry; degrade to pi's default cut
-		// only when the branch is somehow empty — flagged, never silent)
-		const last = event.branchEntries[event.branchEntries.length - 1];
-		const cut = retainNoneCut(event.preparation, undefined, last?.id);
-		if (!last?.id) state.trajectoryFlags.push(`longrun ${marker.slug}: retain-none cut degraded to pi's default (empty branchEntries)`);
-		learn(ctx, `longrun ${marker.slug}: hard context reset (one-line directive, retain-none)`);
-		return {
-			compaction: {
-				summary: marker.summary,
-				firstKeptEntryId: cut,
-				tokensBefore: event.preparation.tokensBefore,
-			},
-		};
-	});
-
-	pi.on("session_compact_failed", async (_ev, ctx) => {
-		if (!state.pendingLongrunCompact) return;
-		// the armed marker must never leak into a LATER unrelated compaction → clear + fallback:
-		// context stays un-reset (the v1 behavior), the loop itself is unaffected
-		state.pendingLongrunCompact = undefined;
-		state.trajectoryFlags.push("longrun phase-transition compaction failed/cancelled — context kept un-reset (fallback)");
-		persist();
-		ctx.ui.notify("⚠ longrun context reset failed/cancelled — the next phase runs on the old (larger) context; /compact manually if you want", "warning");
 	});
 
 	const flag = (msg: string, ctx: ExtensionContext) => {
@@ -1891,9 +1871,10 @@ export default function (pi: ExtensionAPI) {
 
 	/** The auto loop's phase advance (v2 — replaces the human close gate for auto trackers):
 	 *  called on eval PASS (and from the `auto` action). Checkpoints deterministically,
-	 *  snapshots the eval verdict into the tracker (digest source), then — more phases →
-	 *  snapshot the one-line reset directive into pendingLongrunCompact and trigger the hard context reset
-	 *  (ctx.compact → session_before_compact override, retain-none); last phase → the ONE
+	 *  snapshots the eval verdict into the tracker (digest source), then — more phases → arm
+	 *  the one-line reset directive into pendingLongrunCompact; the hard context reset happens
+	 *  at the turn_end boundary as a self-retaining compaction draft (retain-none) — WITHOUT
+	 *  pausing the run; last phase → the ONE
 	 *  final staged apply + digest.md. Never asks the human anything (ADR-004 gates remain:
 	 *  tracker signature + final review + ADR approvals). */
 	const autoLoopAdvance = (ctx: ExtensionContext, t: Tracker): { ok: boolean; text: string; complete?: boolean } => {
@@ -1924,19 +1905,15 @@ export default function (pi: ExtensionAPI) {
 		if (!allPhasesDone(t)) {
 			const nextP = nextPendingPhase(t)!;
 			resetLongrunPhaseCycle(t.slug, t.version, { auto: true, autoFixRounds: 0 });
-			// hard context reset (v2): a one-line reset directive rides pendingLongrunCompact →
-			// the session_before_compact handler turns it into the compaction summary with a
-			// retain-none cut — no LLM summary (v1's growing-context bug), no prior-phase capsule
-			// snapshot (the fresh context re-reads the tracker from disk via zense_longrun next)
+			// hard context reset (v2): arm the one-shot marker — the turn_end boundary handler
+			// consumes it when THIS turn finishes and appends a self-retaining compaction draft
+			// (firstKeptEntryId: null → retain-none; no LLM summary — v1's growing-context bug;
+			// no prior-phase capsule — the fresh context re-reads the tracker from disk via
+			// zense_longrun next). NEVER pi's manual compact() API here: it aborts the
+			// current agent operation mid-run and never retries the interrupted turn — the loop
+			// stalled after every phase transition until a human resumed it (2026-09-26)
 			state.pendingLongrunCompact = { slug: t.slug, summary: buildCompactionCapsule(t) };
 			persist();
-			ctx.compact({
-				onError: (e) => {
-					state.pendingLongrunCompact = undefined;
-					persist();
-					state.trajectoryFlags.push(`longrun ${t.slug}: phase-transition compaction failed (${e.message}) — context kept growing (fallback: old bulletin path)`);
-				},
-			});
 			return { ok: true, text: `✅ phase ${phase.id} auto-advanced — checkpoint ${ck.sha?.slice(0, 12)} (${filesChanged.length} file(s))\ncontext is being hard-reset (retain-none — a one-line directive to call zense_longrun next survives)\n\n${buildNextPhaseKickoff(ctx.cwd, t, nextP)}` ,complete: false};
 		}
 		// last phase → the single human review gate: staged final apply + digest.md

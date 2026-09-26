@@ -14,14 +14,14 @@ import {
 	longrunBranch,
 	nextPendingPhase,
 	renderDigestMd,
-	retainNoneCut,
 	saveTracker,
 	writePhaseSummary,
 } from "../extensions/zense-harness/index.ts";
 
 // longrun v2 (auto loop): auto gating, bounded auto-fix prompt, next-phase kickoff,
-// one-line compaction summary (disk is the source of truth), retain-none cut, digest.md —
-// the single review artifact
+// one-line compaction summary (disk is the source of truth), digest.md — the single review
+// artifact. The reset itself rides turn_end boundary compaction drafts in index.ts (runtime
+// pi wiring, not unit-testable here) — never ctx.compact() (aborts the run mid-turn)
 
 const git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
@@ -93,7 +93,7 @@ test("AUTO_FIX_MAX_ROUNDS is a small integer bound (not an unbounded furnace)", 
 	assert.ok(AUTO_FIX_MAX_ROUNDS >= 1 && AUTO_FIX_MAX_ROUNDS <= 3);
 });
 
-// ---------- compaction: one-line reset directive + retain-none cut
+// ---------- compaction summary: the one-line reset directive the boundary draft carries
 
 test("buildCompactionCapsule: ONE self-sufficient line pointing at zense_longrun next — no stale prior-phase capsule", () => {
 	const root = mkRepo();
@@ -110,13 +110,6 @@ test("buildCompactionCapsule: ONE self-sufficient line pointing at zense_longrun
 	saveTracker(root, t);
 	assert.match(buildCompactionCapsule(t), /awaits the single final human review/);
 	rmSync(root, { recursive: true, force: true });
-});
-
-test("retainNoneCut: marker > last entry > (flagged degrade) pi default", () => {
-	const prep = { firstKeptEntryId: "pi-default-cut", tokensBefore: 100000 };
-	assert.equal(retainNoneCut(prep, "marker-entry"), "marker-entry", "fresh marker keeps the cut at retain-none");
-	assert.equal(retainNoneCut(prep, undefined, "last-tiny-entry"), "last-tiny-entry", "fallback keeps exactly one tiny entry");
-	assert.equal(retainNoneCut(prep, undefined, undefined), "pi-default-cut", "degrade only when the branch is empty");
 });
 
 // ---------- digest.md — per-phase intent, criteria+verdict, files, why

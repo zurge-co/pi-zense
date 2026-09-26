@@ -490,13 +490,13 @@ export default function (pi: ExtensionAPI) {
 		if (!marker) return; // untouched: threshold/manual/overflow compactions outside the loop
 		state.pendingLongrunCompact = undefined; // one-shot: consume ALWAYS, even on weird entry sets
 		persist();
-		// override the compaction deterministically: summary = the pre-built capsule snapshot,
+		// override the compaction deterministically: summary = the pre-built one-line directive,
 		// cut = retain-none (keep only the freshest tiny entry; degrade to pi's default cut
 		// only when the branch is somehow empty — flagged, never silent)
 		const last = event.branchEntries[event.branchEntries.length - 1];
 		const cut = retainNoneCut(event.preparation, undefined, last?.id);
 		if (!last?.id) state.trajectoryFlags.push(`longrun ${marker.slug}: retain-none cut degraded to pi's default (empty branchEntries)`);
-		learn(ctx, `longrun ${marker.slug}: hard context reset (capsule-only compaction, retain-none)`);
+		learn(ctx, `longrun ${marker.slug}: hard context reset (one-line directive, retain-none)`);
 		return {
 			compaction: {
 				summary: marker.summary,
@@ -1892,7 +1892,7 @@ export default function (pi: ExtensionAPI) {
 	/** The auto loop's phase advance (v2 — replaces the human close gate for auto trackers):
 	 *  called on eval PASS (and from the `auto` action). Checkpoints deterministically,
 	 *  snapshots the eval verdict into the tracker (digest source), then — more phases →
-	 *  snapshot the capsule into pendingLongrunCompact and trigger the hard context reset
+	 *  snapshot the one-line reset directive into pendingLongrunCompact and trigger the hard context reset
 	 *  (ctx.compact → session_before_compact override, retain-none); last phase → the ONE
 	 *  final staged apply + digest.md. Never asks the human anything (ADR-004 gates remain:
 	 *  tracker signature + final review + ADR approvals). */
@@ -1924,10 +1924,11 @@ export default function (pi: ExtensionAPI) {
 		if (!allPhasesDone(t)) {
 			const nextP = nextPendingPhase(t)!;
 			resetLongrunPhaseCycle(t.slug, t.version, { auto: true, autoFixRounds: 0 });
-			// hard context reset (v2): the capsule snapshot rides pendingLongrunCompact → the
-			// session_before_compact handler turns it into the compaction summary with a
-			// retain-none cut — no LLM summary, no keepRecentTokens tail (v1's growing-context bug)
-			state.pendingLongrunCompact = { slug: t.slug, summary: buildCompactionCapsule(ctx.cwd, t) };
+			// hard context reset (v2): a one-line reset directive rides pendingLongrunCompact →
+			// the session_before_compact handler turns it into the compaction summary with a
+			// retain-none cut — no LLM summary (v1's growing-context bug), no prior-phase capsule
+			// snapshot (the fresh context re-reads the tracker from disk via zense_longrun next)
+			state.pendingLongrunCompact = { slug: t.slug, summary: buildCompactionCapsule(t) };
 			persist();
 			ctx.compact({
 				onError: (e) => {
@@ -1936,7 +1937,7 @@ export default function (pi: ExtensionAPI) {
 					state.trajectoryFlags.push(`longrun ${t.slug}: phase-transition compaction failed (${e.message}) — context kept growing (fallback: old bulletin path)`);
 				},
 			});
-			return { ok: true, text: `✅ phase ${phase.id} auto-advanced — checkpoint ${ck.sha?.slice(0, 12)} (${filesChanged.length} file(s))\ncontext is being hard-reset to the capsule (retain-none)\n\n${buildNextPhaseKickoff(ctx.cwd, t, nextP)}` ,complete: false};
+			return { ok: true, text: `✅ phase ${phase.id} auto-advanced — checkpoint ${ck.sha?.slice(0, 12)} (${filesChanged.length} file(s))\ncontext is being hard-reset (retain-none — a one-line directive to call zense_longrun next survives)\n\n${buildNextPhaseKickoff(ctx.cwd, t, nextP)}` ,complete: false};
 		}
 		// last phase → the single human review gate: staged final apply + digest.md
 		const digest = buildLongrunDigest(ctx.cwd, t);
@@ -1953,12 +1954,12 @@ export default function (pi: ExtensionAPI) {
 		name: "zense_longrun",
 		label: "Zense Long-Running",
 		description:
-			"Long-running mode: a requirement too big for one cycle is planned ONCE as a signed tracker (phases: pre-phase, p1, p2, …) at .zense/long-running/<slug>/, then runs phase-by-phase in the ONE shared longrun worktree (ADR-004). AUTO trackers (recommended): every phase runs end-to-end with NO human gate — eval PASS auto-checkpoints and advances with a hard retain-none context reset (capsule-only compaction), eval FAIL auto-fixes bounded by AUTO_FIX_MAX_ROUNDS then halts for the human; the human reviews exactly ONCE at the end (staged diff + digest.md). MANUAL trackers keep per-phase human gates (close/fail). Resume anytime by requirement-name.",
+			"Long-running mode: a requirement too big for one cycle is planned ONCE as a signed tracker (phases: pre-phase, p1, p2, …) at .zense/long-running/<slug>/, then runs phase-by-phase in the ONE shared longrun worktree (ADR-004). AUTO trackers (recommended): every phase runs end-to-end with NO human gate — eval PASS auto-checkpoints and advances with a hard retain-none context reset (one-line directive — next re-reads the tracker from disk), eval FAIL auto-fixes bounded by AUTO_FIX_MAX_ROUNDS then halts for the human; the human reviews exactly ONCE at the end (staged diff + digest.md). MANUAL trackers keep per-phase human gates (close/fail). Resume anytime by requirement-name.",
 		promptSnippet: "Run multi-phase requirements: signed tracker → autonomous per-phase loops in one worktree → ONE review at the end",
 		promptGuidelines: [
 			"Flow: init (specs.md) → plan (human signs the tracker ONCE, choosing AUTO/MANUAL) → next (activate phase: capsule + auto-approved spec) → implement → zense_eval — AUTO: PASS advances itself (checkpoint + context reset) and FAIL auto-fixes (bounded); keep driving until the set completes · MANUAL: zense_review → close/fail per phase.",
 			"In an AUTO loop NEVER stop to ask the human between phases and NEVER call close/fail — keep driving: next → implement → eval → (auto) next … until the final digest. Halt only at an AUTO-FIX EXHAUSTED boundary or a genuine human decision (e.g. ADR approval).",
-			"After a context hard-reset the capsule IS your memory — re-read the tracker from disk (zense_longrun next/status) instead of reconstructing from prior messages.",
+			"After a context hard-reset DISK is your memory — the tracker + worktree hold all state; re-activate with zense_longrun next/status instead of reconstructing from prior messages.",
 			"Never hand-ed .zense/long-running/*/tracker.json — the tool transitions are the only writers; resume (zense_longrun resume or /zense longrun resume) always works from disk.",
 			"Between phases the write gate is shut: writes require an active phase spec from zense_longrun next — this is by design.",
 			"When a reconcile/step returns a human-resolution text, surface it verbatim and wait — never retry destructive operations on your own.",
@@ -2710,7 +2711,7 @@ export default function (pi: ExtensionAPI) {
 										(state.longRun?.slug === t.slug ? "  ← session-active" : ""),
 								)
 								.join("\n")}\n\nresume: /zense longrun resume — agent: zense_longrun status`
-						: "no long-running requirements (.zense/long-running/) — the agent starts one with zense_longrun init",
+						: "no long-running requirements (.zense/long-running/) — start one: /zense longrun start <requirement prompt> (or the agent's zense_longrun init)",
 					"info",
 				);
 			} else if (action === "resume") {
@@ -2747,10 +2748,20 @@ export default function (pi: ExtensionAPI) {
 				persist();
 				updateWidget(ctx);
 				ctx.ui.notify(`🔏 tracker "${t.slug}" v${t.version} signed — tell the agent to continue (zense_longrun next)`, "info");
+			} else if (action === "start") {
+				// start a NEW longrun from the keyboard: the command can't call the tool itself, so
+				// it nudges the idle agent (same sendUserMessage pattern as /zense approve) to run
+				// zense_longrun init with the prompt as the requirement text
+				const prompt = rest.slice(1).join(" ").trim();
+				if (!prompt) return ctx.ui.notify("usage: /zense longrun start <requirement prompt>", "warning");
+				if (state.longRun) return ctx.ui.notify(`a longrun is already active in this session: "${state.longRun.slug}" — finish/abandon it first`, "warning");
+				const kick = `Zense: the human started a long-running requirement from the keyboard:\n"""\n${prompt}\n"""\nstart it now with zense_longrun: action=init, title=a concise name for it, intent=what it wants and why, specsMd=the prompt above verbatim (expanded only if the human asked for more), then continue the normal flow (plan → the human signs the tracker once → next)`;
+				try { pi.sendUserMessage(kick); } catch { try { pi.sendUserMessage(kick, { deliverAs: "followUp" }); } catch { /* non-fatal */ } }
+				ctx.ui.notify("🏗 longrun start requested — the agent will init + plan it (you sign the tracker once)", "info");
 			} else if (action === "abandon") {
 				ctx.ui.notify(`use the agent: ask it to run zense_longrun abandon slug=${target ?? "<slug>"} — it enforces the pendingApply guard and confirm flow`, "info");
 			} else {
-				ctx.ui.notify("usage: /zense longrun status|resume [slug]|sign <slug>|abandon <slug>", "info");
+				ctx.ui.notify("usage: /zense longrun status|start <prompt>|resume [slug]|sign <slug>|abandon <slug>", "info");
 			}
 		} else if (sub === "agents") {
 				await openAgentsViewer(ctx);

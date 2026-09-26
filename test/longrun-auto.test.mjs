@@ -20,7 +20,8 @@ import {
 } from "../extensions/zense-harness/index.ts";
 
 // longrun v2 (auto loop): auto gating, bounded auto-fix prompt, next-phase kickoff,
-// capsule-as-compaction-summary, retain-none cut, digest.md — the single review artifact
+// one-line compaction summary (disk is the source of truth), retain-none cut, digest.md —
+// the single review artifact
 
 const git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
@@ -92,20 +93,22 @@ test("AUTO_FIX_MAX_ROUNDS is a small integer bound (not an unbounded furnace)", 
 	assert.ok(AUTO_FIX_MAX_ROUNDS >= 1 && AUTO_FIX_MAX_ROUNDS <= 3);
 });
 
-// ---------- compaction: capsule-as-summary + retain-none cut
+// ---------- compaction: one-line reset directive + retain-none cut
 
-test("buildCompactionCapsule: next phase gets full detail, all-done state gets the review pointer", () => {
+test("buildCompactionCapsule: ONE self-sufficient line pointing at zense_longrun next — no stale prior-phase capsule", () => {
 	const root = mkRepo();
 	const t = mkTracker();
 	saveTracker(root, t);
-	const capsule = buildCompactionCapsule(root, t);
-	assert.match(capsule, /\[zense longrun\] ship-oauth/);
-	assert.match(capsule, /Next phase p2 "login flow": oauth login/, "label is Next phase (not Active)");
-	assert.match(capsule, /seed criteria .*: L1/);
+	const line = buildCompactionCapsule(t);
+	assert.match(line, /\[zense longrun\] ship-oauth/);
+	assert.match(line, /call zense_longrun next now/);
+	assert.match(line, /never reconstruct state from memory/);
+	assert.equal(line.includes("\n"), false, "the summary is ONE line — the fresh context re-derives state from disk, not from a snapshot");
+	assert.ok(!/p2/.test(line) && !/seed criteria/.test(line), "no next-phase detail embedded — next re-reads the tracker");
 	// set complete → no 'next', points at the single review
 	t.phases[1].status = "done";
 	saveTracker(root, t);
-	assert.match(buildCompactionCapsule(root, t), /awaits the single final human review/);
+	assert.match(buildCompactionCapsule(t), /awaits the single final human review/);
 	rmSync(root, { recursive: true, force: true });
 });
 

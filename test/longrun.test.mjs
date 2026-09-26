@@ -321,6 +321,12 @@ test("buildLongrunPlannerPrompt: demands ordered phases + runnable checks, embed
 	assert.match(prompt, /# Spec\nbody/);
 	assert.match(prompt, /"phases"/);
 	assert.match(prompt, /runnable command/);
+	// fewest-phases bias (2026-09-26): over-splitting made longruns slow — the prompt must
+	// state the per-phase cost + genuine-boundary split condition, never a "2–6 phases" range
+	assert.match(prompt, /FEWEST phases/i);
+	assert.match(prompt, /per-phase cost/i);
+	assert.match(prompt, /architecture seam|irreversible|baseline/i);
+	assert.doesNotMatch(prompt, /[0-9][–-]6 phases/);
 });
 
 test("compilePhaseSpec: title/intent/provenance derive from the tracker; seeds keep origin", () => {

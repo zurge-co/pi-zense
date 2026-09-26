@@ -1,14 +1,16 @@
 // zense-harness module: longrun v2 — the autonomous loop (signed ONCE via the tracker, no
 // per-phase human gate): eval PASS auto-checkpoints and advances, eval FAIL auto-fixes
 // bounded by AUTO_FIX_MAX_ROUNDS, and the context between phases is hard-reset by a
-// DETERMINISTIC compaction override (capsule as the whole summary, retain-none cut) — never
-// an LLM auto-summary lugging pi's default ~20k-token tail (that was v1's growing-context
-// bug). Pure helpers only; session-compact/session wiring lives in index.ts.
+// DETERMINISTIC compaction override (a one-line reset directive as the summary, retain-none
+// cut) — never an LLM auto-summary lugging pi's default ~20k-token tail (that was v1's
+// growing-context bug), and never a prior-phase capsule snapshot (that dragged stale state
+// past the reset — the fresh context re-reads the tracker from disk instead). Pure helpers
+// only; session-compact/session wiring lives in index.ts.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Tracker, type TrackerPhase } from "./types.ts";
-import { buildContextCapsule, longrunDir, nextPendingPhase } from "./longrun.ts";
+import { longrunDir, nextPendingPhase } from "./longrun.ts";
 
 /** Max consecutive eval FAILs the auto loop fixes on its own before escalating need-decision
  *  (bound discipline mirrors evalOverrideFails' deadlock guard — an autonomous loop without
@@ -34,17 +36,19 @@ export const buildAutoFixPrompt = (phase: TrackerPhase, failed: { id: string; te
  *  instruction the fresh context carries — it must be fully self-sufficient. */
 export const buildNextPhaseKickoff = (_cwd: string, t: Tracker, nextPhase: TrackerPhase): string =>
 	[
-		`AUTO-CONTINUE longrun "${t.slug}": the previous phase was checkpointed and this context was hard-reset to the capsule (retain-none — nothing of the prior phase remains).`,
+		`AUTO-CONTINUE longrun "${t.slug}": the previous phase was checkpointed and this context was hard-reset (retain-none — nothing of the prior phase remains).`,
 		`call zense_longrun next now to activate phase ${nextPhase.id} "${nextPhase.title}" — it re-reads the tracker from disk and emits the signed phase spec; never reconstruct state from memory`,
 	].join("\n");
 
-/** The capsule rendered AS the compaction summary (deterministic — the harness supplies this
- *  to pi's session_before_compact instead of letting an LLM summarize the old context). */
-export const buildCompactionCapsule = (cwd: string, t: Tracker): string => {
-	const next = nextPendingPhase(t);
-	if (!next)
+/** The compaction summary for a phase transition: ONE self-sufficient line, supplied to
+ *  pi's session_before_compact instead of any LLM summary. The context capsule is
+ *  deliberately NOT embedded (2026-09-26) — that dragged a stale snapshot of completed
+ *  phases past the reset; disk is the single source of truth: `zense_longrun next`
+ *  re-reads tracker.json and re-derives the capsule + phase spec from CURRENT worktree state. */
+export const buildCompactionCapsule = (t: Tracker): string => {
+	if (!nextPendingPhase(t))
 		return `[zense longrun] ${t.slug} — every phase is done; the whole set awaits the single final human review (staged in main) · see digest.md`;
-	return buildContextCapsule(cwd, t, next, { label: "Next phase" });
+	return `[zense longrun] ${t.slug} — a phase was checkpointed and this context was hard-reset (retain-none): call zense_longrun next now to activate the next phase — it re-reads the tracker from disk and emits the signed phase spec; never reconstruct state from memory`;
 };
 
 /** Minimal slice of pi's CompactionPreparation (structural — the handler passes the real one) */
